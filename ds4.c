@@ -17090,8 +17090,22 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             }
         }
 #endif
-        if (!e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->model)) {
+        // Pre-cache both main and MTP tensor spans into device memory at
+        // startup, so the first decode (or first MTP draft) doesn't pay a
+        // multi-second cudaMemcpy cost in the hot path.  The previous
+        // !e->mtp_ready guard skipped both pre-caches when MTP was loaded,
+        // which left the entire 3.6 GiB Q4_K MoE weight set to be copied
+        // synchronously on the first MTP routed_moe invocation.
+        if (!accelerator_cache_model_tensors(e->backend, &e->model)) {
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->mtp_ready &&
+            !accelerator_cache_model_tensors(e->backend, &e->mtp_model)) {
+            fprintf(stderr, "ds4: %s failed to prepare startup MTP model cache\n",
                     ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
