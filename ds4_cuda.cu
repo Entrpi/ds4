@@ -522,12 +522,6 @@ static int cuda_q8_label_is_attention_output(const char *label) {
             strstr(label, "attention_output_b") != NULL);
 }
 
-static int cuda_q8_label_is_attention_output_b(const char *label) {
-    return label &&
-           (strstr(label, "attn_output_b") != NULL ||
-            strstr(label, "attention_output_b") != NULL);
-}
-
 static int cuda_q8_use_dp4a(void) {
     return getenv("DS4_CUDA_NO_Q8_DP4A") == NULL;
 }
@@ -2622,47 +2616,6 @@ __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
     }
     acc = warp_sum_f32(acc);
     if (lane == 0) out[tok * out_dim + row] = acc;
-}
-
-__global__ static void matmul_q8_0_preq_n2_warp8_kernel(
-        float *out,
-        const unsigned char *w,
-        const int8_t *xq,
-        const float *xscale,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        uint64_t blocks,
-        int use_dp4a) {
-    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
-    const uint32_t lane = threadIdx.x & 31u;
-    if (row >= out_dim) return;
-
-    const unsigned char *wr = w + row * blocks * 34;
-    const int8_t *xq0 = xq;
-    const int8_t *xq1 = xq + blocks * 32;
-    const float *xs0 = xscale;
-    const float *xs1 = xscale + blocks;
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    for (uint64_t b = lane; b < blocks; b += 32u) {
-        const uint64_t i0 = b * 32;
-        const uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
-        const __half *scale_h = (const __half *)(wr + b * 34);
-        const int8_t *qs = (const int8_t *)(wr + b * 34 + 2);
-        const float ws = __half2float(*scale_h);
-        const int8_t *xqb0 = xq0 + b * 32;
-        const int8_t *xqb1 = xq1 + b * 32;
-        const int dot0 = dot_i8_block(qs, xqb0, bn, use_dp4a);
-        const int dot1 = dot_i8_block(qs, xqb1, bn, use_dp4a);
-        acc0 += ws * xs0[b] * (float)dot0;
-        acc1 += ws * xs1[b] * (float)dot1;
-    }
-    acc0 = warp_sum_f32(acc0);
-    acc1 = warp_sum_f32(acc1);
-    if (lane == 0) {
-        out[row] = acc0;
-        out[out_dim + row] = acc1;
-    }
 }
 
 __global__ static void dequant_q8_0_to_f16_kernel(
@@ -6336,11 +6289,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
-    const int force_native_attention_output_b =
-        cuda_q8_label_is_attention_output_b(label) &&
-        (getenv("DS4_CUDA_NO_CUBLAS_ATTENTION_OUTPUT_B") != NULL ||
-         (n_tok == 2 && getenv("DS4_CUDA_ATTENTION_OUTPUT_B_N2_Q8") != NULL));
-    if (g_cublas_ready && n_tok > 1 && !force_native_attention_output_b) {
+    if (g_cublas_ready && n_tok > 1) {
         const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
         if (w_f32) {
             const float alpha = 1.0f;
@@ -6434,20 +6383,6 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 blocks,
                 use_dp4a);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 batch warp launch");
-    }
-    if (n_tok == 2 &&
-        cuda_q8_label_is_attention_output_b(label) &&
-        getenv("DS4_CUDA_ATTENTION_OUTPUT_B_N2_Q8") != NULL) {
-        matmul_q8_0_preq_n2_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
-                (float *)out->ptr,
-                reinterpret_cast<const unsigned char *>(wptr),
-                xq,
-                xscale,
-                in_dim,
-                out_dim,
-                blocks,
-                use_dp4a);
-        return cuda_ok(cudaGetLastError(), "matmul_q8_0 n2 warp launch");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     matmul_q8_0_preq_kernel<<<grid, 256>>>((float *)out->ptr,

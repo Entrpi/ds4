@@ -91,9 +91,6 @@ The currently useful CUDA MTP flags are:
   logits are not needed.
 - `DS4_CUDA_MTP_VERIFY_OPT_OUTPUT=1`: schedule verifier output work to avoid an
   avoidable readback/command break on full accepts.
-- `DS4_CUDA_ATTENTION_OUTPUT_B_N2_Q8=1`: experimental custom Q8 kernel for the
-  exact verifier's two-token attention output B projection. This avoids the
-  skinny `8192 -> 4096, N=2` F16/cuBLAS path for `attn_output_b`.
 
 The structural CUDA optimizations are default-on after this work:
 
@@ -127,7 +124,6 @@ PROMPT="List 500 prime numbers, comma-separated, just numbers."
 DS4_CUDA_MTP_TOP2=1 \
 DS4_CUDA_MTP_VERIFY_TOP2=1 \
 DS4_CUDA_MTP_VERIFY_OPT_OUTPUT=1 \
-DS4_CUDA_ATTENTION_OUTPUT_B_N2_Q8=1 \
 DS4_MTP_TIMING=1 \
 ./ds4 --cuda -m "$BASE" --mtp "$MTP" --mtp-draft 2 \
   --temp 0 --nothink -n 256 -p "$PROMPT" \
@@ -163,7 +159,6 @@ On the 256-token prime prompt above, a clean CUDA build on GB10 measured:
 | --- | ---: | ---: |
 | No MTP | 30.12 t/s | 15.46 t/s |
 | Optimized exact MTP | 30.10 t/s | 16.21 t/s |
-| Optimized exact MTP + custom B N=2 Q8 | 25.51 t/s | 16.54 t/s |
 | Rollback structural opts | 27.00 t/s | 15.14 t/s |
 
 The no-MTP, optimized MTP, and rollback MTP outputs were byte-identical for
@@ -174,7 +169,6 @@ MTP verifier timing from the same run:
 | Run | Micro verify avg | Margin-skip verify avg |
 | --- | ---: | ---: |
 | Optimized exact MTP | 106.08 ms | 64.53 ms |
-| Optimized exact MTP + custom B N=2 Q8 | 101.75 ms | 65.12 ms |
 | Rollback structural opts | 118.81 ms | 65.75 ms |
 
 The verified speedup is modest but real on this benchmark: optimized exact MTP
