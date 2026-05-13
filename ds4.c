@@ -13734,7 +13734,8 @@ static bool metal_graph_verify_decode2_top2_output(
         bool                   capture_prefix1,
         int                   *row0_top,
         int                   *commit_drafts,
-        float                 *row_logits) {
+        float                 *row_logits,
+        ds4_gpu_top2_result   *row0_top2) {
     if (!row0_top || !commit_drafts || !row_logits) return false;
     if (!g || !prompt || start > (uint32_t)prompt->len || 2u > (uint32_t)prompt->len - start) return false;
 
@@ -13787,6 +13788,7 @@ static bool metal_graph_verify_decode2_top2_output(
         if (ok) ok = metal_graph_read_current_logits(g, row_logits);
         if (!ok) return false;
 
+        if (row0_top2) *row0_top2 = top2;
         *row0_top = (int)top2.id0;
         *commit_drafts = (*row0_top == draft1) ? 2 : 1;
         if (*commit_drafts == 2) return true;
@@ -13815,6 +13817,7 @@ static bool metal_graph_verify_decode2_top2_output(
     else (void)ds4_gpu_synchronize();
     if (ok) ok = ds4_gpu_tensor_read(g->comp_selected, 0, &top2, sizeof(top2)) != 0;
     if (!ok) return false;
+    if (row0_top2) *row0_top2 = top2;
     *row0_top = (int)top2.id0;
 
     *commit_drafts = (*row0_top == draft1) ? 2 : 1;
@@ -18161,15 +18164,29 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         const bool capture_prefix1 =
             draft_n == 2 && (!strict_mtp || getenv("DS4_MTP_CAPTURE_PREFIX1") != NULL);
         const bool exact_replay_debug = getenv("DS4_MTP_EXACT_REPLAY") != NULL;
+        const bool shadow_b_n2_q8 =
+            draft_n == 2 &&
+            getenv("DS4_CUDA_MTP_SHADOW_B_N2_Q8") != NULL &&
+            getenv("DS4_CUDA_MTP_VERIFY_TOP2") != NULL &&
+            getenv("DS4_CUDA_MTP_TOP2") != NULL;
         const bool snapshot_required =
             draft_n > 2 ||
             (draft_n == 2 && (!capture_prefix1 || exact_replay_debug)) ||
+            shadow_b_n2_q8 ||
             getenv("DS4_MTP_FORCE_SNAPSHOT") != NULL;
         bool have_frontier = false;
         bool ok = true;
         bool verifier_may_have_mutated = false;
         int precomputed_commit_drafts = 0;
         bool have_precomputed_logits = false;
+        bool shadow_have = false;
+        bool shadow_ok = false;
+        int shadow_row0_top = -1;
+        int shadow_commit_drafts = 0;
+        ds4_gpu_top2_result shadow_top2;
+        memset(&shadow_top2, 0, sizeof(shadow_top2));
+        ds4_gpu_top2_result exact_top2;
+        memset(&exact_top2, 0, sizeof(exact_top2));
         const double snapshot_t0 = mtp_timing ? now_sec() : 0.0;
         if (snapshot_required) {
             have_frontier = spec_frontier_snapshot(&frontier, s);
@@ -18179,7 +18196,25 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (ok) {
             for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
             verifier_may_have_mutated = true;
-            if (draft_n == 2 &&
+            if (shadow_b_n2_q8 && have_frontier) {
+                shadow_have = true;
+                ds4_gpu_set_attention_output_b_n2_q8_override(1);
+                shadow_ok = metal_graph_verify_decode2_top2_output(&s->graph,
+                                                                    &e->model,
+                                                                    &e->weights,
+                                                                    &s->checkpoint,
+                                                                    (uint32_t)start,
+                                                                    drafts[1],
+                                                                    capture_prefix1,
+                                                                    &shadow_row0_top,
+                                                                    &shadow_commit_drafts,
+                                                                    row_logits,
+                                                                    &shadow_top2);
+                ds4_gpu_set_attention_output_b_n2_q8_override(0);
+                s->checkpoint.len = start + draft_n;
+                ok = spec_frontier_restore(&frontier, s);
+            }
+            if (ok && draft_n == 2 &&
                 getenv("DS4_CUDA_MTP_VERIFY_TOP2") != NULL &&
                 getenv("DS4_CUDA_MTP_TOP2") != NULL) {
                 int row0_top = -1;
@@ -18192,7 +18227,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                             capture_prefix1,
                                                             &row0_top,
                                                             &precomputed_commit_drafts,
-                                                            row_logits);
+                                                            row_logits,
+                                                            &exact_top2);
                 if (ok) {
                     row_tops[0] = row0_top;
                     have_precomputed_logits = true;
@@ -18218,6 +18254,31 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     if (row_tops[i - 1] != drafts[i]) break;
                     commit_drafts++;
                 }
+            }
+            if (shadow_have) {
+                static uint64_t shadow_checks = 0;
+                static uint64_t shadow_disagreements = 0;
+                const bool agree =
+                    shadow_ok &&
+                    shadow_row0_top == row_tops[0] &&
+                    shadow_commit_drafts == commit_drafts;
+                shadow_checks++;
+                if (!agree) shadow_disagreements++;
+                fprintf(stderr,
+                        "ds4: mtp shadow b_n2_q8 check=%llu disagree=%llu ok=%d agree=%d "
+                        "exact_commit=%d shadow_commit=%d exact_top=%d shadow_top=%d "
+                        "draft_next=%d exact_margin=%.6f shadow_margin=%.6f\n",
+                        (unsigned long long)shadow_checks,
+                        (unsigned long long)shadow_disagreements,
+                        shadow_ok ? 1 : 0,
+                        agree ? 1 : 0,
+                        commit_drafts,
+                        shadow_commit_drafts,
+                        row_tops[0],
+                        shadow_row0_top,
+                        draft_n > 1 ? drafts[1] : -1,
+                        exact_top2.value0 - exact_top2.value1,
+                        shadow_top2.value0 - shadow_top2.value1);
             }
             if (mtp_conf_log) {
                 fprintf(stderr,

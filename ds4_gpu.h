@@ -50,6 +50,7 @@ int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 void ds4_gpu_set_quality(bool quality);
 void ds4_gpu_print_memory_report(const char *label);
+void ds4_gpu_set_attention_output_b_n2_q8_override(int enabled);
 
 /* =========================================================================
  * Embeddings and Indexer Helpers.

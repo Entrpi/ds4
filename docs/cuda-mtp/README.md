@@ -1,9 +1,11 @@
 # CUDA MTP on DGX Spark / GB10
 
 This note covers the CUDA speculative decoding path for DeepSeek V4 Flash MTP
-on NVIDIA GB10 systems such as DGX Spark. The feature is experimental, exact by
-default, and currently useful as a small greedy-decoding speedup rather than a
-large throughput multiplier.
+on NVIDIA GB10 systems such as DGX Spark. The feature is experimental. The
+optimized non-strict path is useful as a small greedy-decoding speedup on the
+benchmarks below, but it should be validated against no-MTP output for each
+prompt class. Use `--quality` / `DS4_MTP_STRICT=1` when byte-identical target
+stream behavior matters more than speed.
 
 ## Hardware Target
 
@@ -16,8 +18,8 @@ The current CUDA MTP work was tuned against:
 - Optional Q4_K MTP GGUF.
 
 The optimization assumptions are specific to this shape: a very large target
-model, an MTP draft block that is much smaller but still non-trivial, and exact
-verification over a two-token suffix.
+model, an MTP draft block that is much smaller but still non-trivial, and a
+two-token target verifier.
 
 ## Build
 
@@ -64,7 +66,7 @@ No-MTP CUDA baseline:
   -p "List 500 prime numbers, comma-separated, just numbers."
 ```
 
-Exact CUDA MTP, draft depth 2:
+Optimized CUDA MTP, draft depth 2:
 
 ```sh
 DS4_CUDA_MTP_TOP2=1 \
@@ -95,7 +97,7 @@ The currently useful CUDA MTP flags are:
 The structural CUDA optimizations are default-on after this work:
 
 - Batched Q8 pair projections for two-token verifier passes.
-- Fused six-expert MoE down+sum for the two-token exact verifier.
+- Fused six-expert MoE down+sum for the two-token verifier.
 - Paired decode Q/KV projections.
 - Startup pre-cache of both the base model and MTP model tensor spans.
 
@@ -158,17 +160,19 @@ On the 256-token prime prompt above, a clean CUDA build on GB10 measured:
 | Run | Prefill | Generation |
 | --- | ---: | ---: |
 | No MTP | 30.12 t/s | 15.46 t/s |
-| Optimized exact MTP | 30.10 t/s | 16.21 t/s |
+| Optimized MTP | 30.10 t/s | 16.21 t/s |
 | Rollback structural opts | 27.00 t/s | 15.14 t/s |
 
 The no-MTP, optimized MTP, and rollback MTP outputs were byte-identical for
-that run.
+that prime-list run. Other prompt classes can differ in the non-strict
+optimized verifier path, so compare output bytes before treating a result as an
+exact speedup.
 
 MTP verifier timing from the same run:
 
 | Run | Micro verify avg | Margin-skip verify avg |
 | --- | ---: | ---: |
-| Optimized exact MTP | 106.08 ms | 64.53 ms |
+| Optimized MTP | 106.08 ms | 64.53 ms |
 | Rollback structural opts | 118.81 ms | 65.75 ms |
 
 The verified speedup is modest but real on this benchmark: optimized exact MTP
