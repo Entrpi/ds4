@@ -715,7 +715,7 @@ def dataclass_dict(obj: Any) -> Any:
     return obj
 
 
-def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None, scope: str = "both") -> None:
+def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None, scope: str = "both") -> dict[str, Any]:
     expected: dict[str, int] = {}
     if scope in {"both", "base"}:
         expected["base"] = os.path.getsize(base_model)
@@ -725,6 +725,7 @@ def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None,
         raise ValueError(f"weight manifest scope {scope!r} has no expected models")
     seen: dict[str, list[tuple[int, int]]] = {k: [] for k in expected}
     saw_header = False
+    owner: dict[str, Any] = {}
     for lineno, raw in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -733,6 +734,32 @@ def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None,
             saw_header = True
             continue
         parts = line.split()
+        if parts and parts[0] == "owner":
+            if len(parts) != 5:
+                raise ValueError(f"invalid weight manifest owner line {lineno}: {raw}")
+            try:
+                owner_pid = int(parts[1])
+                owner_device = int(parts[2])
+            except ValueError as e:
+                raise ValueError(f"invalid weight manifest owner pid/device on line {lineno}") from e
+            owner_scope = parts[3]
+            if owner_scope != scope:
+                raise ValueError(f"weight manifest owner scope mismatch: manifest={owner_scope} requested={scope}")
+            if owner_pid <= 1:
+                raise ValueError(f"invalid weight manifest owner pid on line {lineno}")
+            try:
+                os.kill(owner_pid, 0)
+            except ProcessLookupError as e:
+                raise ValueError(f"weight manifest owner pid is not running: {owner_pid}") from e
+            except PermissionError:
+                pass
+            owner = {
+                "pid": owner_pid,
+                "device": owner_device,
+                "scope": owner_scope,
+                "lock_file": "" if parts[4] == "-" else parts[4],
+            }
+            continue
         if len(parts) != 6 or parts[0] != "range":
             raise ValueError(f"invalid weight manifest line {lineno}: {raw}")
         _, model_id, model_size_s, off_s, bytes_s, handle_hex = parts
@@ -764,6 +791,9 @@ def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None,
             if off < prev_end:
                 raise ValueError(f"weight manifest has overlapping ranges for {model_id}")
             prev_end = end
+    if not owner:
+        raise ValueError(f"weight manifest missing live owner record: {path}")
+    return {"owner": owner, "ranges": {k: len(v) for k, v in seen.items()}}
 
 
 def print_run_line(result: RunResult) -> None:
@@ -910,9 +940,10 @@ def main(argv: list[str] | None = None) -> int:
         manifest_path=args.weight_ipc_manifest or "",
     )
     if args.weight_ipc_manifest:
-        validate_weight_manifest(Path(args.weight_ipc_manifest), args.base, args.mtp, args.weight_server_scope)
+        manifest_info = validate_weight_manifest(Path(args.weight_ipc_manifest), args.base, args.mtp, args.weight_server_scope)
         weight_server_state.ready = True
         weight_server_state.cleanup = "external"
+        weight_server_state.telemetry = {"manifest": manifest_info}
     elif args.start_weight_server:
         manifest_path = args.weight_server_manifest or (work_dir / "ds4_weight_server.ipc")
         log_path = work_dir / "ds4_weight_server.log"

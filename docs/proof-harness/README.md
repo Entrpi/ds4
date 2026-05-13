@@ -118,9 +118,11 @@ tests/ds4_proof.py \
 ```
 
 The owner process must remain alive while workers run. If it exits, imported
-CUDA IPC mappings are no longer a valid basis for proof. This first
-implementation shares raw tensor spans only; derived Q8 F16/F32 cache sharing
-is intentionally deferred.
+CUDA IPC mappings are no longer a valid basis for proof. Manifests therefore
+include an owner PID record, and the proof runner rejects external manifests
+whose owner is gone or whose owner scope differs from `--weight-server-scope`.
+This first implementation shares raw tensor spans only; derived Q8 F16/F32
+cache sharing is intentionally deferred.
 
 By default the server refuses to start unless the CUDA allocator reports enough
 free memory for the full raw-span upload plus a 32 GiB reserve. Use

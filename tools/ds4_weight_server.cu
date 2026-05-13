@@ -602,7 +602,8 @@ static bool upload_model(const char *id, const char *path, uint64_t span_bytes,
     return true;
 }
 
-static bool write_manifest(const char *path, const std::vector<owned_range> &ranges) {
+static bool write_manifest(const char *path, const std::vector<owned_range> &ranges,
+                           int device, const char *scope, const char *lock_file) {
     std::string tmp = std::string(path) + ".tmp";
     FILE *fp = fopen(tmp.c_str(), "w");
     if (!fp) {
@@ -610,6 +611,12 @@ static bool write_manifest(const char *path, const std::vector<owned_range> &ran
         return false;
     }
     fprintf(fp, "DS4_WEIGHT_SERVER_IPC_V1\n");
+    fprintf(fp, "# owner <pid> <cuda-device> <scope> <lock-file-or-dash>\n");
+    fprintf(fp, "owner %ld %d %s %s\n",
+            (long)getpid(),
+            device,
+            scope ? scope : "both",
+            (lock_file && lock_file[0]) ? lock_file : "-");
     fprintf(fp, "# range <model-id> <model-size> <offset> <bytes> <cuda-ipc-handle-hex>\n");
     for (const owned_range &r : ranges) {
         std::string hex;
@@ -737,7 +744,7 @@ int main(int argc, char **argv) {
     std::vector<owned_range> ranges;
     if (want_base && !upload_model("base", base, span_bytes, copy_chunk_bytes, ranges)) return 1;
     if (want_mtp && !upload_model("mtp", mtp, span_bytes, copy_chunk_bytes, ranges)) return 1;
-    if (!write_manifest(manifest, ranges)) return 1;
+    if (!write_manifest(manifest, ranges, device, scope, lock_file)) return 1;
 
     fprintf(stderr,
             "ds4_weight_server: ready manifest=%s ranges=%zu. Keep this process alive while workers run.\n",
