@@ -18187,6 +18187,9 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         memset(&shadow_top2, 0, sizeof(shadow_top2));
         ds4_gpu_top2_result exact_top2;
         memset(&exact_top2, 0, sizeof(exact_top2));
+        float *shadow_logits = shadow_b_n2_q8
+            ? xmalloc((size_t)DS4_N_VOCAB * sizeof(shadow_logits[0]))
+            : NULL;
         const double snapshot_t0 = mtp_timing ? now_sec() : 0.0;
         if (snapshot_required) {
             have_frontier = spec_frontier_snapshot(&frontier, s);
@@ -18210,6 +18213,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                                                     &shadow_commit_drafts,
                                                                     row_logits,
                                                                     &shadow_top2);
+                if (shadow_ok && shadow_logits) {
+                    memcpy(shadow_logits, row_logits,
+                           (size_t)DS4_N_VOCAB * sizeof(shadow_logits[0]));
+                }
                 ds4_gpu_set_attention_output_b_n2_q8_override(0);
                 s->checkpoint.len = start + draft_n;
                 ok = spec_frontier_restore(&frontier, s);
@@ -18258,16 +18265,43 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             if (shadow_have) {
                 static uint64_t shadow_checks = 0;
                 static uint64_t shadow_disagreements = 0;
+                int exact_logit_top0 = -1, exact_logit_top1 = -1;
+                int shadow_logit_top0 = -1, shadow_logit_top1 = -1;
+                float exact_logit_v0 = 0.0f, exact_logit_v1 = 0.0f;
+                float shadow_logit_v0 = 0.0f, shadow_logit_v1 = 0.0f;
+                float logits_max_abs = 0.0f;
+                double logits_sumsq = 0.0;
+                if (shadow_ok && shadow_logits) {
+                    logits_top2(row_logits, DS4_N_VOCAB,
+                                &exact_logit_top0, &exact_logit_v0,
+                                &exact_logit_top1, &exact_logit_v1);
+                    logits_top2(shadow_logits, DS4_N_VOCAB,
+                                &shadow_logit_top0, &shadow_logit_v0,
+                                &shadow_logit_top1, &shadow_logit_v1);
+                    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+                        const float d = fabsf(row_logits[i] - shadow_logits[i]);
+                        if (d > logits_max_abs) logits_max_abs = d;
+                        logits_sumsq += (double)d * (double)d;
+                    }
+                }
                 const bool agree =
                     shadow_ok &&
                     shadow_row0_top == row_tops[0] &&
                     shadow_commit_drafts == commit_drafts;
+                const bool logits_top_agree =
+                    shadow_ok &&
+                    shadow_logits &&
+                    shadow_commit_drafts == commit_drafts &&
+                    shadow_logit_top0 == exact_logit_top0;
                 shadow_checks++;
-                if (!agree) shadow_disagreements++;
+                if (!agree || !logits_top_agree) shadow_disagreements++;
                 fprintf(stderr,
                         "ds4: mtp shadow b_n2_q8 check=%llu disagree=%llu ok=%d agree=%d "
                         "exact_commit=%d shadow_commit=%d exact_top=%d shadow_top=%d "
-                        "draft_next=%d exact_margin=%.6f shadow_margin=%.6f\n",
+                        "draft_next=%d exact_margin=%.6f shadow_margin=%.6f "
+                        "logit_agree=%d exact_logit_top=%d shadow_logit_top=%d "
+                        "exact_logit_margin=%.6f shadow_logit_margin=%.6f "
+                        "logit_max_abs=%.6f logit_rms=%.6f\n",
                         (unsigned long long)shadow_checks,
                         (unsigned long long)shadow_disagreements,
                         shadow_ok ? 1 : 0,
@@ -18278,7 +18312,14 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         shadow_row0_top,
                         draft_n > 1 ? drafts[1] : -1,
                         exact_top2.value0 - exact_top2.value1,
-                        shadow_top2.value0 - shadow_top2.value1);
+                        shadow_top2.value0 - shadow_top2.value1,
+                        logits_top_agree ? 1 : 0,
+                        exact_logit_top0,
+                        shadow_logit_top0,
+                        exact_logit_v0 - exact_logit_v1,
+                        shadow_logit_v0 - shadow_logit_v1,
+                        logits_max_abs,
+                        sqrt(logits_sumsq / (double)DS4_N_VOCAB));
             }
             if (mtp_conf_log) {
                 fprintf(stderr,
@@ -18316,6 +18357,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         DS4_MTP_KEEP_ACCEPTED(replayed);
                         spec_frontier_free(&frontier);
                         free(row_logits);
+                        free(shadow_logits);
                         free(row_tops);
                         return n_accept;
                     }
@@ -18349,6 +18391,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     }
                     spec_frontier_free(&frontier);
                     free(row_logits);
+                    free(shadow_logits);
                     free(row_tops);
                     return n_accept;
                 }
@@ -18380,6 +18423,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     }
                     spec_frontier_free(&frontier);
                     free(row_logits);
+                    free(shadow_logits);
                     free(row_tops);
                     return n_accept;
                 }
@@ -18415,6 +18459,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     }
                     spec_frontier_free(&frontier);
                     free(row_logits);
+                    free(shadow_logits);
                     free(row_tops);
                     return n_accept;
                 }
@@ -18456,6 +18501,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     }
                     spec_frontier_free(&frontier);
                     free(row_logits);
+                    free(shadow_logits);
                     free(row_tops);
                     return n_accept;
                 }
@@ -18473,11 +18519,13 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             DS4_MTP_KEEP_ACCEPTED(0);
             spec_frontier_free(&frontier);
             free(row_logits);
+            free(shadow_logits);
             free(row_tops);
             return -1;
         }
         spec_frontier_free(&frontier);
         free(row_logits);
+        free(shadow_logits);
         free(row_tops);
         if (getenv("DS4_MTP_SPEC_LOG")) {
             fprintf(stderr, "ds4: mtp spec micro verifier failed, falling back to sequential\n");
