@@ -55,6 +55,7 @@ WEIGHT_UPLOAD_RE = re.compile(
 WEIGHT_READY_RE = re.compile(
     r"ds4_weight_server: ready manifest=(?P<manifest>\S+) ranges=(?P<ranges>\d+)"
 )
+WEIGHT_LOCK_RE = re.compile(r"ds4_weight_server: acquired lock (?P<path>\S+)")
 
 
 @dataclass(frozen=True)
@@ -425,12 +426,15 @@ def parse_weight_server_log(log_text: str) -> dict[str, Any]:
             "manifest": ready_m.group("manifest"),
             "ranges": int(ready_m.group("ranges")),
         }
+    lock_m = WEIGHT_LOCK_RE.search(log_text)
     return {
         "plans": plans,
         "memory": memory,
         "uploads": uploads,
         "ready": ready,
+        "lock_path": lock_m.group("path") if lock_m else "",
         "shutdown": "ds4_weight_server: shutting down" in log_text,
+        "lock_busy": "another weight server owns lock" in log_text,
         "refused_upload": "refusing upload" in log_text,
     }
 

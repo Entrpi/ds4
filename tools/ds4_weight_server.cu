@@ -13,6 +13,7 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -67,6 +68,39 @@ static bool parent_pid_alive(pid_t pid) {
     if (pid <= 0) return true;
     if (kill(pid, 0) == 0) return true;
     return errno != ESRCH;
+}
+
+static int acquire_owner_lock(const char *path) {
+    if (!path || !path[0]) return -1;
+    int fd = open(path, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "ds4_weight_server: lock open failed %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        char buf[128] = {0};
+        ssize_t nread = pread(fd, buf, sizeof(buf) - 1u, 0);
+        if (nread < 0) buf[0] = '\0';
+        fprintf(stderr,
+                "ds4_weight_server: another weight server owns lock %s%s%s\n",
+                path,
+                buf[0] ? " pid=" : "",
+                buf[0] ? buf : "");
+        close(fd);
+        return -1;
+    }
+    if (ftruncate(fd, 0) != 0) {
+        fprintf(stderr, "ds4_weight_server: lock truncate failed %s: %s\n", path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (dprintf(fd, "%ld\n", (long)getpid()) < 0) {
+        fprintf(stderr, "ds4_weight_server: lock write failed %s: %s\n", path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    fprintf(stderr, "ds4_weight_server: acquired lock %s\n", path);
+    return fd;
 }
 
 static bool read_u32(const mapped_file &m, uint64_t &pos, uint32_t &out) {
@@ -603,6 +637,8 @@ static void usage(FILE *fp) {
             "  --device N        CUDA device ordinal. Default: 0\n"
             "  --scope S         Models to upload: both, base, or mtp. Default: both\n"
             "  --exit-on-parent-pid N Exit if parent/orchestrator PID disappears\n"
+            "  --lock-file FILE  Single-owner lock file. Default: /tmp/ds4_weight_server_cudaN.lock\n"
+            "  --no-lock         Disable the single-owner lock\n"
             "  --span-mb N       Maximum exported raw tensor span. Default: 1024\n"
             "  --copy-chunk-mb N Pinned staged upload chunk. Default: 256\n"
             "  --reserve-gb N    Free CUDA memory to keep unused. Default: 32\n"
@@ -614,6 +650,7 @@ int main(int argc, char **argv) {
     const char *mtp = nullptr;
     const char *manifest = nullptr;
     const char *scope = "both";
+    const char *lock_file = nullptr;
     pid_t exit_on_parent_pid = 0;
     int device = 0;
     uint64_t span_bytes = 1024ull * 1048576ull;
@@ -626,6 +663,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--manifest") && i + 1 < argc) manifest = argv[++i];
         else if (!strcmp(argv[i], "--scope") && i + 1 < argc) scope = argv[++i];
         else if (!strcmp(argv[i], "--exit-on-parent-pid") && i + 1 < argc) exit_on_parent_pid = (pid_t)strtol(argv[++i], nullptr, 10);
+        else if (!strcmp(argv[i], "--lock-file") && i + 1 < argc) lock_file = argv[++i];
+        else if (!strcmp(argv[i], "--no-lock")) lock_file = "";
         else if (!strcmp(argv[i], "--device") && i + 1 < argc) device = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--span-mb") && i + 1 < argc) span_bytes = parse_mib(argv[++i], span_bytes);
         else if (!strcmp(argv[i], "--copy-chunk-mb") && i + 1 < argc) copy_chunk_bytes = parse_mib(argv[++i], copy_chunk_bytes);
@@ -659,6 +698,19 @@ int main(int argc, char **argv) {
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4_weight_server: cudaSetDevice failed: %s\n", cudaGetErrorString(err));
         return 1;
+    }
+
+    char default_lock[128];
+    int lock_fd = -1;
+    if (!dry_run) {
+        if (!lock_file) {
+            snprintf(default_lock, sizeof(default_lock), "/tmp/ds4_weight_server_cuda%d.lock", device);
+            lock_file = default_lock;
+        }
+        if (lock_file[0]) {
+            lock_fd = acquire_owner_lock(lock_file);
+            if (lock_fd < 0) return 1;
+        }
     }
 
     uint64_t total_upload_bytes = 0;
@@ -706,5 +758,6 @@ int main(int argc, char **argv) {
     for (owned_range &r : ranges) {
         if (r.dev) cudaFree(r.dev);
     }
+    if (lock_fd >= 0) close(lock_fd);
     return 0;
 }
