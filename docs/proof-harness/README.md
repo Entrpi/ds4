@@ -88,7 +88,9 @@ the persistent owner unless `--no-weight-server-preflight` is set. Owned-server
 cleanup is a proof condition: if the owner exits during a profile or the runner
 cannot terminate it cleanly, the proof fails. The report also includes parsed
 owner telemetry for planned GiB, memory preflight, uploaded GiB/ranges, ready
-state, and shutdown observation.
+state, and shutdown observation. Owned server runs also pass
+`--exit-on-parent-pid` so the owner exits on its own if the proof runner process
+disappears before normal cleanup.
 
 Manual startup is still available when running several proof commands against
 one owner. Start it only after the dry-run plan and memory preflight look sane:

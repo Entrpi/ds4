@@ -183,6 +183,8 @@ class WeightServer:
             str(self.manifest_path),
             "--scope",
             self.scope,
+            "--exit-on-parent-pid",
+            str(os.getpid()),
             "--reserve-gb",
             str(self.reserve_gb),
         ]

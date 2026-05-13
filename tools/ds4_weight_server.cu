@@ -12,8 +12,10 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 struct mapped_file {
@@ -59,6 +61,12 @@ static bool parse_scope(const char *scope, bool &want_base, bool &want_mtp) {
         return true;
     }
     return false;
+}
+
+static bool parent_pid_alive(pid_t pid) {
+    if (pid <= 0) return true;
+    if (kill(pid, 0) == 0) return true;
+    return errno != ESRCH;
 }
 
 static bool read_u32(const mapped_file &m, uint64_t &pos, uint32_t &out) {
@@ -594,6 +602,7 @@ static void usage(FILE *fp) {
             "Options:\n"
             "  --device N        CUDA device ordinal. Default: 0\n"
             "  --scope S         Models to upload: both, base, or mtp. Default: both\n"
+            "  --exit-on-parent-pid N Exit if parent/orchestrator PID disappears\n"
             "  --span-mb N       Maximum exported raw tensor span. Default: 1024\n"
             "  --copy-chunk-mb N Pinned staged upload chunk. Default: 256\n"
             "  --reserve-gb N    Free CUDA memory to keep unused. Default: 32\n"
@@ -605,6 +614,7 @@ int main(int argc, char **argv) {
     const char *mtp = nullptr;
     const char *manifest = nullptr;
     const char *scope = "both";
+    pid_t exit_on_parent_pid = 0;
     int device = 0;
     uint64_t span_bytes = 1024ull * 1048576ull;
     uint64_t copy_chunk_bytes = 256ull * 1048576ull;
@@ -615,6 +625,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--mtp") && i + 1 < argc) mtp = argv[++i];
         else if (!strcmp(argv[i], "--manifest") && i + 1 < argc) manifest = argv[++i];
         else if (!strcmp(argv[i], "--scope") && i + 1 < argc) scope = argv[++i];
+        else if (!strcmp(argv[i], "--exit-on-parent-pid") && i + 1 < argc) exit_on_parent_pid = (pid_t)strtol(argv[++i], nullptr, 10);
         else if (!strcmp(argv[i], "--device") && i + 1 < argc) device = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--span-mb") && i + 1 < argc) span_bytes = parse_mib(argv[++i], span_bytes);
         else if (!strcmp(argv[i], "--copy-chunk-mb") && i + 1 < argc) copy_chunk_bytes = parse_mib(argv[++i], copy_chunk_bytes);
@@ -682,7 +693,14 @@ int main(int argc, char **argv) {
             ranges.size());
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-    while (!g_stop) sleep(1);
+    while (!g_stop) {
+        if (exit_on_parent_pid > 0 && !parent_pid_alive(exit_on_parent_pid)) {
+            fprintf(stderr, "ds4_weight_server: parent pid %ld disappeared; shutting down\n",
+                    (long)exit_on_parent_pid);
+            break;
+        }
+        sleep(1);
+    }
 
     fprintf(stderr, "ds4_weight_server: shutting down\n");
     for (owned_range &r : ranges) {
