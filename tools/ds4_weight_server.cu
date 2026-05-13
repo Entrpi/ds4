@@ -25,8 +25,10 @@
 
 struct mapped_file {
     int fd = -1;
+    int direct_fd = -1;
     const uint8_t *data = nullptr;
     uint64_t size = 0;
+    uint64_t direct_align = 1;
 };
 
 struct tensor_span {
@@ -245,6 +247,18 @@ static uint64_t align_up(uint64_t v, uint64_t a) {
     return r ? v + (a - r) : v;
 }
 
+static uint64_t align_down(uint64_t v, uint64_t a) {
+    if (a <= 1) return v;
+    return (v / a) * a;
+}
+
+static void *align_ptr(void *ptr, uint64_t align) {
+    if (align <= 1) return ptr;
+    const uintptr_t p = (uintptr_t)ptr;
+    const uintptr_t a = (uintptr_t)align;
+    return (void *)(((p + a - 1u) / a) * a);
+}
+
 static uint64_t sum_rounded_ranges(const std::vector<tensor_span> &ranges, uint64_t granularity) {
     uint64_t total = 0;
     for (const tensor_span &r : ranges) {
@@ -351,6 +365,21 @@ static bool map_file(const char *path, mapped_file &m) {
         return false;
     }
     m.size = (uint64_t)st.st_size;
+    if (st.st_blksize > 1) m.direct_align = (uint64_t)st.st_blksize;
+#if defined(__linux__) && defined(O_DIRECT)
+    if (getenv("DS4_CUDA_NO_DIRECT_IO") == nullptr) {
+        char proc_path[64];
+        snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", m.fd);
+        int direct_fd = open(proc_path, O_RDONLY | O_DIRECT);
+        if (direct_fd >= 0) {
+            m.direct_fd = direct_fd;
+            if (m.direct_align < 512) m.direct_align = 512;
+            fprintf(stderr, "ds4_weight_server: direct I/O enabled for %s align=%llu\n",
+                    path,
+                    (unsigned long long)m.direct_align);
+        }
+    }
+#endif
     void *p = mmap(NULL, (size_t)m.size, PROT_READ, MAP_SHARED, m.fd, 0);
     if (p == MAP_FAILED) {
         fprintf(stderr, "ds4_weight_server: mmap failed %s: %s\n", path, strerror(errno));
@@ -364,6 +393,7 @@ static bool map_file(const char *path, mapped_file &m) {
 
 static void unmap_file(mapped_file &m) {
     if (m.data) munmap((void *)m.data, (size_t)m.size);
+    if (m.direct_fd >= 0) close(m.direct_fd);
     if (m.fd >= 0) close(m.fd);
     m = {};
 }
@@ -568,25 +598,30 @@ static bool pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
 
 struct upload_stage_pool {
     cudaStream_t stream = nullptr;
+    void *raw[4] = {nullptr, nullptr, nullptr, nullptr};
     void *stage[4] = {nullptr, nullptr, nullptr, nullptr};
     cudaEvent_t event[4] = {nullptr, nullptr, nullptr, nullptr};
     uint64_t bytes = 0;
+    uint64_t align = 1;
 };
 
 static void upload_stage_pool_destroy(upload_stage_pool &pool) {
     for (int i = 0; i < 4; i++) {
         if (pool.event[i]) cudaEventDestroy(pool.event[i]);
-        if (pool.stage[i]) cudaFreeHost(pool.stage[i]);
+        if (pool.raw[i]) cudaFreeHost(pool.raw[i]);
         pool.event[i] = nullptr;
+        pool.raw[i] = nullptr;
         pool.stage[i] = nullptr;
     }
     if (pool.stream) cudaStreamDestroy(pool.stream);
     pool.stream = nullptr;
     pool.bytes = 0;
+    pool.align = 1;
 }
 
-static bool upload_stage_pool_init(upload_stage_pool &pool, uint64_t bytes) {
-    if (pool.bytes >= bytes) return true;
+static bool upload_stage_pool_init(upload_stage_pool &pool, uint64_t bytes, uint64_t align) {
+    if (align < 1) align = 1;
+    if (pool.bytes >= bytes && pool.align >= align) return true;
     upload_stage_pool_destroy(pool);
     cudaError_t err = cudaStreamCreateWithFlags(&pool.stream, cudaStreamNonBlocking);
     if (err != cudaSuccess) {
@@ -594,11 +629,13 @@ static bool upload_stage_pool_init(upload_stage_pool &pool, uint64_t bytes) {
         return false;
     }
     for (int i = 0; i < 4; i++) {
-        err = cudaMallocHost(&pool.stage[i], (size_t)bytes);
+        const uint64_t alloc_bytes = bytes + (align > 1 ? align : 1);
+        err = cudaMallocHost(&pool.raw[i], (size_t)alloc_bytes);
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4_weight_server: pinned staging alloc failed: %s\n", cudaGetErrorString(err));
             return false;
         }
+        pool.stage[i] = align_ptr(pool.raw[i], align);
         err = cudaEventCreateWithFlags(&pool.event[i], cudaEventDisableTiming);
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4_weight_server: staging event create failed: %s\n", cudaGetErrorString(err));
@@ -606,12 +643,41 @@ static bool upload_stage_pool_init(upload_stage_pool &pool, uint64_t bytes) {
         }
     }
     pool.bytes = bytes;
+    pool.align = align;
     return true;
 }
 
-static bool upload_range_chunked(int fd, uint64_t file_off, void *dev, uint64_t bytes,
+static bool read_stage(const mapped_file &m, void *stage, uint64_t stage_bytes,
+                       uint64_t file_off, uint64_t bytes, const char **payload) {
+    *payload = (const char *)stage;
+#if defined(__linux__) && defined(O_DIRECT)
+    if (m.direct_fd >= 0 && m.direct_align > 1 && m.size != 0) {
+        const uint64_t aligned_off = align_down(file_off, m.direct_align);
+        const uint64_t delta = file_off - aligned_off;
+        const uint64_t read_size = align_up(delta + bytes, m.direct_align);
+        if (aligned_off <= m.size && read_size <= stage_bytes && read_size <= m.size - aligned_off) {
+            const int saved_errno = errno;
+            errno = 0;
+            if (pread_full(m.direct_fd, stage, read_size, aligned_off)) {
+                *payload = (const char *)stage + delta;
+                errno = saved_errno;
+                return true;
+            }
+            const int direct_errno = errno;
+            errno = direct_errno;
+        }
+    }
+#else
+    (void)stage_bytes;
+#endif
+    return pread_full(m.fd, stage, bytes, file_off);
+}
+
+static bool upload_range_chunked(const mapped_file &m, uint64_t file_off, void *dev, uint64_t bytes,
                                  upload_stage_pool &pool, uint64_t chunk_bytes) {
-    if (!upload_stage_pool_init(pool, chunk_bytes)) return false;
+    const uint64_t stage_align = m.direct_fd >= 0 ? m.direct_align : 1;
+    const uint64_t stage_bytes = chunk_bytes + (stage_align > 1 ? stage_align : 1);
+    if (!upload_stage_pool_init(pool, stage_bytes, stage_align)) return false;
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
     while (copied < bytes) {
@@ -625,12 +691,13 @@ static bool upload_range_chunked(int fd, uint64_t file_off, void *dev, uint64_t 
                 return false;
             }
         }
-        if (!pread_full(fd, pool.stage[bi], n, file_off + copied)) {
+        const char *payload = nullptr;
+        if (!read_stage(m, pool.stage[bi], pool.bytes, file_off + copied, n, &payload)) {
             fprintf(stderr, "ds4_weight_server: model read failed at off=%llu: %s\n",
                     (unsigned long long)(file_off + copied), strerror(errno));
             return false;
         }
-        err = cudaMemcpyAsync((char *)dev + copied, pool.stage[bi], (size_t)n,
+        err = cudaMemcpyAsync((char *)dev + copied, payload, (size_t)n,
                               cudaMemcpyHostToDevice, pool.stream);
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4_weight_server: async upload failed: %s\n", cudaGetErrorString(err));
@@ -642,7 +709,7 @@ static bool upload_range_chunked(int fd, uint64_t file_off, void *dev, uint64_t 
             return false;
         }
 #if defined(POSIX_FADV_DONTNEED)
-        (void)posix_fadvise(fd, (off_t)(file_off + copied), (off_t)n, POSIX_FADV_DONTNEED);
+        (void)posix_fadvise(m.fd, (off_t)(file_off + copied), (off_t)n, POSIX_FADV_DONTNEED);
 #endif
         copied += n;
         chunk_idx++;
@@ -777,7 +844,7 @@ static bool upload_model(const char *id, const char *path, uint64_t span_bytes,
             }
             r.dev = dev;
         }
-        if (!upload_range_chunked(m.fd, off, r.dev, bytes, pool, copy_chunk_bytes)) {
+        if (!upload_range_chunked(m, off, r.dev, bytes, pool, copy_chunk_bytes)) {
             release_owned_range(r);
             upload_stage_pool_destroy(pool);
             unmap_file(m);
