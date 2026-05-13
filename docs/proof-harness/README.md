@@ -83,12 +83,15 @@ and cleanup machinery.
 
 The JSON report includes `weight_server` with the command, manifest path, log
 path, dry-run preflight result, startup time, readiness, and cleanup result.
-The runner performs a short-lived `ds4_weight_server --dry-run` before launching
-the persistent owner unless `--no-weight-server-preflight` is set. Owned-server
-cleanup is a proof condition: if the owner exits during a profile or the runner
-cannot terminate it cleanly, the proof fails. The report also includes parsed
-owner telemetry for planned GiB, memory preflight, uploaded GiB/ranges, ready
-state, and shutdown observation. Owned server runs also pass
+It also includes `weight_server_validation`, a top-level pass/fail verdict for
+automation. The verdict checks ready state, scope, preflight success when
+enabled, upload telemetry for the requested model scope, parent PID guarding,
+lock acquisition, shutdown observation, and clean termination for owned runs.
+For external manifests, it checks the live owner record and manifest ranges.
+Owned-server cleanup is a proof condition: if the owner exits during a profile
+or the runner cannot terminate it cleanly, the proof fails. The report also
+includes parsed owner telemetry for planned GiB, memory preflight, uploaded
+GiB/ranges, ready state, and shutdown observation. Owned server runs pass
 `--exit-on-parent-pid` so the owner exits on its own if the proof runner process
 disappears before normal cleanup.
 The server also takes a nonblocking per-CUDA-device lock by default

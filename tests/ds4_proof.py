@@ -439,6 +439,65 @@ def parse_weight_server_log(log_text: str) -> dict[str, Any]:
     }
 
 
+def weight_server_expected_models(scope: str) -> list[str]:
+    if scope == "both":
+        return ["base", "mtp"]
+    return [scope]
+
+
+def weight_server_validation(
+    state: WeightServerState,
+    *,
+    scope: str,
+    preflight_required: bool,
+) -> dict[str, Any]:
+    checks: dict[str, bool] = {}
+    reasons: list[str] = []
+    if not state.enabled:
+        return {"passed": True, "enabled": False, "checks": checks, "reasons": reasons}
+
+    checks["ready"] = state.ready
+    checks["manifest_path"] = bool(state.manifest_path)
+    checks["scope_matches"] = state.scope == scope
+    if preflight_required:
+        checks["preflight_rc_zero"] = state.preflight_rc == 0
+        checks["preflight_not_refused"] = not state.preflight_telemetry.get("refused_upload", False)
+
+    if state.owned:
+        telemetry = state.telemetry
+        cmd = state.cmd
+        uploads = telemetry.get("uploads", {})
+        ready = telemetry.get("ready", {})
+        checks["cleanup_terminated"] = state.cleanup == "terminated"
+        checks["shutdown_observed"] = telemetry.get("shutdown", False)
+        checks["ready_telemetry"] = bool(ready.get("manifest")) and int(ready.get("ranges", 0)) > 0
+        checks["parent_guard"] = "--exit-on-parent-pid" in cmd
+        checks["lock_not_busy"] = not telemetry.get("lock_busy", False)
+        if "--no-lock" not in cmd:
+            checks["lock_recorded"] = bool(telemetry.get("lock_path"))
+        for model_id in weight_server_expected_models(scope):
+            checks[f"uploaded_{model_id}"] = model_id in uploads and int(uploads[model_id].get("ranges", 0)) > 0
+    else:
+        manifest = state.telemetry.get("manifest", {})
+        owner = manifest.get("owner", {})
+        ranges = manifest.get("ranges", {})
+        checks["external_manifest"] = state.cleanup == "external"
+        checks["external_owner"] = bool(owner.get("pid")) and owner.get("scope") == scope
+        for model_id in weight_server_expected_models(scope):
+            checks[f"manifest_ranges_{model_id}"] = int(ranges.get(model_id, 0)) > 0
+
+    for name, ok in checks.items():
+        if not ok:
+            reasons.append(name)
+    return {
+        "passed": not reasons,
+        "enabled": True,
+        "preflight_required": preflight_required,
+        "checks": checks,
+        "reasons": reasons,
+    }
+
+
 def profile_from_json(raw: dict[str, Any]) -> EngineProfile:
     return EngineProfile(
         name=str(raw["name"]),
@@ -1041,8 +1100,16 @@ def main(argv: list[str] | None = None) -> int:
             weight_server_state = weight_server.state
             print(f"ds4_weight_server cleanup={weight_server_state.cleanup}")
 
-    if weight_server and weight_server_state.cleanup != "terminated":
-        print(f"ds4_weight_server cleanup FAILED cleanup={weight_server_state.cleanup}")
+    weight_server_verdict = weight_server_validation(
+        weight_server_state,
+        scope=args.weight_server_scope,
+        preflight_required=args.start_weight_server and not args.no_weight_server_preflight,
+    )
+    if weight_server_verdict["enabled"] and not weight_server_verdict["passed"]:
+        print(
+            "ds4_weight_server validation FAILED "
+            f"reasons={','.join(weight_server_verdict['reasons'])}"
+        )
         failures += 1
 
     report = {
@@ -1054,6 +1121,7 @@ def main(argv: list[str] | None = None) -> int:
         "weight_ipc_manifest": weight_ipc_manifest,
         "weight_ipc_scope": args.weight_server_scope,
         "weight_server": dataclass_dict(weight_server_state),
+        "weight_server_validation": weight_server_verdict,
         "profiles": [dataclass_dict(p) for p in profiles],
         "prompts": [dataclass_dict(p) for p in prompts],
         "contracts": [dataclass_dict(c) for c in contracts],
