@@ -31,18 +31,23 @@ struct tensor_span {
     uint64_t end = 0;
 };
 
+enum weight_backend {
+    WEIGHT_BACKEND_IPC = 0,
+    WEIGHT_BACKEND_VMM = 1,
+};
+
 struct owned_range {
+    weight_backend backend = WEIGHT_BACKEND_IPC;
     std::string model_id;
     uint64_t model_size = 0;
     uint64_t off = 0;
     uint64_t bytes = 0;
+    uint64_t alloc_bytes = 0;
     void *dev = nullptr;
     cudaIpcMemHandle_t handle{};
-};
-
-enum weight_backend {
-    WEIGHT_BACKEND_IPC = 0,
-    WEIGHT_BACKEND_VMM = 1,
+    CUmemGenericAllocationHandle vmm_handle{};
+    CUdeviceptr vmm_va = 0;
+    int exported_fd = -1;
 };
 
 struct vmm_support {
@@ -641,6 +646,68 @@ static bool upload_range_chunked(int fd, uint64_t file_off, void *dev, uint64_t 
     return true;
 }
 
+static void release_owned_range(owned_range &r) {
+    if (r.exported_fd >= 0) {
+        close(r.exported_fd);
+        r.exported_fd = -1;
+    }
+    if (r.backend == WEIGHT_BACKEND_VMM) {
+        if (r.vmm_va && r.alloc_bytes) {
+            (void)cuMemUnmap(r.vmm_va, (size_t)r.alloc_bytes);
+            (void)cuMemAddressFree(r.vmm_va, (size_t)r.alloc_bytes);
+            r.vmm_va = 0;
+        }
+        if (r.vmm_handle) {
+            (void)cuMemRelease(r.vmm_handle);
+            r.vmm_handle = 0;
+        }
+        r.dev = nullptr;
+        return;
+    }
+    if (r.dev) {
+        (void)cudaFree(r.dev);
+        r.dev = nullptr;
+    }
+}
+
+static bool vmm_alloc_range(int device, uint64_t logical_bytes, uint64_t granularity, owned_range &r) {
+    if (logical_bytes == 0 || granularity == 0) return false;
+    const uint64_t alloc_bytes = align_up(logical_bytes, granularity);
+    CUmemAllocationProp prop = vmm_allocation_prop(device);
+    CUmemGenericAllocationHandle handle;
+    memset(&handle, 0, sizeof(handle));
+    if (!driver_ok(cuMemCreate(&handle, (size_t)alloc_bytes, &prop, 0), "VMM allocation create")) {
+        return false;
+    }
+    CUdeviceptr va = 0;
+    if (!driver_ok(cuMemAddressReserve(&va, (size_t)alloc_bytes, 0, 0, 0), "VMM address reserve")) {
+        (void)cuMemRelease(handle);
+        return false;
+    }
+    if (!driver_ok(cuMemMap(va, (size_t)alloc_bytes, 0, handle, 0), "VMM map")) {
+        (void)cuMemAddressFree(va, (size_t)alloc_bytes);
+        (void)cuMemRelease(handle);
+        return false;
+    }
+    CUmemAccessDesc access;
+    memset(&access, 0, sizeof(access));
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id = device;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (!driver_ok(cuMemSetAccess(va, (size_t)alloc_bytes, &access, 1), "VMM set access")) {
+        (void)cuMemUnmap(va, (size_t)alloc_bytes);
+        (void)cuMemAddressFree(va, (size_t)alloc_bytes);
+        (void)cuMemRelease(handle);
+        return false;
+    }
+    r.backend = WEIGHT_BACKEND_VMM;
+    r.alloc_bytes = alloc_bytes;
+    r.vmm_handle = handle;
+    r.vmm_va = va;
+    r.dev = (void *)va;
+    return true;
+}
+
 static void hex_encode(const void *data, size_t bytes, std::string &out) {
     static const char *hex = "0123456789abcdef";
     const uint8_t *p = (const uint8_t *)data;
@@ -652,7 +719,8 @@ static void hex_encode(const void *data, size_t bytes, std::string &out) {
 }
 
 static bool upload_model(const char *id, const char *path, uint64_t span_bytes,
-                         uint64_t copy_chunk_bytes, std::vector<owned_range> &ranges) {
+                         uint64_t copy_chunk_bytes, std::vector<owned_range> &ranges,
+                         weight_backend backend, int device, uint64_t vmm_granularity) {
     mapped_file m;
     if (!map_file(path, m)) return false;
     std::vector<tensor_span> spans;
@@ -673,37 +741,52 @@ static bool upload_model(const char *id, const char *path, uint64_t span_bytes,
     for (const tensor_span &planned_range : plan) {
         const uint64_t off = planned_range.off;
         const uint64_t bytes = planned_range.end - planned_range.off;
-        void *dev = nullptr;
-        cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4_weight_server: cudaMalloc failed for %s %.2f MiB: %s\n",
-                    id, (double)bytes / 1048576.0, cudaGetErrorString(err));
-            unmap_file(m);
-            return false;
-        }
-        if (!upload_range_chunked(m.fd, off, dev, bytes, pool, copy_chunk_bytes)) {
-            cudaFree(dev);
-            upload_stage_pool_destroy(pool);
-            unmap_file(m);
-            return false;
-        }
-        cudaIpcMemHandle_t handle;
-        err = cudaIpcGetMemHandle(&handle, dev);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "ds4_weight_server: cudaIpcGetMemHandle failed for %s: %s\n",
-                    id, cudaGetErrorString(err));
-            cudaFree(dev);
-            upload_stage_pool_destroy(pool);
-            unmap_file(m);
-            return false;
-        }
         owned_range r;
+        r.backend = backend;
         r.model_id = id;
         r.model_size = m.size;
         r.off = off;
         r.bytes = bytes;
-        r.dev = dev;
-        r.handle = handle;
+        r.alloc_bytes = bytes;
+        if (backend == WEIGHT_BACKEND_VMM) {
+            if (!vmm_alloc_range(device, bytes, vmm_granularity, r)) {
+                fprintf(stderr, "ds4_weight_server: VMM allocation failed for %s %.2f MiB\n",
+                        id, (double)bytes / 1048576.0);
+                upload_stage_pool_destroy(pool);
+                unmap_file(m);
+                return false;
+            }
+        } else {
+            void *dev = nullptr;
+            cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "ds4_weight_server: cudaMalloc failed for %s %.2f MiB: %s\n",
+                        id, (double)bytes / 1048576.0, cudaGetErrorString(err));
+                upload_stage_pool_destroy(pool);
+                unmap_file(m);
+                return false;
+            }
+            r.dev = dev;
+        }
+        if (!upload_range_chunked(m.fd, off, r.dev, bytes, pool, copy_chunk_bytes)) {
+            release_owned_range(r);
+            upload_stage_pool_destroy(pool);
+            unmap_file(m);
+            return false;
+        }
+        if (backend == WEIGHT_BACKEND_IPC) {
+            cudaIpcMemHandle_t handle;
+            cudaError_t err = cudaIpcGetMemHandle(&handle, r.dev);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "ds4_weight_server: cudaIpcGetMemHandle failed for %s: %s\n",
+                        id, cudaGetErrorString(err));
+                release_owned_range(r);
+                upload_stage_pool_destroy(pool);
+                unmap_file(m);
+                return false;
+            }
+            r.handle = handle;
+        }
         ranges.push_back(r);
         uploaded += bytes;
         count++;
@@ -720,30 +803,46 @@ static bool upload_model(const char *id, const char *path, uint64_t span_bytes,
 }
 
 static bool write_manifest(const char *path, const std::vector<owned_range> &ranges,
-                           int device, const char *scope, const char *lock_file) {
+                           int device, const char *scope, const char *lock_file,
+                           weight_backend backend) {
     std::string tmp = std::string(path) + ".tmp";
     FILE *fp = fopen(tmp.c_str(), "w");
     if (!fp) {
         fprintf(stderr, "ds4_weight_server: manifest open failed %s: %s\n", tmp.c_str(), strerror(errno));
         return false;
     }
-    fprintf(fp, "DS4_WEIGHT_SERVER_IPC_V1\n");
+    fprintf(fp, "%s\n", backend == WEIGHT_BACKEND_VMM ? "DS4_WEIGHT_SERVER_VMM_V1" : "DS4_WEIGHT_SERVER_IPC_V1");
     fprintf(fp, "# owner <pid> <cuda-device> <scope> <lock-file-or-dash>\n");
     fprintf(fp, "owner %ld %d %s %s\n",
             (long)getpid(),
             device,
             scope ? scope : "both",
             (lock_file && lock_file[0]) ? lock_file : "-");
-    fprintf(fp, "# range <model-id> <model-size> <offset> <bytes> <cuda-ipc-handle-hex>\n");
+    if (backend == WEIGHT_BACKEND_VMM) {
+        fprintf(fp, "# alloc <alloc-id> <model-id> <model-size> <offset> <bytes> <alloc-bytes>\n");
+    } else {
+        fprintf(fp, "# range <model-id> <model-size> <offset> <bytes> <cuda-ipc-handle-hex>\n");
+    }
+    uint64_t alloc_id = 0;
     for (const owned_range &r : ranges) {
-        std::string hex;
-        hex_encode(&r.handle, sizeof(r.handle), hex);
-        fprintf(fp, "range %s %llu %llu %llu %s\n",
-                r.model_id.c_str(),
-                (unsigned long long)r.model_size,
-                (unsigned long long)r.off,
-                (unsigned long long)r.bytes,
-                hex.c_str());
+        if (backend == WEIGHT_BACKEND_VMM) {
+            fprintf(fp, "alloc %llu %s %llu %llu %llu %llu\n",
+                    (unsigned long long)alloc_id++,
+                    r.model_id.c_str(),
+                    (unsigned long long)r.model_size,
+                    (unsigned long long)r.off,
+                    (unsigned long long)r.bytes,
+                    (unsigned long long)r.alloc_bytes);
+        } else {
+            std::string hex;
+            hex_encode(&r.handle, sizeof(r.handle), hex);
+            fprintf(fp, "range %s %llu %llu %llu %s\n",
+                    r.model_id.c_str(),
+                    (unsigned long long)r.model_size,
+                    (unsigned long long)r.off,
+                    (unsigned long long)r.bytes,
+                    hex.c_str());
+        }
     }
     if (fclose(fp) != 0) return false;
     if (rename(tmp.c_str(), path) != 0) {
@@ -892,15 +991,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ds4_weight_server: dry-run complete; no allocations or manifest were created\n");
         return 0;
     }
-    if (backend == WEIGHT_BACKEND_VMM) {
-        fprintf(stderr, "ds4_weight_server: VMM backend allocation is not implemented yet; use --dry-run\n");
-        return 1;
-    }
 
     std::vector<owned_range> ranges;
-    if (want_base && !upload_model("base", base, span_bytes, copy_chunk_bytes, ranges)) return 1;
-    if (want_mtp && !upload_model("mtp", mtp, span_bytes, copy_chunk_bytes, ranges)) return 1;
-    if (!write_manifest(manifest, ranges, device, scope, lock_file)) return 1;
+    if (want_base && !upload_model("base", base, span_bytes, copy_chunk_bytes, ranges,
+                                   backend, device, vmm_granularity)) return 1;
+    if (want_mtp && !upload_model("mtp", mtp, span_bytes, copy_chunk_bytes, ranges,
+                                  backend, device, vmm_granularity)) return 1;
+    if (!write_manifest(manifest, ranges, device, scope, lock_file, backend)) return 1;
 
     fprintf(stderr,
             "ds4_weight_server: ready manifest=%s ranges=%zu. Keep this process alive while workers run.\n",
@@ -919,7 +1016,7 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "ds4_weight_server: shutting down\n");
     for (owned_range &r : ranges) {
-        if (r.dev) cudaFree(r.dev);
+        release_owned_range(r);
     }
     if (lock_fd >= 0) close(lock_fd);
     return 0;
