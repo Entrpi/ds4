@@ -11049,6 +11049,7 @@ static bool metal_graph_encode_layer_attention_batch(
     const bool index_stage_profile = getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
     const bool layer_stage_profile = getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL;
     const bool q_stage_profile = getenv("DS4_METAL_Q_STAGE_PROFILE") != NULL;
+    const bool batch_q8_pair = getenv("DS4_CUDA_NO_BATCH_Q8_PAIR") == NULL;
     double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
     double q_stage_t0 = q_stage_profile ? now_sec() : 0.0;
 #define DS4_METAL_PROFILE_ATTN_STAGE(name) do { \
@@ -11141,28 +11142,42 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_qr,
-                                              model->map,
-                                              model->size,
-                                              layer->attn_q_a->abs_offset,
-                                              DS4_N_EMBD,
-                                              q_rank,
-                                              g->batch_attn_norm,
-                                              n_tokens) != 0;
+    if (ok && qkv_rms_fused && batch_q8_pair) {
+        ok = ds4_gpu_matmul_q8_0_pair_tensor(g->batch_qr,
+                                             g->batch_kv_raw,
+                                             model->map,
+                                             model->size,
+                                             layer->attn_q_a->abs_offset,
+                                             layer->attn_kv->abs_offset,
+                                             DS4_N_EMBD,
+                                             q_rank,
+                                             DS4_N_HEAD_DIM,
+                                             g->batch_attn_norm,
+                                             n_tokens) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(g->batch_qr,
+                                          model->map,
+                                          model->size,
+                                          layer->attn_q_a->abs_offset,
+                                          DS4_N_EMBD,
+                                          q_rank,
+                                          g->batch_attn_norm,
+                                          n_tokens) != 0;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", g->batch_qr,
                                       (uint64_t)n_tokens * q_rank, il, pos0);
     }
     DS4_METAL_PROFILE_Q_STAGE("q_a");
     if (qkv_rms_fused) {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_kv_raw,
-                                                  model->map,
-                                                  model->size,
-                                                  layer->attn_kv->abs_offset,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HEAD_DIM,
-                                                  g->batch_attn_norm,
-                                                  n_tokens) != 0;
+        if (ok && !batch_q8_pair) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_kv_raw,
+                                                                    model->map,
+                                                                    model->size,
+                                                                    layer->attn_kv->abs_offset,
+                                                                    DS4_N_EMBD,
+                                                                    DS4_N_HEAD_DIM,
+                                                                    g->batch_attn_norm,
+                                                                    n_tokens) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->batch_kv_raw,
                                           (uint64_t)n_tokens * DS4_N_HEAD_DIM, il, pos0);
@@ -12366,6 +12381,7 @@ static bool metal_graph_encode_layer_ffn_batch(
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     const bool layer_stage_profile = getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL;
+    const bool batch_q8_pair = getenv("DS4_CUDA_NO_BATCH_Q8_PAIR") == NULL;
     double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
 #define DS4_METAL_PROFILE_FFN_STAGE(name) do { \
         if (ok && layer_stage_profile) { \
@@ -12523,22 +12539,36 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_gate,
-                                              model->map,
-                                              model->size,
-                                              layer->ffn_gate_shexp->abs_offset,
-                                              DS4_N_EMBD,
-                                              shared_dim,
-                                              g->batch_ffn_norm,
-                                              n_tokens) != 0;
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_up,
-                                              model->map,
-                                              model->size,
-                                              layer->ffn_up_shexp->abs_offset,
-                                              DS4_N_EMBD,
-                                              shared_dim,
-                                              g->batch_ffn_norm,
-                                              n_tokens) != 0;
+    if (ok && batch_q8_pair) {
+        ok = ds4_gpu_matmul_q8_0_pair_tensor(g->batch_shared_gate,
+                                             g->batch_shared_up,
+                                             model->map,
+                                             model->size,
+                                             layer->ffn_gate_shexp->abs_offset,
+                                             layer->ffn_up_shexp->abs_offset,
+                                             DS4_N_EMBD,
+                                             shared_dim,
+                                             shared_dim,
+                                             g->batch_ffn_norm,
+                                             n_tokens) != 0;
+    } else {
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_gate,
+                                                  model->map,
+                                                  model->size,
+                                                  layer->ffn_gate_shexp->abs_offset,
+                                                  DS4_N_EMBD,
+                                                  shared_dim,
+                                                  g->batch_ffn_norm,
+                                                  n_tokens) != 0;
+        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_up,
+                                                  model->map,
+                                                  model->size,
+                                                  layer->ffn_up_shexp->abs_offset,
+                                                  DS4_N_EMBD,
+                                                  shared_dim,
+                                                  g->batch_ffn_norm,
+                                                  n_tokens) != 0;
+    }
     DS4_METAL_PROFILE_FFN_STAGE("shared_gate_up");
     if (ok) ok = ds4_gpu_swiglu_tensor(g->batch_shared_mid,
                                          g->batch_shared_gate,

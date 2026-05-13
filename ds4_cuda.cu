@@ -2486,6 +2486,56 @@ __global__ static void matmul_q8_0_pair_preq_warp8_kernel(
     }
 }
 
+__global__ static void matmul_q8_0_pair_preq_batch_warp8_kernel(
+        float *out0,
+        float *out1,
+        const unsigned char *w0,
+        const unsigned char *w1,
+        const int8_t *xq,
+        const float *xscale,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        uint64_t n_tok,
+        uint64_t blocks,
+        int use_dp4a) {
+    uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    uint64_t tok = (uint64_t)blockIdx.y;
+    uint32_t lane = threadIdx.x & 31u;
+    if ((row >= out0_dim && row >= out1_dim) || tok >= n_tok) return;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const unsigned char *wr0 = row < out0_dim ? w0 + row * blocks * 34 : NULL;
+    const unsigned char *wr1 = row < out1_dim ? w1 + row * blocks * 34 : NULL;
+    const int8_t *xqr = xq + tok * blocks * 32;
+    const float *xsr = xscale + tok * blocks;
+    for (uint64_t b = lane; b < blocks; b += 32u) {
+        uint64_t i0 = b * 32;
+        uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+        const int8_t *xqb = xqr + b * 32;
+        const float xs = xsr[b];
+        if (wr0) {
+            const __half *scale_h = (const __half *)(wr0 + b * 34);
+            const int8_t *qs = (const int8_t *)(wr0 + b * 34 + 2);
+            int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+            acc0 += __half2float(*scale_h) * xs * (float)dot;
+        }
+        if (wr1) {
+            const __half *scale_h = (const __half *)(wr1 + b * 34);
+            const int8_t *qs = (const int8_t *)(wr1 + b * 34 + 2);
+            int dot = dot_i8_block(qs, xqb, bn, use_dp4a);
+            acc1 += __half2float(*scale_h) * xs * (float)dot;
+        }
+    }
+    acc0 = warp_sum_f32(acc0);
+    acc1 = warp_sum_f32(acc1);
+    if (lane == 0) {
+        if (row < out0_dim) out0[tok * out0_dim + row] = acc0;
+        if (row < out1_dim) out1[tok * out1_dim + row] = acc1;
+    }
+}
+
 __global__ static void matmul_q8_0_hc_expand_preq_warp8_kernel(
         float *out_hc,
         float *block_out,
@@ -6424,12 +6474,6 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out0_dim == 0 || out1_dim == 0 || n_tok == 0) {
         return 0;
     }
-    if (n_tok != 1) {
-        return cuda_matmul_q8_0_tensor_labeled(out0, model_map, model_size, weight0_offset,
-                                               in_dim, out0_dim, x, n_tok, "q8_0_pair0") &&
-               cuda_matmul_q8_0_tensor_labeled(out1, model_map, model_size, weight1_offset,
-                                               in_dim, out1_dim, x, n_tok, "q8_0_pair1");
-    }
     const uint64_t blocks = (in_dim + 31) / 32;
     if (weight0_offset > model_size || weight1_offset > model_size ||
         out0_dim > UINT64_MAX / (blocks * 34) ||
@@ -6440,39 +6484,56 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     const uint64_t weight1_bytes = out1_dim * blocks * 34;
     if (weight0_bytes > model_size - weight0_offset ||
         weight1_bytes > model_size - weight1_offset ||
-        x->bytes < in_dim * sizeof(float) ||
-        out0->bytes < out0_dim * sizeof(float) ||
-        out1->bytes < out1_dim * sizeof(float)) {
+        x->bytes < n_tok * in_dim * sizeof(float) ||
+        out0->bytes < n_tok * out0_dim * sizeof(float) ||
+        out1->bytes < n_tok * out1_dim * sizeof(float)) {
         return 0;
     }
     const char *w0 = cuda_model_range_ptr(model_map, weight0_offset, weight0_bytes, "q8_0_pair0");
     const char *w1 = cuda_model_range_ptr(model_map, weight1_offset, weight1_bytes, "q8_0_pair1");
     if (!w0 || !w1) return 0;
 
-    const uint64_t xq_bytes = blocks * 32u;
+    const uint64_t xq_bytes = n_tok * blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
+    const uint64_t tmp_bytes = scale_offset + n_tok * blocks * sizeof(float);
     void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 pair prequant");
     if (!tmp) return 0;
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
-    dim3 qgrid((unsigned)blocks, 1, 1);
+    dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
     quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
-    matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)max_out + 7u) / 8u, 256>>>(
-            (float *)out0->ptr,
-            (float *)out1->ptr,
-            reinterpret_cast<const unsigned char *>(w0),
-            reinterpret_cast<const unsigned char *>(w1),
-            xq,
-            xscale,
-            in_dim,
-            out0_dim,
-            out1_dim,
-            blocks,
-            use_dp4a);
+    if (n_tok == 1) {
+        matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)max_out + 7u) / 8u, 256>>>(
+                (float *)out0->ptr,
+                (float *)out1->ptr,
+                reinterpret_cast<const unsigned char *>(w0),
+                reinterpret_cast<const unsigned char *>(w1),
+                xq,
+                xscale,
+                in_dim,
+                out0_dim,
+                out1_dim,
+                blocks,
+                use_dp4a);
+    } else {
+        dim3 grid(((unsigned)max_out + 7u) / 8u, (unsigned)n_tok, 1);
+        matmul_q8_0_pair_preq_batch_warp8_kernel<<<grid, 256>>>(
+                (float *)out0->ptr,
+                (float *)out1->ptr,
+                reinterpret_cast<const unsigned char *>(w0),
+                reinterpret_cast<const unsigned char *>(w1),
+                xq,
+                xscale,
+                in_dim,
+                out0_dim,
+                out1_dim,
+                n_tok,
+                blocks,
+                use_dp4a);
+    }
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");
 }
 
