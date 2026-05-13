@@ -175,6 +175,74 @@ The verified speedup is modest but real on this benchmark: optimized exact MTP
 beat the no-MTP baseline by about 4.9%, and beat the structural rollback by
 about 7.1%.
 
+## Current Profiling Details
+
+For stage attribution, use the graph stage profiler plus MTP timing:
+
+```sh
+DS4_CUDA_MTP_TOP2=1 \
+DS4_CUDA_MTP_VERIFY_TOP2=1 \
+DS4_CUDA_MTP_VERIFY_OPT_OUTPUT=1 \
+DS4_MTP_TIMING=1 \
+DS4_METAL_LAYER_STAGE_PROFILE=1 \
+DS4_CUDA_MOE_PROFILE=1 \
+./ds4 --cuda -m "$BASE" --mtp "$MTP" --mtp-draft 2 \
+  --temp 0 --nothink -n 32 -p "$PROMPT" \
+  > /tmp/ds4_mtp_profile.out 2> /tmp/ds4_mtp_profile.log
+```
+
+`DS4_METAL_LAYER_STAGE_PROFILE` is shared by the graph encoder despite the
+name, so it also profiles the CUDA graph path. It synchronizes at each stage
+boundary, which makes the run slower; use it for attribution, not headline
+throughput.
+
+On GB10, the current two-token target verifier profile measured about
+`103.45 ms` of synchronized layer work per verifier cycle. Normal unsynchronized
+MTP timing from the same code path measured about `106 ms` average verifier time,
+so the stage profile accounts for almost all of the remaining verifier cost.
+
+Per verifier cycle, two-token layer-stage attribution was:
+
+| Stage | Time | Share |
+| --- | ---: | ---: |
+| routed MoE | 29.73 ms | 28.7% |
+| attention output projection | 27.20 ms | 26.3% |
+| Q path | 15.03 ms | 14.5% |
+| compressor | 6.81 ms | 6.6% |
+| shared expert gate/up | 4.91 ms | 4.7% |
+| shared expert down | 4.05 ms | 3.9% |
+| indexer setup | 4.04 ms | 3.9% |
+| HC pre projections | 3.97 ms | 3.8% |
+| attention proper | 2.71 ms | 2.6% |
+| norms | 1.58 ms | 1.5% |
+| router | 1.41 ms | 1.4% |
+| HC post projections | 0.91 ms | 0.9% |
+| KV path | 0.81 ms | 0.8% |
+| inverse RoPE | 0.31 ms | 0.3% |
+
+Grouped by layer half:
+
+| Layer half | Time | Share |
+| --- | ---: | ---: |
+| Attention-side work | 60.18 ms | 58.2% |
+| FFN/MoE-side work | 43.27 ms | 41.8% |
+
+The CUDA MoE sub-profile for the same two-token verifier shape averaged:
+
+| MoE substage | Time |
+| --- | ---: |
+| input Q8 quantize | 0.006 ms |
+| pair sort | 0.040 ms |
+| gate/up | 0.407 ms |
+| mid Q8 quantize | 0.004 ms |
+| down | 0.222 ms |
+| sum | 0.001 ms |
+| total per layer | 0.680 ms |
+
+This is why the remaining optimization target is clear: most of the exact MTP
+cost is still the full target verifier pass, especially routed MoE, attention
+output projection, and the Q path.
+
 ## Why The Gain Is Modest
 
 MTP is not free. Each speculative cycle does three expensive things:
