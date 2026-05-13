@@ -9090,6 +9090,7 @@ static bool metal_graph_encode_decode_layer(
         attn_factor /= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }
     const bool qkv_rms_fused = !metal_graph_use_reference_qkv_norm();
+    const bool decode_q8_pair = getenv("DS4_CUDA_NO_DECODE_Q8_PAIR") == NULL;
 
     bool ok = true;
     const bool decode_stage_profile = getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL;
@@ -9148,18 +9149,32 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
     }
-    if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->qr, model->map, model->size,
-                                              layer->attn_q_a->abs_offset,
-                                              DS4_N_EMBD, q_rank,
-                                              g->attn_norm, 1) != 0;
+    if (ok && qkv_rms_fused && decode_q8_pair) {
+        ok = ds4_gpu_matmul_q8_0_pair_tensor(g->qr,
+                                             g->kv_raw,
+                                             model->map,
+                                             model->size,
+                                             layer->attn_q_a->abs_offset,
+                                             layer->attn_kv->abs_offset,
+                                             DS4_N_EMBD,
+                                             q_rank,
+                                             DS4_N_HEAD_DIM,
+                                             g->attn_norm,
+                                             1) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(g->qr, model->map, model->size,
+                                          layer->attn_q_a->abs_offset,
+                                          DS4_N_EMBD, q_rank,
+                                          g->attn_norm, 1) != 0;
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", g->qr, q_rank, il, pos);
     }
     if (qkv_rms_fused) {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
-                                                  layer->attn_kv->abs_offset,
-                                                  DS4_N_EMBD, DS4_N_HEAD_DIM,
-                                                  g->attn_norm, 1) != 0;
+        if (ok && !decode_q8_pair) ok = ds4_gpu_matmul_q8_0_tensor(g->kv_raw, model->map, model->size,
+                                                                     layer->attn_kv->abs_offset,
+                                                                     DS4_N_EMBD, DS4_N_HEAD_DIM,
+                                                                     g->attn_norm, 1) != 0;
         if (ok) {
             metal_graph_debug_dump_tensor("KVraw", g->kv_raw, DS4_N_HEAD_DIM, il, pos);
         }
