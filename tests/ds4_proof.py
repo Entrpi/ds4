@@ -40,6 +40,21 @@ SHADOW_RE = re.compile(
     r"logit_max_abs=(?P<max_abs>[-+0-9.eE]+).*?"
     r"logit_rms=(?P<rms>[-+0-9.eE]+)"
 )
+WEIGHT_PLAN_RE = re.compile(
+    r"ds4_weight_server: (?P<model>\w+) plan model=(?P<model_gib>[-+0-9.eE]+) GiB "
+    r"raw_tensor_ranges=(?P<raw_gib>[-+0-9.eE]+) GiB ranges=(?P<ranges>\d+)"
+)
+WEIGHT_MEMORY_RE = re.compile(
+    r"ds4_weight_server: memory preflight .*?need=(?P<need_gib>[-+0-9.eE]+) GiB "
+    r"reserve=(?P<reserve_gib>[-+0-9.eE]+) GiB free=(?P<free_gib>[-+0-9.eE]+) GiB "
+    r"total=(?P<total_gib>[-+0-9.eE]+) GiB"
+)
+WEIGHT_UPLOAD_RE = re.compile(
+    r"ds4_weight_server: (?P<model>\w+) uploaded (?P<gib>[-+0-9.eE]+) GiB across (?P<ranges>\d+) ranges"
+)
+WEIGHT_READY_RE = re.compile(
+    r"ds4_weight_server: ready manifest=(?P<manifest>\S+) ranges=(?P<ranges>\d+)"
+)
 
 
 @dataclass(frozen=True)
@@ -110,9 +125,11 @@ class WeightServerState:
     preflight_log_path: str = ""
     preflight_rc: int | None = None
     preflight_wall_ms: float = 0.0
+    preflight_telemetry: dict[str, Any] = field(default_factory=dict)
     start_wall_ms: float = 0.0
     ready: bool = False
     cleanup: str = "not_started"
+    telemetry: dict[str, Any] = field(default_factory=dict)
     error: str = ""
 
 
@@ -198,6 +215,7 @@ class WeightServer:
             raise TimeoutError(self.state.error) from e
         self.state.preflight_wall_ms = (time.monotonic() - t0) * 1000.0
         self.state.preflight_rc = proc.returncode
+        self.state.preflight_telemetry = self.parse_log_file(preflight_log_path)
         if proc.returncode != 0:
             self.state.error = (
                 f"ds4_weight_server dry-run failed rc={proc.returncode}: "
@@ -229,6 +247,9 @@ class WeightServer:
                 raise RuntimeError(self.state.error)
             if self.manifest_path.exists():
                 validate_weight_manifest(self.manifest_path, self.base_model, self.mtp_model, self.scope)
+                if self.log_f:
+                    self.log_f.flush()
+                self.state.telemetry = self.parse_log_file(self.log_path)
                 self.state.start_wall_ms = (time.monotonic() - t0) * 1000.0
                 self.state.ready = True
                 self.state.cleanup = "pending"
@@ -250,6 +271,16 @@ class WeightServer:
         except OSError:
             return ""
         return data[-limit:].decode("utf-8", errors="replace").replace("\n", "\\n")
+
+    @staticmethod
+    def parse_log_file(path: Path) -> dict[str, Any]:
+        try:
+            return parse_weight_server_log(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            return {}
+
+    def is_running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
 
     def stop(self) -> None:
         if self.proc is None:
@@ -275,6 +306,7 @@ class WeightServer:
         if self.log_f:
             self.log_f.close()
             self.log_f = None
+        self.state.telemetry = self.parse_log_file(self.log_path)
 
 
 def parse_env_assignments(spec: str) -> tuple[str, dict[str, str]]:
@@ -358,6 +390,46 @@ def parse_shadow(log_text: str) -> dict[str, Any]:
         "logit_bad": logit_bad,
         "max_abs": max_abs,
         "max_rms": max_rms,
+    }
+
+
+def parse_weight_server_log(log_text: str) -> dict[str, Any]:
+    plans: dict[str, Any] = {}
+    uploads: dict[str, Any] = {}
+    memory: dict[str, float] = {}
+    ready: dict[str, Any] = {}
+    for m in WEIGHT_PLAN_RE.finditer(log_text):
+        plans[m.group("model")] = {
+            "model_gib": float(m.group("model_gib")),
+            "raw_tensor_ranges_gib": float(m.group("raw_gib")),
+            "ranges": int(m.group("ranges")),
+        }
+    mem = WEIGHT_MEMORY_RE.search(log_text)
+    if mem:
+        memory = {
+            "need_gib": float(mem.group("need_gib")),
+            "reserve_gib": float(mem.group("reserve_gib")),
+            "free_gib": float(mem.group("free_gib")),
+            "total_gib": float(mem.group("total_gib")),
+        }
+    for m in WEIGHT_UPLOAD_RE.finditer(log_text):
+        uploads[m.group("model")] = {
+            "uploaded_gib": float(m.group("gib")),
+            "ranges": int(m.group("ranges")),
+        }
+    ready_m = WEIGHT_READY_RE.search(log_text)
+    if ready_m:
+        ready = {
+            "manifest": ready_m.group("manifest"),
+            "ranges": int(ready_m.group("ranges")),
+        }
+    return {
+        "plans": plans,
+        "memory": memory,
+        "uploads": uploads,
+        "ready": ready,
+        "shutdown": "ds4_weight_server: shutting down" in log_text,
+        "refused_upload": "refusing upload" in log_text,
     }
 
 
@@ -452,12 +524,19 @@ def default_engine_profiles() -> list[EngineProfile]:
 def default_contracts(profiles: list[EngineProfile], suite: str) -> list[Contract]:
     baseline = next((p.name for p in profiles if p.baseline), profiles[0].name)
     contracts: list[Contract] = []
+    seen: set[tuple[str, str]] = set()
     for p in profiles:
         if p.name == baseline:
             continue
-        contracts.append(Contract(f"{baseline}_vs_{p.name}", baseline, p.name))
+        pairs = [(baseline, p.name)]
         if suite == "mtp_speculative" and p.name != "mtp-fast" and any(x.name == "mtp-fast" for x in profiles):
-            contracts.append(Contract(f"mtp-fast_vs_{p.name}", "mtp-fast", p.name))
+            pairs.append(("mtp-fast", p.name))
+        for base_name, cand_name in pairs:
+            key = (base_name, cand_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            contracts.append(Contract(f"{base_name}_vs_{cand_name}", base_name, cand_name))
     return contracts
 
 
@@ -874,6 +953,10 @@ def main(argv: list[str] | None = None) -> int:
         for prompt_case in prompts:
             print(f"\n=== {prompt_case.id} {prompt_case.prompt[:80]!r}")
             for profile in profiles:
+                if weight_server and not weight_server.is_running():
+                    print(f"{profile.name:28s} FAILED ds4_weight_server exited before profile run")
+                    failures += 1
+                    continue
                 try:
                     result = run_profile(
                         bin_path=args.bin,
@@ -897,6 +980,9 @@ def main(argv: list[str] | None = None) -> int:
                 print_run_line(result)
                 if result.rc != 0:
                     failures += 1
+                if weight_server and not weight_server.is_running():
+                    print(f"{profile.name:28s} FAILED ds4_weight_server exited during profile run")
+                    failures += 1
 
             for contract in contracts:
                 comp = evaluate_contract(contract, prompt_case.id, results)
@@ -917,6 +1003,10 @@ def main(argv: list[str] | None = None) -> int:
             weight_server.stop()
             weight_server_state = weight_server.state
             print(f"ds4_weight_server cleanup={weight_server_state.cleanup}")
+
+    if weight_server and weight_server_state.cleanup != "terminated":
+        print(f"ds4_weight_server cleanup FAILED cleanup={weight_server_state.cleanup}")
+        failures += 1
 
     report = {
         "schema": "ds4-proof-report-v1",

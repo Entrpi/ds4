@@ -84,7 +84,11 @@ and cleanup machinery.
 The JSON report includes `weight_server` with the command, manifest path, log
 path, dry-run preflight result, startup time, readiness, and cleanup result.
 The runner performs a short-lived `ds4_weight_server --dry-run` before launching
-the persistent owner unless `--no-weight-server-preflight` is set.
+the persistent owner unless `--no-weight-server-preflight` is set. Owned-server
+cleanup is a proof condition: if the owner exits during a profile or the runner
+cannot terminate it cleanly, the proof fails. The report also includes parsed
+owner telemetry for planned GiB, memory preflight, uploaded GiB/ranges, ready
+state, and shutdown observation.
 
 Manual startup is still available when running several proof commands against
 one owner. Start it only after the dry-run plan and memory preflight look sane:
