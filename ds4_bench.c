@@ -22,6 +22,7 @@
 
 typedef struct {
     const char *model_path;
+    const char *mtp_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -33,6 +34,8 @@ typedef struct {
     int ctx_alloc;
     int step_incr;
     int gen_tokens;
+    int mtp_draft_tokens;
+    float mtp_margin;
     double step_mul;
     bool warm_weights;
     bool quality;
@@ -63,6 +66,9 @@ static void usage(FILE *fp) {
         "\n"
         "Model and backend:\n"
         "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
+        "  --mtp FILE             Optional MTP draft GGUF for speculative decode.\n"
+        "  --mtp-draft N          Draft tokens per speculative cycle. Default: 1\n"
+        "  --mtp-margin F         Non-exact MTP margin. Default: 3.0\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "      Select backend explicitly. Defaults to Metal on macOS, CUDA elsewhere.\n"
         "  -t, --threads N        CPU helper threads.\n"
@@ -177,6 +183,8 @@ static bench_config parse_options(int argc, char **argv) {
         .ctx_max = 32768,
         .step_incr = 2048,
         .gen_tokens = 128,
+        .mtp_draft_tokens = 1,
+        .mtp_margin = 3.0f,
         .step_mul = 1.0,
     };
 
@@ -187,6 +195,17 @@ static bench_config parse_options(int argc, char **argv) {
             exit(0);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp")) {
+            c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp-draft")) {
+            c.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mtp-margin")) {
+            double v = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v < 0.0 || v > 1000.0) {
+                fprintf(stderr, "ds4-bench: invalid value for %s: %.17g\n", arg, v);
+                exit(2);
+            }
+            c.mtp_margin = (float)v;
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -289,8 +308,11 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
+        .mtp_draft_tokens = cfg.mtp_draft_tokens,
+        .mtp_margin = cfg.mtp_margin,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
     };
@@ -368,7 +390,8 @@ int main(int argc, char **argv) {
         }
 
         const double gen_t0 = bench_now_sec();
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        int generated = 0;
+        while (generated < cfg.gen_tokens) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -380,10 +403,34 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
-                rc = 1;
-                break;
+            const bool use_mtp_eval =
+                ds4_engine_mtp_draft_tokens(engine) > 1 &&
+                getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+            if (use_mtp_eval) {
+                int toks[17];
+                int ntok = ds4_session_eval_speculative_argmax(session,
+                                                               token,
+                                                               cfg.gen_tokens - generated,
+                                                               eos,
+                                                               toks,
+                                                               (int)(sizeof(toks) / sizeof(toks[0])),
+                                                               err,
+                                                               sizeof(err));
+                if (ntok < 0) {
+                    fprintf(stderr, "ds4-bench: speculative decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                for (int j = 0; j < ntok && generated < cfg.gen_tokens; j++) {
+                    if (toks[j] != eos) generated++;
+                }
+            } else {
+                if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                generated++;
             }
         }
         const double gen_t1 = bench_now_sec();
