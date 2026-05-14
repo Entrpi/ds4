@@ -80,15 +80,14 @@ static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
 static int g_model_hmm_direct;
 static int g_model_fd = -1;
-static const void *g_model_fd_host_base;
-static int g_model_direct_fd = -1;
-static uint64_t g_model_direct_align = 1;
-static uint64_t g_model_file_size;
 // Tracks which model_map owns g_model_fd. Set on the first set_model_map call
 // after set_model_fd. fd-based weight caching is refused for any other map
 // (e.g. a separately-mmap'd model registered via a second set_model_map_range
 // call would otherwise read bytes from g_model_fd at the wrong offsets).
 static const void *g_model_fd_host_base;
+static int g_model_direct_fd = -1;
+static uint64_t g_model_direct_align = 1;
+static uint64_t g_model_file_size;
 static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
