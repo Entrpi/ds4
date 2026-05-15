@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cuda.h>
 
 #include <algorithm>
@@ -21,6 +22,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 struct mapped_file {
@@ -36,6 +38,21 @@ struct tensor_span {
     uint64_t end = 0;
 };
 
+struct tensor_record {
+    std::string name;
+    uint32_t type = 0;
+    uint32_t ndim = 0;
+    uint64_t dims[8] = {};
+    uint64_t elements = 0;
+    uint64_t off = 0;
+    uint64_t bytes = 0;
+};
+
+enum derived_kind {
+    DERIVED_NONE = 0,
+    DERIVED_Q8_0_ROW_GROUP_NORMS = 1,
+};
+
 enum weight_backend {
     WEIGHT_BACKEND_IPC = 0,
     WEIGHT_BACKEND_VMM = 1,
@@ -43,11 +60,19 @@ enum weight_backend {
 
 struct owned_range {
     weight_backend backend = WEIGHT_BACKEND_IPC;
+    bool derived = false;
     std::string model_id;
     uint64_t model_size = 0;
     uint64_t off = 0;
     uint64_t bytes = 0;
     uint64_t alloc_bytes = 0;
+    uint32_t derived_kind = DERIVED_NONE;
+    uint64_t source_off = 0;
+    uint64_t source_bytes = 0;
+    uint64_t in_dim = 0;
+    uint64_t out_dim = 0;
+    uint32_t group_count = 0;
+    std::string source_name;
     void *dev = nullptr;
     cudaIpcMemHandle_t handle{};
     CUmemGenericAllocationHandle vmm_handle{};
@@ -108,6 +133,12 @@ static bool parse_backend(const char *backend, weight_backend &out) {
 
 static const char *backend_name(weight_backend backend) {
     return backend == WEIGHT_BACKEND_VMM ? "vmm" : "ipc";
+}
+
+static double now_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
 static bool parent_pid_alive(pid_t pid) {
@@ -351,6 +382,47 @@ static bool tensor_type_info(uint32_t type, uint64_t &block_elems, uint64_t &blo
     }
 }
 
+__device__ static float warp_sum_f32(float v) {
+    for (int off = 16; off > 0; off >>= 1) {
+        v += __shfl_down_sync(0xffffffffu, v, off);
+    }
+    return v;
+}
+
+__global__ static void q8_0_row_group_norms_warp_kernel(
+        float *row_group_norms,
+        const unsigned char *w,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t blocks,
+        uint32_t group_count) {
+    const uint64_t row = (uint64_t)blockIdx.x;
+    const uint32_t group = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= out_dim || group >= group_count) return;
+
+    const uint64_t group_start = ((uint64_t)group * in_dim) / group_count;
+    const uint64_t group_end = ((uint64_t)(group + 1u) * in_dim) / group_count;
+    const uint64_t block_start = group_start / 32u;
+    const uint64_t block_end = (group_end + 31u) / 32u;
+    const unsigned char *wr = w + row * blocks * 34u;
+    float sum = 0.0f;
+    for (uint64_t b = block_start; b < block_end; b++) {
+        const uint64_t i0 = b * 32u;
+        const uint64_t lo = group_start > i0 ? group_start - i0 : 0u;
+        const uint64_t hi = group_end < i0 + 32u ? group_end - i0 : 32u;
+        const __half *scale_h = (const __half *)(wr + b * 34u);
+        const int8_t *qs = (const int8_t *)(wr + b * 34u + 2u);
+        const float scale = __half2float(*scale_h);
+        for (uint64_t i = lo + lane; i < hi; i += 32u) {
+            const float v = scale * (float)qs[i];
+            sum += v * v;
+        }
+    }
+    sum = warp_sum_f32(sum);
+    if (lane == 0) row_group_norms[row * group_count + group] = sqrtf(sum);
+}
+
 static bool map_file(const char *path, mapped_file &m) {
     m.fd = open(path, O_RDONLY);
     if (m.fd < 0) {
@@ -398,7 +470,9 @@ static void unmap_file(mapped_file &m) {
     m = {};
 }
 
-static bool collect_tensor_spans(const mapped_file &m, std::vector<tensor_span> &spans) {
+static bool collect_tensor_catalog(const mapped_file &m,
+                                   std::vector<tensor_span> &spans,
+                                   std::vector<tensor_record> *records) {
     uint64_t pos = 0;
     uint32_t magic = 0, version = 0;
     uint64_t n_tensors = 0, n_kv = 0;
@@ -425,44 +499,50 @@ static bool collect_tensor_spans(const mapped_file &m, std::vector<tensor_span> 
         }
     }
 
-    struct tensor_info {
-        uint64_t rel = 0;
-        uint64_t bytes = 0;
-    };
-    std::vector<tensor_info> tensors;
+    std::vector<tensor_record> tensors;
     tensors.reserve((size_t)n_tensors);
     for (uint64_t i = 0; i < n_tensors; i++) {
-        std::string name;
+        tensor_record t;
         uint32_t ndim = 0;
-        if (!read_string(m, pos, name) || !read_u32(m, pos, ndim) || ndim > 8) return false;
+        if (!read_string(m, pos, t.name) || !read_u32(m, pos, ndim) || ndim > 8) return false;
+        t.ndim = ndim;
         uint64_t elems = 1;
         for (uint32_t d = 0; d < ndim; d++) {
             uint64_t dim = 0;
             if (!read_u64(m, pos, dim)) return false;
             if (dim != 0 && elems > UINT64_MAX / dim) return false;
+            t.dims[d] = dim;
             elems *= dim;
         }
+        t.elements = elems;
         uint32_t type = 0;
         uint64_t rel = 0;
         if (!read_u32(m, pos, type) || !read_u64(m, pos, rel)) return false;
+        t.type = type;
         uint64_t block_elems = 0, block_bytes = 0;
         if (!tensor_type_info(type, block_elems, block_bytes)) {
-            fprintf(stderr, "ds4_weight_server: unsupported tensor type %u for %s\n", type, name.c_str());
+            fprintf(stderr, "ds4_weight_server: unsupported tensor type %u for %s\n", type, t.name.c_str());
             return false;
         }
         const uint64_t blocks = (elems + block_elems - 1u) / block_elems;
         if (blocks > UINT64_MAX / block_bytes) return false;
-        tensors.push_back({rel, blocks * block_bytes});
+        t.off = rel;
+        t.bytes = blocks * block_bytes;
+        tensors.push_back(t);
     }
 
     const uint64_t tensor_data_pos = align_up(pos, alignment);
     spans.clear();
     spans.reserve(tensors.size());
-    for (const tensor_info &t : tensors) {
-        if (t.rel > UINT64_MAX - tensor_data_pos) return false;
-        const uint64_t off = tensor_data_pos + t.rel;
+    if (records) records->clear();
+    if (records) records->reserve(tensors.size());
+    for (tensor_record &t : tensors) {
+        if (t.off > UINT64_MAX - tensor_data_pos) return false;
+        const uint64_t off = tensor_data_pos + t.off;
         if (off > m.size || t.bytes > m.size - off) return false;
+        t.off = off;
         if (t.bytes != 0) spans.push_back({off, off + t.bytes});
+        if (records) records->push_back(t);
     }
     return true;
 }
@@ -523,7 +603,8 @@ static bool inspect_model_plan(const char *id, const char *path, uint64_t span_b
     mapped_file m;
     if (!map_file(path, m)) return false;
     std::vector<tensor_span> spans;
-    if (!collect_tensor_spans(m, spans)) {
+    std::vector<tensor_record> records;
+    if (!collect_tensor_catalog(m, spans, &records)) {
         unmap_file(m);
         return false;
     }
@@ -537,6 +618,10 @@ static bool inspect_model_plan(const char *id, const char *path, uint64_t span_b
             (double)m.size / 1073741824.0,
             (double)planned / 1073741824.0,
             ranges.size());
+    fprintf(stderr,
+            "ds4_weight_server: %s catalog tensors=%zu\n",
+            id,
+            records.size());
     if (vmm_granularity) {
         fprintf(stderr,
                 "ds4_weight_server: %s vmm plan logical=%.2f GiB allocated=%.2f GiB granularity=%llu\n",
@@ -796,14 +881,17 @@ static void hex_encode(const void *data, size_t bytes, std::string &out) {
 
 static bool upload_model(const char *id, const char *path, uint64_t span_bytes,
                          uint64_t copy_chunk_bytes, std::vector<owned_range> &ranges,
-                         weight_backend backend, int device, uint64_t vmm_granularity) {
+                         weight_backend backend, int device, uint64_t vmm_granularity,
+                         std::vector<tensor_record> *records_out) {
     mapped_file m;
     if (!map_file(path, m)) return false;
     std::vector<tensor_span> spans;
-    if (!collect_tensor_spans(m, spans)) {
+    std::vector<tensor_record> records;
+    if (!collect_tensor_catalog(m, spans, &records)) {
         unmap_file(m);
         return false;
     }
+    if (records_out) *records_out = records;
     std::vector<tensor_span> plan;
     build_range_plan(spans, span_bytes, plan);
     if (m.data) {
@@ -878,6 +966,142 @@ static bool upload_model(const char *id, const char *path, uint64_t span_bytes,
     return true;
 }
 
+static const tensor_record *find_tensor_record(const std::vector<tensor_record> &records,
+                                               const char *name) {
+    if (!name) return nullptr;
+    for (const tensor_record &t : records) {
+        if (t.name == name) return &t;
+    }
+    return nullptr;
+}
+
+static const unsigned char *owned_raw_range_ptr(const std::vector<owned_range> &ranges,
+                                                const char *model_id,
+                                                uint64_t off,
+                                                uint64_t bytes) {
+    const uint64_t end = off + bytes;
+    if (!model_id || end < off) return nullptr;
+    for (const owned_range &r : ranges) {
+        if (r.derived || r.model_id != model_id) continue;
+        const uint64_t rend = r.off + r.bytes;
+        if (rend < r.off) continue;
+        if (off >= r.off && end <= rend) {
+            return (const unsigned char *)r.dev + (off - r.off);
+        }
+    }
+    return nullptr;
+}
+
+static bool build_output_certifier_norms(const char *model_id,
+                                         uint64_t model_size,
+                                         const std::vector<tensor_record> &records,
+                                         std::vector<owned_range> &ranges,
+                                         weight_backend backend,
+                                         int device,
+                                         uint64_t vmm_granularity,
+                                         uint32_t group_count) {
+    if (!model_id || group_count == 0) return false;
+    const tensor_record *t = find_tensor_record(records, "output.weight");
+    if (!t) {
+        fprintf(stderr, "ds4_weight_server: output certifier derivation skipped for %s: missing output.weight\n",
+                model_id);
+        return false;
+    }
+    if (t->type != 8 || t->ndim != 2 || t->dims[0] == 0 || t->dims[1] == 0) {
+        fprintf(stderr,
+                "ds4_weight_server: output certifier derivation skipped for %s: output.weight is not 2D Q8_0\n",
+                model_id);
+        return false;
+    }
+    if (t->dims[1] > UINT64_MAX / group_count / sizeof(float)) {
+        fprintf(stderr, "ds4_weight_server: output certifier derived size overflow\n");
+        return false;
+    }
+    const uint64_t in_dim = t->dims[0];
+    const uint64_t out_dim = t->dims[1];
+    const uint64_t bytes = out_dim * (uint64_t)group_count * sizeof(float);
+    const unsigned char *src = owned_raw_range_ptr(ranges, model_id, t->off, t->bytes);
+    if (!src) {
+        fprintf(stderr,
+                "ds4_weight_server: output certifier derivation skipped for %s: raw output.weight is not resident\n",
+                model_id);
+        return false;
+    }
+
+    owned_range r;
+    r.backend = backend;
+    r.derived = true;
+    r.model_id = model_id;
+    r.model_size = model_size;
+    r.off = 0;
+    r.bytes = bytes;
+    r.alloc_bytes = bytes;
+    r.derived_kind = DERIVED_Q8_0_ROW_GROUP_NORMS;
+    r.source_off = t->off;
+    r.source_bytes = t->bytes;
+    r.in_dim = in_dim;
+    r.out_dim = out_dim;
+    r.group_count = group_count;
+    r.source_name = t->name;
+    if (backend == WEIGHT_BACKEND_VMM) {
+        if (!vmm_alloc_range(device, bytes, vmm_granularity, r)) {
+            fprintf(stderr, "ds4_weight_server: VMM derived allocation failed for output certifier %.2f MiB\n",
+                    (double)bytes / 1048576.0);
+            return false;
+        }
+    } else {
+        void *dev = nullptr;
+        cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4_weight_server: cudaMalloc failed for output certifier derived %.2f MiB: %s\n",
+                    (double)bytes / 1048576.0,
+                    cudaGetErrorString(err));
+            return false;
+        }
+        r.dev = dev;
+    }
+
+    const double t0 = now_sec();
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    q8_0_row_group_norms_warp_kernel<<<(unsigned)out_dim, 512>>>(
+            (float *)r.dev,
+            src,
+            in_dim,
+            out_dim,
+            blocks,
+            group_count);
+    cudaError_t err = cudaGetLastError();
+    if (err == cudaSuccess) err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4_weight_server: output certifier derived kernel failed: %s\n",
+                cudaGetErrorString(err));
+        release_owned_range(r);
+        return false;
+    }
+    if (backend == WEIGHT_BACKEND_IPC) {
+        cudaIpcMemHandle_t handle;
+        err = cudaIpcGetMemHandle(&handle, r.dev);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4_weight_server: cudaIpcGetMemHandle failed for output certifier derived: %s\n",
+                    cudaGetErrorString(err));
+            release_owned_range(r);
+            return false;
+        }
+        r.handle = handle;
+    }
+    const double t1 = now_sec();
+    ranges.push_back(r);
+    fprintf(stderr,
+            "ds4_weight_server: derived %s output certifier row norms %.2f MiB groups=%u in=%llu out=%llu built in %.3fs\n",
+            model_id,
+            (double)bytes / 1048576.0,
+            group_count,
+            (unsigned long long)in_dim,
+            (unsigned long long)out_dim,
+            t1 - t0);
+    return true;
+}
+
 static bool write_manifest(const char *path, const std::vector<owned_range> &ranges,
                            int device, const char *scope, const char *lock_file,
                            weight_backend backend, const char *broker_path) {
@@ -887,7 +1111,18 @@ static bool write_manifest(const char *path, const std::vector<owned_range> &ran
         fprintf(stderr, "ds4_weight_server: manifest open failed %s: %s\n", tmp.c_str(), strerror(errno));
         return false;
     }
-    fprintf(fp, "%s\n", backend == WEIGHT_BACKEND_VMM ? "DS4_WEIGHT_SERVER_VMM_V1" : "DS4_WEIGHT_SERVER_IPC_V1");
+    bool has_derived = false;
+    for (const owned_range &r : ranges) {
+        if (r.derived) {
+            has_derived = true;
+            break;
+        }
+    }
+    if (backend == WEIGHT_BACKEND_VMM) {
+        fprintf(fp, "%s\n", has_derived ? "DS4_WEIGHT_SERVER_VMM_DERIVED_V1" : "DS4_WEIGHT_SERVER_VMM_V1");
+    } else {
+        fprintf(fp, "%s\n", has_derived ? "DS4_WEIGHT_SERVER_IPC_DERIVED_V1" : "DS4_WEIGHT_SERVER_IPC_V1");
+    }
     fprintf(fp, "# owner <pid> <cuda-device> <scope> <lock-file-or-dash>\n");
     fprintf(fp, "owner %ld %d %s %s\n",
             (long)getpid(),
@@ -900,28 +1135,61 @@ static bool write_manifest(const char *path, const std::vector<owned_range> &ran
     }
     if (backend == WEIGHT_BACKEND_VMM) {
         fprintf(fp, "# alloc <alloc-id> <model-id> <model-size> <offset> <bytes> <alloc-bytes>\n");
+        fprintf(fp, "# derived-alloc <alloc-id> <model-id> <model-size> <source-offset> <source-bytes> <kind> <in-dim> <out-dim> <group-count> <bytes> <alloc-bytes> <source-name>\n");
     } else {
         fprintf(fp, "# range <model-id> <model-size> <offset> <bytes> <cuda-ipc-handle-hex>\n");
+        fprintf(fp, "# derived-range <model-id> <model-size> <source-offset> <source-bytes> <kind> <in-dim> <out-dim> <group-count> <bytes> <cuda-ipc-handle-hex> <source-name>\n");
     }
     uint64_t alloc_id = 0;
     for (const owned_range &r : ranges) {
         if (backend == WEIGHT_BACKEND_VMM) {
-            fprintf(fp, "alloc %llu %s %llu %llu %llu %llu\n",
-                    (unsigned long long)alloc_id++,
-                    r.model_id.c_str(),
-                    (unsigned long long)r.model_size,
-                    (unsigned long long)r.off,
-                    (unsigned long long)r.bytes,
-                    (unsigned long long)r.alloc_bytes);
+            if (r.derived) {
+                fprintf(fp, "derived-alloc %llu %s %llu %llu %llu %u %llu %llu %u %llu %llu %s\n",
+                        (unsigned long long)alloc_id++,
+                        r.model_id.c_str(),
+                        (unsigned long long)r.model_size,
+                        (unsigned long long)r.source_off,
+                        (unsigned long long)r.source_bytes,
+                        r.derived_kind,
+                        (unsigned long long)r.in_dim,
+                        (unsigned long long)r.out_dim,
+                        r.group_count,
+                        (unsigned long long)r.bytes,
+                        (unsigned long long)r.alloc_bytes,
+                        r.source_name.c_str());
+            } else {
+                fprintf(fp, "alloc %llu %s %llu %llu %llu %llu\n",
+                        (unsigned long long)alloc_id++,
+                        r.model_id.c_str(),
+                        (unsigned long long)r.model_size,
+                        (unsigned long long)r.off,
+                        (unsigned long long)r.bytes,
+                        (unsigned long long)r.alloc_bytes);
+            }
         } else {
             std::string hex;
             hex_encode(&r.handle, sizeof(r.handle), hex);
-            fprintf(fp, "range %s %llu %llu %llu %s\n",
-                    r.model_id.c_str(),
-                    (unsigned long long)r.model_size,
-                    (unsigned long long)r.off,
-                    (unsigned long long)r.bytes,
-                    hex.c_str());
+            if (r.derived) {
+                fprintf(fp, "derived-range %s %llu %llu %llu %u %llu %llu %u %llu %s %s\n",
+                        r.model_id.c_str(),
+                        (unsigned long long)r.model_size,
+                        (unsigned long long)r.source_off,
+                        (unsigned long long)r.source_bytes,
+                        r.derived_kind,
+                        (unsigned long long)r.in_dim,
+                        (unsigned long long)r.out_dim,
+                        r.group_count,
+                        (unsigned long long)r.bytes,
+                        hex.c_str(),
+                        r.source_name.c_str());
+            } else {
+                fprintf(fp, "range %s %llu %llu %llu %s\n",
+                        r.model_id.c_str(),
+                        (unsigned long long)r.model_size,
+                        (unsigned long long)r.off,
+                        (unsigned long long)r.bytes,
+                        hex.c_str());
+            }
         }
     }
     if (fclose(fp) != 0) return false;
@@ -1075,6 +1343,8 @@ static void usage(FILE *fp) {
             "  --span-mb N       Maximum exported raw tensor span. Default: 1024\n"
             "  --copy-chunk-mb N Pinned staged upload chunk. Default: 256\n"
             "  --reserve-gb N    Free CUDA memory to keep unused. Default: 32\n"
+            "  --derive-output-certifier Build base output Q8_0 row-group norms for exact verifier\n"
+            "  --derive-group-count N Row groups for --derive-output-certifier. Default: 8\n"
             "  --dry-run         Parse GGUFs, print upload plan, and exit before allocation\n");
 }
 
@@ -1091,6 +1361,8 @@ int main(int argc, char **argv) {
     uint64_t span_bytes = 1024ull * 1048576ull;
     uint64_t copy_chunk_bytes = 256ull * 1048576ull;
     uint64_t reserve_bytes = 32ull * 1073741824ull;
+    bool derive_output_certifier = false;
+    uint32_t derive_group_count = 8;
     bool dry_run = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--base") && i + 1 < argc) base = argv[++i];
@@ -1106,6 +1378,15 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--span-mb") && i + 1 < argc) span_bytes = parse_mib(argv[++i], span_bytes);
         else if (!strcmp(argv[i], "--copy-chunk-mb") && i + 1 < argc) copy_chunk_bytes = parse_mib(argv[++i], copy_chunk_bytes);
         else if (!strcmp(argv[i], "--reserve-gb") && i + 1 < argc) reserve_bytes = parse_gib(argv[++i], reserve_bytes);
+        else if (!strcmp(argv[i], "--derive-output-certifier")) derive_output_certifier = true;
+        else if (!strcmp(argv[i], "--derive-group-count") && i + 1 < argc) {
+            unsigned long v = strtoul(argv[++i], nullptr, 10);
+            if (v > 0 && v <= 16) derive_group_count = (uint32_t)v;
+            else {
+                fprintf(stderr, "ds4_weight_server: invalid --derive-group-count; expected 1..16\n");
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--dry-run")) dry_run = true;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             usage(stdout);
@@ -1135,6 +1416,10 @@ int main(int argc, char **argv) {
     if (span_bytes > 4096ull * 1048576ull) span_bytes = 4096ull * 1048576ull;
     if (copy_chunk_bytes < 16ull * 1048576ull) copy_chunk_bytes = 16ull * 1048576ull;
     if (copy_chunk_bytes > 1024ull * 1048576ull) copy_chunk_bytes = 1024ull * 1048576ull;
+    if (derive_output_certifier && !want_base) {
+        fprintf(stderr, "ds4_weight_server: --derive-output-certifier requires base scope\n");
+        return 2;
+    }
 
     cudaError_t err = cudaSetDevice(device);
     if (err != cudaSuccess) {
@@ -1169,9 +1454,11 @@ int main(int argc, char **argv) {
     uint64_t total_upload_bytes = 0;
     uint64_t total_alloc_bytes = 0;
     uint64_t base_bytes = 0;
+    uint64_t base_model_size = 0;
+    uint64_t mtp_model_size = 0;
     if (want_base) {
         uint64_t base_alloc_bytes = 0;
-        if (!inspect_model_plan("base", base, span_bytes, nullptr, &base_bytes, nullptr,
+        if (!inspect_model_plan("base", base, span_bytes, &base_model_size, &base_bytes, nullptr,
                                 vmm_granularity, &base_alloc_bytes)) return 1;
         total_upload_bytes += base_bytes;
         total_alloc_bytes += backend == WEIGHT_BACKEND_VMM ? base_alloc_bytes : base_bytes;
@@ -1179,7 +1466,7 @@ int main(int argc, char **argv) {
     if (want_mtp) {
         uint64_t mtp_bytes = 0;
         uint64_t mtp_alloc_bytes = 0;
-        if (!inspect_model_plan("mtp", mtp, span_bytes, nullptr, &mtp_bytes, nullptr,
+        if (!inspect_model_plan("mtp", mtp, span_bytes, &mtp_model_size, &mtp_bytes, nullptr,
                                 vmm_granularity, &mtp_alloc_bytes)) return 1;
         if (UINT64_MAX - total_upload_bytes < mtp_bytes) {
             fprintf(stderr, "ds4_weight_server: upload plan size overflow\n");
@@ -1204,10 +1491,23 @@ int main(int argc, char **argv) {
     }
 
     std::vector<owned_range> ranges;
+    std::vector<tensor_record> base_records;
+    std::vector<tensor_record> mtp_records;
     if (want_base && !upload_model("base", base, span_bytes, copy_chunk_bytes, ranges,
-                                   backend, device, vmm_granularity)) return 1;
+                                   backend, device, vmm_granularity, &base_records)) return 1;
     if (want_mtp && !upload_model("mtp", mtp, span_bytes, copy_chunk_bytes, ranges,
-                                  backend, device, vmm_granularity)) return 1;
+                                  backend, device, vmm_granularity, &mtp_records)) return 1;
+    if (derive_output_certifier &&
+        !build_output_certifier_norms("base",
+                                      base_model_size,
+                                      base_records,
+                                      ranges,
+                                      backend,
+                                      device,
+                                      vmm_granularity,
+                                      derive_group_count)) {
+        return 1;
+    }
     std::string default_broker_socket;
     fd_broker broker;
     if (backend == WEIGHT_BACKEND_VMM) {

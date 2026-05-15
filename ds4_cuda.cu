@@ -152,6 +152,27 @@ struct cuda_q8_f32_range {
     float *device_ptr;
 };
 
+enum cuda_derived_kind {
+    CUDA_DERIVED_Q8_0_ROW_GROUP_NORMS = 1,
+};
+
+struct cuda_derived_range {
+    const void *host_base;
+    uint64_t source_offset;
+    uint64_t source_bytes;
+    uint32_t kind;
+    uint64_t in_dim;
+    uint64_t out_dim;
+    uint32_t group_count;
+    uint64_t bytes;
+    char *device_ptr;
+    int imported_ipc;
+    int imported_vmm;
+    CUmemGenericAllocationHandle vmm_handle;
+    CUdeviceptr vmm_va;
+    uint64_t vmm_alloc_bytes;
+};
+
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
@@ -159,7 +180,9 @@ static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
+static std::vector<cuda_derived_range> g_derived_ranges;
 static uint64_t g_model_range_bytes;
+static uint64_t g_derived_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
 static int g_q8_f16_disabled_after_oom;
@@ -361,6 +384,37 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
         }
     }
     return 0;
+}
+
+static char *cuda_derived_weight_ptr(
+        const void *model_map,
+        uint64_t source_offset,
+        uint64_t source_bytes,
+        uint32_t kind,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t group_count,
+        uint64_t bytes,
+        const char *label) {
+    if (getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != NULL) return NULL;
+    for (const cuda_derived_range &r : g_derived_ranges) {
+        if (r.host_base == model_map &&
+            r.source_offset == source_offset &&
+            r.source_bytes == source_bytes &&
+            r.kind == kind &&
+            r.in_dim == in_dim &&
+            r.out_dim == out_dim &&
+            r.group_count == group_count &&
+            bytes <= r.bytes) {
+            if (getenv("DS4_CUDA_DERIVED_WEIGHT_VERBOSE") != NULL) {
+                fprintf(stderr, "ds4: CUDA derived weight hit %s %.2f MiB\n",
+                        label ? label : "derived",
+                        (double)r.bytes / 1048576.0);
+            }
+            return r.device_ptr;
+        }
+    }
+    return NULL;
 }
 
 static void cuda_q8_f16_cache_release_all(void) {
@@ -1226,6 +1280,21 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
 }
 
 static void cuda_model_range_release_all(void) {
+    for (const cuda_derived_range &r : g_derived_ranges) {
+        if (r.imported_vmm) {
+            if (r.vmm_va && r.vmm_alloc_bytes) {
+                (void)cuMemUnmap(r.vmm_va, (size_t)r.vmm_alloc_bytes);
+                (void)cuMemAddressFree(r.vmm_va, (size_t)r.vmm_alloc_bytes);
+            }
+            if (r.vmm_handle) {
+                (void)cuMemRelease(r.vmm_handle);
+            }
+        } else if (r.imported_ipc && r.device_ptr) {
+            (void)cudaIpcCloseMemHandle(r.device_ptr);
+        }
+    }
+    g_derived_ranges.clear();
+    g_derived_range_bytes = 0;
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
@@ -1756,6 +1825,115 @@ static int import_vmm_allocation(
     return 1;
 }
 
+static int import_vmm_derived_allocation(
+        const void *model_map,
+        uint64_t model_size,
+        const char *model_id,
+        const char *broker_path,
+        unsigned long long alloc_id,
+        unsigned long long file_size,
+        unsigned long long source_off,
+        unsigned long long source_bytes,
+        unsigned int kind,
+        unsigned long long in_dim,
+        unsigned long long out_dim,
+        unsigned int group_count,
+        unsigned long long bytes,
+        unsigned long long alloc_bytes,
+        uint64_t *imported_bytes,
+        uint64_t *imported_ranges) {
+    if ((uint64_t)file_size != model_size ||
+        (uint64_t)source_off > model_size ||
+        (uint64_t)source_bytes > model_size - (uint64_t)source_off ||
+        source_bytes == 0 ||
+        bytes == 0 ||
+        alloc_bytes < bytes) {
+        fprintf(stderr,
+                "ds4: CUDA derived VMM allocation rejected for %s "
+                "(manifest size=%llu local size=%llu source=%llu bytes=%llu derived=%llu alloc=%llu)\n",
+                model_id,
+                file_size,
+                (unsigned long long)model_size,
+                source_off,
+                source_bytes,
+                bytes,
+                alloc_bytes);
+        return 0;
+    }
+
+    unsigned long long broker_alloc_bytes = 0;
+    int fd = recv_vmm_fd(broker_path, alloc_id, &broker_alloc_bytes);
+    if (fd < 0) return 0;
+    if (broker_alloc_bytes != alloc_bytes) {
+        fprintf(stderr,
+                "ds4: CUDA VMM broker derived alloc size mismatch for %s alloc=%llu broker=%llu manifest=%llu\n",
+                model_id,
+                alloc_id,
+                broker_alloc_bytes,
+                alloc_bytes);
+        close(fd);
+        return 0;
+    }
+
+    CUmemGenericAllocationHandle handle;
+    memset(&handle, 0, sizeof(handle));
+    if (!driver_ok(cuMemImportFromShareableHandle(&handle,
+                                                  (void *)(uintptr_t)fd,
+                                                  CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR),
+                   "VMM import derived POSIX FD")) {
+        close(fd);
+        return 0;
+    }
+    close(fd);
+
+    CUdeviceptr va = 0;
+    if (!driver_ok(cuMemAddressReserve(&va, (size_t)alloc_bytes, 0, 0, 0),
+                   "VMM import derived address reserve")) {
+        (void)cuMemRelease(handle);
+        return 0;
+    }
+    if (!driver_ok(cuMemMap(va, (size_t)alloc_bytes, 0, handle, 0), "VMM import derived map")) {
+        (void)cuMemAddressFree(va, (size_t)alloc_bytes);
+        (void)cuMemRelease(handle);
+        return 0;
+    }
+    CUmemAccessDesc access;
+    memset(&access, 0, sizeof(access));
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    int dev_id = 0;
+    (void)cudaGetDevice(&dev_id);
+    access.location.id = dev_id;
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READ;
+    if (!driver_ok(cuMemSetAccess(va, (size_t)alloc_bytes, &access, 1),
+                   "VMM import derived set access")) {
+        (void)cuMemUnmap(va, (size_t)alloc_bytes);
+        (void)cuMemAddressFree(va, (size_t)alloc_bytes);
+        (void)cuMemRelease(handle);
+        return 0;
+    }
+
+    g_derived_ranges.push_back({
+        model_map,
+        (uint64_t)source_off,
+        (uint64_t)source_bytes,
+        (uint32_t)kind,
+        (uint64_t)in_dim,
+        (uint64_t)out_dim,
+        (uint32_t)group_count,
+        (uint64_t)bytes,
+        (char *)va,
+        0,
+        1,
+        handle,
+        va,
+        (uint64_t)alloc_bytes,
+    });
+    g_derived_range_bytes += (uint64_t)bytes;
+    *imported_bytes += (uint64_t)bytes;
+    *imported_ranges += 1;
+    return 1;
+}
+
 extern "C" int ds4_gpu_import_model_ipc_manifest(
         const void *model_map,
         uint64_t model_size,
@@ -1776,6 +1954,8 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
     char broker_path[512] = {0};
     uint64_t imported_bytes = 0;
     uint64_t imported_ranges = 0;
+    uint64_t imported_derived_bytes = 0;
+    uint64_t imported_derived_ranges = 0;
     int saw_header = 0;
     int vmm_manifest = 0;
     int ok = 1;
@@ -1784,12 +1964,14 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '#' || *p == '\n' || *p == '\0') continue;
         if (!strncmp(p, "DS4_WEIGHT_SERVER_IPC_V1", 24) ||
+            !strncmp(p, "DS4_WEIGHT_SERVER_IPC_DERIVED_V1", 32) ||
             !strncmp(p, "DS4_WEIGHTD_IPC_V1", 18)) {
             saw_header = 1;
             vmm_manifest = 0;
             continue;
         }
-        if (!strncmp(p, "DS4_WEIGHT_SERVER_VMM_V1", 24)) {
+        if (!strncmp(p, "DS4_WEIGHT_SERVER_VMM_V1", 24) ||
+            !strncmp(p, "DS4_WEIGHT_SERVER_VMM_DERIVED_V1", 32)) {
             saw_header = 1;
             vmm_manifest = 1;
             continue;
@@ -1809,6 +1991,64 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
                     broker_path[sizeof(broker_path) - 1u] = '\0';
                     continue;
                 }
+            }
+            if (sscanf(p, "%31s", rec) == 1 && strcmp(rec, "derived-alloc") == 0) {
+                unsigned long long alloc_id = 0;
+                unsigned int kind = 0;
+                unsigned int group_count = 0;
+                unsigned long long source_off = 0;
+                unsigned long long source_bytes = 0;
+                unsigned long long in_dim = 0;
+                unsigned long long out_dim = 0;
+                unsigned long long derived_bytes = 0;
+                unsigned long long derived_alloc_bytes = 0;
+                char source_name[256] = {0};
+                if (sscanf(p, "%31s %llu %63s %llu %llu %llu %u %llu %llu %u %llu %llu %255s",
+                           rec,
+                           &alloc_id,
+                           id,
+                           &file_size,
+                           &source_off,
+                           &source_bytes,
+                           &kind,
+                           &in_dim,
+                           &out_dim,
+                           &group_count,
+                           &derived_bytes,
+                           &derived_alloc_bytes,
+                           source_name) != 13) {
+                    continue;
+                }
+                if (strcmp(id, model_id) != 0) continue;
+                if (!broker_path[0]) {
+                    fprintf(stderr, "ds4: CUDA shared VMM manifest missing broker before derived allocation\n");
+                    ok = 0;
+                    break;
+                }
+                if (!driver_ok(cuInit(0), "init")) {
+                    ok = 0;
+                    break;
+                }
+                if (!import_vmm_derived_allocation(model_map,
+                                                   model_size,
+                                                   model_id,
+                                                   broker_path,
+                                                   alloc_id,
+                                                   file_size,
+                                                   source_off,
+                                                   source_bytes,
+                                                   kind,
+                                                   in_dim,
+                                                   out_dim,
+                                                   group_count,
+                                                   derived_bytes,
+                                                   derived_alloc_bytes,
+                                                   &imported_derived_bytes,
+                                                   &imported_derived_ranges)) {
+                    ok = 0;
+                    break;
+                }
+                continue;
             }
             unsigned long long alloc_id = 0;
             unsigned long long alloc_bytes = 0;
@@ -1840,6 +2080,89 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
                 ok = 0;
                 break;
             }
+            continue;
+        }
+        if (!strncmp(p, "derived-range", 13)) {
+            unsigned int kind = 0;
+            unsigned int group_count = 0;
+            unsigned long long source_off = 0;
+            unsigned long long source_bytes = 0;
+            unsigned long long in_dim = 0;
+            unsigned long long out_dim = 0;
+            unsigned long long derived_bytes = 0;
+            char source_name[256] = {0};
+            if (sscanf(p, "%31s %63s %llu %llu %llu %u %llu %llu %u %llu %255s %255s",
+                       rec,
+                       id,
+                       &file_size,
+                       &source_off,
+                       &source_bytes,
+                       &kind,
+                       &in_dim,
+                       &out_dim,
+                       &group_count,
+                       &derived_bytes,
+                       hex,
+                       source_name) != 12) {
+                continue;
+            }
+            if (strcmp(id, model_id) != 0) continue;
+            if ((uint64_t)file_size != model_size ||
+                (uint64_t)source_off > model_size ||
+                (uint64_t)source_bytes > model_size - (uint64_t)source_off ||
+                source_bytes == 0 ||
+                derived_bytes == 0) {
+                fprintf(stderr,
+                        "ds4: CUDA shared derived weight manifest range rejected for %s "
+                        "(manifest size=%llu local size=%llu source=%llu source_bytes=%llu derived=%llu)\n",
+                        model_id,
+                        file_size,
+                        (unsigned long long)model_size,
+                        source_off,
+                        source_bytes,
+                        derived_bytes);
+                ok = 0;
+                break;
+            }
+            cudaIpcMemHandle_t handle;
+            memset(&handle, 0, sizeof(handle));
+            if (!cuda_hex_decode(hex, &handle, sizeof(handle))) {
+                fprintf(stderr, "ds4: CUDA shared derived weight manifest has invalid IPC handle for %s\n", model_id);
+                ok = 0;
+                break;
+            }
+            void *dev = NULL;
+            cudaError_t err = cudaIpcOpenMemHandle(&dev, handle, cudaIpcMemLazyEnablePeerAccess);
+            if (err != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: CUDA shared derived weight IPC import failed for %s source=%llu bytes=%.2f MiB: %s\n",
+                        model_id,
+                        source_off,
+                        (double)derived_bytes / 1048576.0,
+                        cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                ok = 0;
+                break;
+            }
+            g_derived_ranges.push_back({
+                model_map,
+                (uint64_t)source_off,
+                (uint64_t)source_bytes,
+                (uint32_t)kind,
+                (uint64_t)in_dim,
+                (uint64_t)out_dim,
+                (uint32_t)group_count,
+                (uint64_t)derived_bytes,
+                (char *)dev,
+                1,
+                0,
+                0,
+                0,
+                0,
+            });
+            g_derived_range_bytes += (uint64_t)derived_bytes;
+            imported_derived_bytes += (uint64_t)derived_bytes;
+            imported_derived_ranges++;
             continue;
         }
         if (sscanf(p, "%31s %63s %llu %llu %llu %255s",
@@ -1916,11 +2239,18 @@ extern "C" int ds4_gpu_import_model_ipc_manifest(
         return 0;
     }
     fprintf(stderr,
-            "ds4: CUDA imported shared %s weight cache for %s: %.2f GiB across %llu ranges\n",
+            "ds4: CUDA imported shared %s weight cache for %s: %.2f GiB across %llu ranges",
             vmm_manifest ? "VMM" : "IPC",
             model_id,
             (double)imported_bytes / 1073741824.0,
             (unsigned long long)imported_ranges);
+    if (imported_derived_ranges != 0) {
+        fprintf(stderr,
+                " plus %.2f MiB across %llu derived artifacts",
+                (double)imported_derived_bytes / 1048576.0,
+                (unsigned long long)imported_derived_ranges);
+    }
+    fprintf(stderr, "\n");
     return 1;
 }
 
@@ -6947,6 +7277,41 @@ extern "C" int ds4_gpu_q8_0_row_group_norms_tensor(
             blocks,
             group_count);
     return cuda_ok(cudaGetLastError(), "q8_0 row group norms launch");
+}
+
+extern "C" ds4_gpu_tensor *ds4_gpu_imported_q8_0_row_group_norms_tensor(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t group_count) {
+    if (!model_map || in_dim == 0 || out_dim == 0 ||
+        group_count == 0 || group_count > 16u) {
+        return NULL;
+    }
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34u)) return NULL;
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    if (weight_bytes > model_size - weight_offset) return NULL;
+    if (out_dim > UINT64_MAX / group_count / sizeof(float)) return NULL;
+    const uint64_t bytes = out_dim * (uint64_t)group_count * sizeof(float);
+    char *ptr = cuda_derived_weight_ptr(model_map,
+                                        weight_offset,
+                                        weight_bytes,
+                                        CUDA_DERIVED_Q8_0_ROW_GROUP_NORMS,
+                                        in_dim,
+                                        out_dim,
+                                        group_count,
+                                        bytes,
+                                        "q8_0 row group norms");
+    if (!ptr) return NULL;
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    t->ptr = ptr;
+    t->bytes = bytes;
+    t->owner = 0;
+    return t;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_candidate_certify_tensor(

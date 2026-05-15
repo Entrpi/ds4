@@ -10177,9 +10177,21 @@ static bool metal_graph_prepare_output_certifier(
     }
     if (!g->output_cert_group_norms) {
         g->output_cert_group_norms =
-            ds4_gpu_tensor_alloc(vocab_dim * group_count * sizeof(float));
-        g->output_cert_group_norms_groups = group_count;
-        g->output_cert_group_norms_ready = false;
+            ds4_gpu_imported_q8_0_row_group_norms_tensor(model->map,
+                                                         model->size,
+                                                         weights->output->abs_offset,
+                                                         DS4_N_EMBD,
+                                                         vocab_dim,
+                                                         group_count);
+        if (g->output_cert_group_norms) {
+            g->output_cert_group_norms_groups = group_count;
+            g->output_cert_group_norms_ready = true;
+        } else {
+            g->output_cert_group_norms =
+                ds4_gpu_tensor_alloc(vocab_dim * group_count * sizeof(float));
+            g->output_cert_group_norms_groups = group_count;
+            g->output_cert_group_norms_ready = false;
+        }
     }
     if (!g->output_cert_result) {
         g->output_cert_result = ds4_gpu_tensor_alloc(sizeof(ds4_gpu_candidate_cert_result));

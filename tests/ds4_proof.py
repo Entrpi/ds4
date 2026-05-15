@@ -1058,11 +1058,11 @@ def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None,
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        if line in {"DS4_WEIGHT_SERVER_IPC_V1", "DS4_WEIGHTD_IPC_V1"}:
+        if line in {"DS4_WEIGHT_SERVER_IPC_V1", "DS4_WEIGHT_SERVER_IPC_DERIVED_V1", "DS4_WEIGHTD_IPC_V1"}:
             saw_header = True
             backend = "ipc"
             continue
-        if line == "DS4_WEIGHT_SERVER_VMM_V1":
+        if line in {"DS4_WEIGHT_SERVER_VMM_V1", "DS4_WEIGHT_SERVER_VMM_DERIVED_V1"}:
             saw_header = True
             backend = "vmm"
             continue
@@ -1099,6 +1099,43 @@ def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None,
             }
             continue
         if backend == "vmm":
+            if parts and parts[0] == "derived-alloc":
+                if len(parts) != 13:
+                    raise ValueError(f"invalid VMM derived weight manifest line {lineno}: {raw}")
+                _, alloc_id_s, model_id, model_size_s, source_off_s, source_bytes_s, kind_s, in_dim_s, out_dim_s, group_count_s, bytes_s, alloc_bytes_s, _source_name = parts
+                if model_id not in expected:
+                    raise ValueError(f"unexpected derived weight manifest model id {model_id!r} on line {lineno}")
+                try:
+                    int(alloc_id_s)
+                    model_size = int(model_size_s)
+                    source_off = int(source_off_s)
+                    source_n = int(source_bytes_s)
+                    kind = int(kind_s)
+                    in_dim = int(in_dim_s)
+                    out_dim = int(out_dim_s)
+                    group_count = int(group_count_s)
+                    derived_n = int(bytes_s)
+                    alloc_n = int(alloc_bytes_s)
+                except ValueError as e:
+                    raise ValueError(f"non-integer VMM derived weight manifest allocation on line {lineno}") from e
+                if model_size != expected[model_id]:
+                    raise ValueError(
+                        f"weight manifest size mismatch for {model_id}: manifest={model_size} local={expected[model_id]}"
+                    )
+                if (
+                    source_off < 0
+                    or source_n <= 0
+                    or source_off > model_size
+                    or source_n > model_size - source_off
+                    or kind <= 0
+                    or in_dim <= 0
+                    or out_dim <= 0
+                    or group_count <= 0
+                    or derived_n <= 0
+                    or alloc_n < derived_n
+                ):
+                    raise ValueError(f"invalid VMM derived weight manifest allocation bounds on line {lineno}")
+                continue
             if len(parts) != 7 or parts[0] != "alloc":
                 raise ValueError(f"invalid VMM weight manifest line {lineno}: {raw}")
             _, alloc_id_s, model_id, model_size_s, off_s, bytes_s, alloc_bytes_s = parts
@@ -1119,6 +1156,42 @@ def validate_weight_manifest(path: Path, base_model: str, mtp_model: str | None,
             if off < 0 or n <= 0 or off > model_size or n > model_size - off or alloc_n < n:
                 raise ValueError(f"invalid VMM weight manifest allocation bounds on line {lineno}")
             seen[model_id].append((off, off + n))
+            continue
+        if parts and parts[0] == "derived-range":
+            if len(parts) != 12:
+                raise ValueError(f"invalid derived weight manifest line {lineno}: {raw}")
+            _, model_id, model_size_s, source_off_s, source_bytes_s, kind_s, in_dim_s, out_dim_s, group_count_s, bytes_s, handle_hex, _source_name = parts
+            if model_id not in expected:
+                raise ValueError(f"unexpected derived weight manifest model id {model_id!r} on line {lineno}")
+            try:
+                model_size = int(model_size_s)
+                source_off = int(source_off_s)
+                source_n = int(source_bytes_s)
+                kind = int(kind_s)
+                in_dim = int(in_dim_s)
+                out_dim = int(out_dim_s)
+                group_count = int(group_count_s)
+                derived_n = int(bytes_s)
+            except ValueError as e:
+                raise ValueError(f"non-integer derived weight manifest range on line {lineno}") from e
+            if model_size != expected[model_id]:
+                raise ValueError(
+                    f"weight manifest size mismatch for {model_id}: manifest={model_size} local={expected[model_id]}"
+                )
+            if (
+                source_off < 0
+                or source_n <= 0
+                or source_off > model_size
+                or source_n > model_size - source_off
+                or kind <= 0
+                or in_dim <= 0
+                or out_dim <= 0
+                or group_count <= 0
+                or derived_n <= 0
+            ):
+                raise ValueError(f"invalid derived weight manifest bounds on line {lineno}")
+            if len(handle_hex) != 128 or re.search(r"[^0-9A-Fa-f]", handle_hex):
+                raise ValueError(f"invalid CUDA IPC derived handle encoding on line {lineno}")
             continue
         if len(parts) != 6 or parts[0] != "range":
             raise ValueError(f"invalid weight manifest line {lineno}: {raw}")
