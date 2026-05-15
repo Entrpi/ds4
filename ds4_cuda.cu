@@ -6716,15 +6716,21 @@ static cudaStream_t ds4_cuda_moe_stream(void) {
 }
 
 static int ds4_cuda_moe_graphs_enabled(void) {
+    /* Default ON after determinism validation (10/10 greedy decode runs
+     * bit-identical vs graphs OFF, 2026-05-16).  Opt-out:
+     *   DS4_CUDA_MOE_GRAPHS=0  (or off / no / false) */
     static int init = 0;
-    static int enabled = 0;
+    static int enabled = 1;
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_MOE_GRAPHS");
-        if (s && *s && strcmp(s, "0") != 0 &&
-            strcmp(s, "off") != 0 && strcmp(s, "no") != 0 && strcmp(s, "false") != 0) {
-            enabled = 1;
-            fprintf(stderr, "ds4: DS4_CUDA_MOE_GRAPHS enabled - capturing routed-MoE decode\n");
+        if (s && *s &&
+            (strcmp(s, "0") == 0 ||
+             strcmp(s, "off") == 0 || strcmp(s, "OFF") == 0 ||
+             strcmp(s, "no") == 0 || strcmp(s, "NO") == 0 ||
+             strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0)) {
+            enabled = 0;
+            fprintf(stderr, "ds4: DS4_CUDA_MOE_GRAPHS=%s - graph capture disabled\n", s);
         }
     }
     return enabled;
@@ -6744,6 +6750,45 @@ static uint64_t moe_graph_hash(const struct moe_graph_key *k) {
 static struct moe_graph_entry *moe_graph_slot(const struct moe_graph_key *key) {
     uint64_t h = moe_graph_hash(key);
     return &g_moe_graphs[h % DS4_MOE_GRAPH_CACHE_SIZE];
+}
+
+/* Step 8.2: dense Q8_0 vec graph cache.  Each n_tok=1 attention-side
+ * matmul (q/k/v/output projections and HC-expand variants) becomes its
+ * own cached cudaGraphExec_t.  V4 Flash has ~5 such projections per
+ * layer * 43 layers = ~215 keys per gen.  Sized at 1024 to fit
+ * comfortably and tolerate routine MTP/decode-2 add-ons. */
+struct dense_graph_key {
+    uint64_t weight_offset;
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_tok;
+    void *x_ptr;
+    void *out_ptr;
+};
+
+struct dense_graph_entry {
+    struct dense_graph_key key;
+    cudaGraphExec_t exec;
+    int valid;
+    uint64_t hits;
+};
+
+#define DS4_DENSE_GRAPH_CACHE_SIZE 1024
+
+static struct dense_graph_entry g_dense_graphs[DS4_DENSE_GRAPH_CACHE_SIZE];
+
+static uint64_t dense_graph_hash(const struct dense_graph_key *k) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    const uint8_t *p = (const uint8_t *)k;
+    for (size_t i = 0; i < sizeof(*k); i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static struct dense_graph_entry *dense_graph_slot(const struct dense_graph_key *key) {
+    return &g_dense_graphs[dense_graph_hash(key) % DS4_DENSE_GRAPH_CACHE_SIZE];
 }
 
 static int ds4_cuda_use_mmq() {
@@ -6788,12 +6833,95 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
      * first; on failure falls through to mmq dense, which itself falls
      * through to the legacy native kernels at the bottom of this function.
      *
-     * Opt-out: DS4_CUDA_NO_MMVQ_DECODE=1 (same flag as routed_moe_launch). */
+     * Opt-out: DS4_CUDA_NO_MMVQ_DECODE=1 (same flag as routed_moe_launch).
+     *
+     * Step 8.2: when DS4_CUDA_MOE_GRAPHS=1 also enables graph capture
+     * around this branch.  Each (weight_offset, x_ptr, out_ptr) tuple
+     * gets its own cached cudaGraphExec_t.  On cache hit, a single
+     * cudaGraphLaunch replaces the alloc + quantize + mmvq + free
+     * launches.  Same g_moe_stream + ds4_pool_set_stream plumbing as
+     * the routed-MoE graph branch. */
     if (ds4_cuda_use_mmq() && (in_dim % 256u == 0) && n_tok == 1u &&
         getenv("DS4_CUDA_NO_MMVQ_DECODE") == NULL) {
+
+        struct dense_graph_entry *dslot = NULL;
+        int dcapturing = 0;
+        cudaStream_t moe_stream = ds4_cuda_moe_graphs_enabled() ? ds4_cuda_moe_stream() : (cudaStream_t)0;
+        if (ds4_cuda_moe_graphs_enabled() && moe_stream) {
+            struct dense_graph_key dkey;
+            memset(&dkey, 0, sizeof(dkey));
+            dkey.weight_offset = weight_offset;
+            dkey.in_dim        = (uint32_t)in_dim;
+            dkey.out_dim       = (uint32_t)out_dim;
+            dkey.n_tok         = (uint32_t)n_tok;
+            dkey.x_ptr         = x->ptr;
+            dkey.out_ptr       = out->ptr;
+            dslot = dense_graph_slot(&dkey);
+            if (dslot->valid && memcmp(&dslot->key, &dkey, sizeof(dkey)) == 0) {
+                cudaError_t ge = cudaGraphLaunch(dslot->exec, moe_stream);
+                if (ge == cudaSuccess) {
+                    dslot->hits++;
+                    return 1;
+                }
+                fprintf(stderr, "ds4: cudaGraphLaunch (dense) failed: %s; recapturing\n",
+                        cudaGetErrorString(ge));
+                cudaGraphExecDestroy(dslot->exec);
+                dslot->valid = 0;
+            }
+            memcpy(&dslot->key, &dkey, sizeof(dkey));
+            if (dslot->valid) {
+                cudaGraphExecDestroy(dslot->exec);
+                dslot->valid = 0;
+                dslot->hits = 0;
+            }
+            cudaError_t ge = cudaStreamBeginCapture(moe_stream, cudaStreamCaptureModeThreadLocal);
+            if (ge == cudaSuccess) {
+                dcapturing = 1;
+            } else {
+                fprintf(stderr, "ds4: cudaStreamBeginCapture (dense) failed: %s\n",
+                        cudaGetErrorString(ge));
+                dslot = NULL;
+            }
+        }
+
         int rc = ds4_mmq_q8_0_dense_vec(wptr, (const float *)x->ptr, (float *)out->ptr,
                                         (int)out_dim, (int)n_tok, (int)in_dim,
-                                        /*stream=*/0);
+                                        moe_stream);
+
+        if (dcapturing && dslot) {
+            cudaGraph_t graph;
+            cudaError_t ge = cudaStreamEndCapture(moe_stream, &graph);
+            dcapturing = 0;
+            if (ge == cudaSuccess) {
+                if (rc == 0) {
+                    cudaGraphExec_t exec;
+                    ge = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+                    if (ge == cudaSuccess) {
+                        dslot->exec = exec;
+                        dslot->valid = 1;
+                        dslot->hits = 0;
+                        ge = cudaGraphLaunch(exec, moe_stream);
+                        if (ge != cudaSuccess) {
+                            fprintf(stderr, "ds4: cudaGraphLaunch (dense first) failed: %s\n",
+                                    cudaGetErrorString(ge));
+                        }
+                    } else {
+                        fprintf(stderr, "ds4: cudaGraphInstantiate (dense) failed: %s\n",
+                                cudaGetErrorString(ge));
+                    }
+                }
+                cudaGraphDestroy(graph);
+            } else {
+                fprintf(stderr, "ds4: cudaStreamEndCapture (dense) failed: %s\n",
+                        cudaGetErrorString(ge));
+            }
+        } else if (dcapturing) {
+            /* Slot was nulled out for some reason; bail capture cleanly. */
+            cudaGraph_t partial;
+            cudaError_t ge = cudaStreamEndCapture(moe_stream, &partial);
+            if (ge == cudaSuccess) cudaGraphDestroy(partial);
+        }
+
         if (rc == 0) return 1;
         fprintf(stderr, "ds4: ds4_mmq_q8_0_dense_vec returned %d (label='%s' in=%llu out=%llu); falling back to mmq\n",
                 rc, label ? label : "", (unsigned long long)in_dim, (unsigned long long)out_dim);
