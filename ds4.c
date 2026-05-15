@@ -10933,6 +10933,54 @@ static bool metal_graph_decode2_finish_ffn_shared_post_from_batch_row(
     return ok;
 }
 
+static bool metal_graph_decode2_run_ffn_prefix_into_batch_row(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos,
+        int                     token,
+        uint32_t                row,
+        ds4_gpu_tensor        *cur_hc,
+        ds4_gpu_tensor        *after_attn,
+        ds4_gpu_tensor        *after_ffn) {
+    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
+    ds4_gpu_tensor *split_row = metal_graph_tensor_row_view(g->batch_hc_split, row, mix_hc);
+    ds4_gpu_tensor *norm_row = metal_graph_tensor_row_view(g->batch_ffn_norm, row, DS4_N_EMBD);
+    ds4_gpu_tensor *selected_row = metal_graph_tensor_row_view(g->batch_router_selected, row, DS4_N_EXPERT_USED);
+    ds4_gpu_tensor *weights_row = metal_graph_tensor_row_view(g->batch_router_weights, row, DS4_N_EXPERT_USED);
+    ds4_gpu_tensor *saved_cur = g->cur_hc;
+    ds4_gpu_tensor *saved_after_attn = g->after_attn_hc;
+    ds4_gpu_tensor *saved_after_ffn = g->after_ffn_hc;
+    ds4_gpu_tensor *saved_split = g->hc_split;
+    ds4_gpu_tensor *saved_norm = g->ffn_norm;
+    ds4_gpu_tensor *saved_selected = g->router_selected;
+    ds4_gpu_tensor *saved_weights = g->router_weights;
+    bool ok = split_row && norm_row && selected_row && weights_row;
+    if (ok) {
+        g->cur_hc = cur_hc;
+        g->after_attn_hc = after_attn;
+        g->after_ffn_hc = after_ffn;
+        g->hc_split = split_row;
+        g->ffn_norm = norm_row;
+        g->router_selected = selected_row;
+        g->router_weights = weights_row;
+        ok = metal_graph_encode_decode_ffn_prefix_exact(g, model, layer, il, pos, token);
+    }
+    g->router_weights = saved_weights;
+    g->router_selected = saved_selected;
+    g->ffn_norm = saved_norm;
+    g->hc_split = saved_split;
+    g->after_ffn_hc = saved_after_ffn;
+    g->after_attn_hc = saved_after_attn;
+    g->cur_hc = saved_cur;
+    ds4_gpu_tensor_free(weights_row);
+    ds4_gpu_tensor_free(selected_row);
+    ds4_gpu_tensor_free(norm_row);
+    ds4_gpu_tensor_free(split_row);
+    return ok;
+}
+
 static bool metal_graph_encode_decode2_pair_attention_output_exact(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -11116,31 +11164,27 @@ static bool metal_graph_encode_decode2_layer_state_barrier_exact(
                                                     after1);
         }
     } else if (ok && (batch_ffn_body || batch_routed_body)) {
-        g->cur_hc = cur0;
-        g->after_attn_hc = after0;
-        g->after_ffn_hc = next0;
-        ok = metal_graph_encode_decode_ffn_prefix_exact(g,
-                                                        model,
-                                                        &weights->layer[il],
-                                                        il,
-                                                        pos0,
-                                                        token0);
+        ok = metal_graph_decode2_run_ffn_prefix_into_batch_row(g,
+                                                               model,
+                                                               &weights->layer[il],
+                                                               il,
+                                                               pos0,
+                                                               token0,
+                                                               0,
+                                                               cur0,
+                                                               after0,
+                                                               next0);
         if (ok) {
-            ok = metal_graph_decode2_capture_ffn_prefix_scalar_row(g, 0);
-        }
-        if (ok) {
-            g->cur_hc = cur1;
-            g->after_attn_hc = after1;
-            g->after_ffn_hc = next1;
-            ok = metal_graph_encode_decode_ffn_prefix_exact(g,
-                                                            model,
-                                                            &weights->layer[il],
-                                                            il,
-                                                            pos1,
-                                                            token1);
-        }
-        if (ok) {
-            ok = metal_graph_decode2_capture_ffn_prefix_scalar_row(g, 1);
+            ok = metal_graph_decode2_run_ffn_prefix_into_batch_row(g,
+                                                                   model,
+                                                                   &weights->layer[il],
+                                                                   il,
+                                                                   pos1,
+                                                                   token1,
+                                                                   1,
+                                                                   cur1,
+                                                                   after1,
+                                                                   next1);
         }
         if (ok && batch_ffn_body) {
             ok = metal_graph_decode2_run_batch_ffn_body_from_scalar_prefix(g,
