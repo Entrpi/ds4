@@ -174,6 +174,15 @@ def run_owned_lifecycle(tmp: Path, base: Path, mtp: Path, fake_engine: Path, fak
             "mtp",
             "--weight-server-bin",
             str(fake_weight_server),
+            "--weight-server-derive-output-certifier",
+            "--weight-server-derive-group-count",
+            "8",
+            "--weight-server-derive-q8-f16",
+            "blk.0.attn_output_a.weight",
+            "--weight-server-derive-q8-f32",
+            "blk.0.attn_q_b.weight",
+            "--weight-server-derive-budget-gb",
+            "1",
             "--work-dir",
             str(work),
             "--json-report",
@@ -183,6 +192,20 @@ def run_owned_lifecycle(tmp: Path, base: Path, mtp: Path, fake_engine: Path, fak
     if report["failures"] != 0:
         raise AssertionError(f"owned proof failures={report['failures']}")
     assert_true(report, "weight_server_validation.passed")
+    cmd = report["weight_server"]["cmd"]
+    for expected in [
+        "--derive-output-certifier",
+        "--derive-group-count",
+        "8",
+        "--derive-q8-f16",
+        "blk.0.attn_output_a.weight",
+        "--derive-q8-f32",
+        "blk.0.attn_q_b.weight",
+        "--derive-budget-gb",
+        "1",
+    ]:
+        if expected not in cmd:
+            raise AssertionError(f"owned proof did not forward {expected!r}: {cmd}")
     for check in [
         "ready",
         "scope_matches",

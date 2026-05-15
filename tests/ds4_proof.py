@@ -1322,6 +1322,16 @@ def main(argv: list[str] | None = None) -> int:
                     help="Raw span size passed to ds4_weight_server.")
     ap.add_argument("--weight-server-copy-chunk-mb", type=int,
                     help="Pinned upload chunk size passed to ds4_weight_server.")
+    ap.add_argument("--weight-server-derive-output-certifier", action="store_true",
+                    help="Ask ds4_weight_server to build imported output-head row norms for exact verification.")
+    ap.add_argument("--weight-server-derive-group-count", type=int,
+                    help="Row groups passed to ds4_weight_server --derive-group-count.")
+    ap.add_argument("--weight-server-derive-q8-f16", action="append", default=[], metavar="NAME",
+                    help="Ask ds4_weight_server to build an imported F16 layout for a base Q8_0 tensor. May be repeated.")
+    ap.add_argument("--weight-server-derive-q8-f32", action="append", default=[], metavar="NAME",
+                    help="Ask ds4_weight_server to build an imported F32 layout for a base Q8_0 tensor. May be repeated.")
+    ap.add_argument("--weight-server-derive-budget-gb", type=int,
+                    help="Derived artifact memory budget passed to ds4_weight_server.")
     ap.add_argument("--weight-server-arg", action="append", default=[],
                     help="Extra argument passed to ds4_weight_server. May be repeated.")
     ap.add_argument("--prompt", action="append", dest="prompts")
@@ -1437,6 +1447,17 @@ def main(argv: list[str] | None = None) -> int:
     elif args.start_weight_server:
         manifest_path = args.weight_server_manifest or (work_dir / "ds4_weight_server.ipc")
         log_path = work_dir / "ds4_weight_server.log"
+        weight_server_extra_args = list(args.weight_server_arg)
+        if args.weight_server_derive_output_certifier:
+            weight_server_extra_args.append("--derive-output-certifier")
+        if args.weight_server_derive_group_count is not None:
+            weight_server_extra_args.extend(["--derive-group-count", str(args.weight_server_derive_group_count)])
+        for name in args.weight_server_derive_q8_f16:
+            weight_server_extra_args.extend(["--derive-q8-f16", name])
+        for name in args.weight_server_derive_q8_f32:
+            weight_server_extra_args.extend(["--derive-q8-f32", name])
+        if args.weight_server_derive_budget_gb is not None:
+            weight_server_extra_args.extend(["--derive-budget-gb", str(args.weight_server_derive_budget_gb)])
         weight_server = WeightServer(
             bin_path=args.weight_server_bin,
             base_model=args.base,
@@ -1447,7 +1468,7 @@ def main(argv: list[str] | None = None) -> int:
             reserve_gb=args.weight_server_reserve_gb,
             span_mb=args.weight_server_span_mb,
             copy_chunk_mb=args.weight_server_copy_chunk_mb,
-            extra_args=args.weight_server_arg,
+            extra_args=weight_server_extra_args,
             preflight_timeout_s=args.weight_server_preflight_timeout,
             scope=weight_server_scope,
             backend=args.weight_server_backend,
