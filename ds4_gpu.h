@@ -165,6 +165,16 @@ int ds4_gpu_matmul_q8_0_top2_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x);
 
+int ds4_gpu_matmul_q8_0_top2_and_logits_n2_tensor(
+        ds4_gpu_tensor       *row0_top2,
+        ds4_gpu_tensor       *row1_logits,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x2);
+
 int ds4_gpu_matmul_q8_0_candidates_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *candidate_ids,
