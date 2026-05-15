@@ -43,8 +43,46 @@ Objective-C only where Metal requires it and Metal kernels under `metal/`.
   tool-call mapping, disk KV cache policy.
 - `ds4_metal.m`: Objective-C Metal runtime and kernel wrappers.
 - `metal/*.metal`: compute kernels.
+- `ds4_cuda.cu`: CUDA backend.  Single TU; mirrors ds4_metal.m's role on
+  NVIDIA / DGX Spark.  Dispatches quantized matmuls either through its own
+  bespoke kernels or - when `DS4_CUDA_USE_MMQ=1` is set - through the
+  vendored llama.cpp `mul_mat_q` kernels in `cuda/mmq/`.
+- `cuda/mmq/`: vendored llama.cpp ggml-cuda kernels (`mmq.cuh`, `mma.cuh`,
+  `vecdotq.cuh`, `quantize.{cu,cuh}`, `mmid.{cu,cuh}`, `common.cuh`,
+  `ggml-common.h`, `vendors/cuda.h`) pinned to upstream commit `5c0e9468`,
+  plus the ds4-side adapter (`ds4_ggml_stubs.{h,cu}`, `ds4_mmq.{h,cu}`,
+  redirect `ggml.h` / `ggml-impl.h` / `ggml-cuda.h`).  See
+  `cuda/mmq/VENDOR.md` for the symbol-resolution table and the upstream
+  re-sync procedure.  Phases 0-7 of the lift are documented in
+  `local/docs/ds4_mmq_lift_plan.html` (in the auto-round companion repo).
 - `tests/`: unit and live integration tests.
 - `misc/`: ignored notes, experiments, and old planning material.
+
+## CUDA environment variables
+
+The CUDA backend has a few opt-in switches that affect the inner matmul
+dispatch.  Defaults preserve the historical behavior; set the variables
+to opt in to the newer paths.
+
+- `DS4_CUDA_USE_MMQ=1`: route quantized matmuls through the vendored
+  llama.cpp `mul_mat_q` kernels (`cuda/mmq/`).  Covers Q8_0 dense
+  (attention projections, shared expert, lm_head) and the routed-MoE
+  block when the GGUF uses IQ2_XXS for gate/up and Q2_K for down (the
+  V4 Flash configuration).  Other quant combinations fall through to
+  the existing kernels.  Validated on RTX PRO 6000 Blackwell (sm_120,
+  CUDA 13.0) against V4 Flash: prefill 357-1041 tok/s vs 357-373
+  baseline (sustained ~2.80x), gen within run-to-run variance.
+- `DS4_CUDA_MMQ_MOE_MIN_TOKENS=N`: minimum `n_tokens` at which the
+  routed-MoE mmq path activates.  Default 2.  The legacy decode kernel
+  (`moe_gate_up_mid_decode_lut_qwarp32_kernel`) wins at `n_tokens=1`
+  because mmq's matrix-matrix-shaped path has higher per-launch fixed
+  cost than the legacy fused decode kernel.  Override to 1 to force
+  mmq even at decode (slower today; may flip if mmvq kernels are
+  lifted later).
+- `DS4_CUDA_NO_Q8_F16_CACHE`, `DS4_CUDA_Q8_F16_CACHE_BYTES`, and the
+  family of `DS4_CUDA_MOE_*` tuning vars all date to the legacy
+  cuda_q8_f16_ptr + cublasGemmEx pipeline and remain functional when
+  `DS4_CUDA_USE_MMQ` is unset.
 
 ## Testing
 

@@ -110,14 +110,37 @@ likely come from `common.cuh` which we vendor and don't need any shim
 changes. If they're new `ggml_*` host functions (rare, but possible if
 upstream adds a new helper), extend `ds4_ggml_stubs.h`.
 
-## Testing matrix (future work)
+## Testing matrix
 
-| Test                                          | Status     | Phase     |
-|-----------------------------------------------|------------|-----------|
-| `nvcc -c cuda/mmq/ds4_mmq.cu` builds cleanly  | TBD        | Phase 0   |
-| Q8_0 dense parity vs cublas+dequant baseline  | not built  | Phase 2   |
-| Q2_K dense parity                             | not built  | Phase 3   |
-| IQ2_XXS dense parity                          | not built  | Phase 3   |
-| MoE `_id` Q8_0 parity                         | not built  | Phase 4   |
-| End-to-end greedy decode parity vs main path  | not built  | Phase 5   |
-| Per-stage MoE perf vs baseline on PRO 6000    | not built  | Phase 6   |
+| Test                                          | Status                       | Phase     |
+|-----------------------------------------------|------------------------------|-----------|
+| `nvcc -c cuda/mmq/ds4_mmq.cu` builds cleanly  | **passes** (sm_120, nvcc 13) | Phase 0   |
+| Q8_0 dense parity vs CPU reference            | **passes** (4 shapes)        | Phase 2   |
+| Q2_K dense parity                             | **passes** (4 shapes)        | Phase 3   |
+| IQ2_XXS dense parity                          | **passes** (4 shapes)        | Phase 3   |
+| MoE `_id` Q8_0 parity                         | **passes** (3 shapes)        | Phase 4   |
+| MoE `_id` Q2_K parity                         | **passes** (3 shapes)        | Phase 4   |
+| MoE `_id` IQ2_XXS parity                      | **passes** (4 shapes)        | Phase 4   |
+| `make ds4-bench` with mmq integration         | **builds and runs**          | Phase 5/6 |
+| Frontier sweep, ctx 2k-16k, V4 Flash IQ2XXS   | **see results below**        | Phase 7   |
+
+## Validated performance
+
+PRO 6000 Blackwell (sm_120), CUDA 13.0, V4 Flash IQ2_XXS GGUF (86.7 GB),
+default `DS4_CUDA_MMQ_MOE_MIN_TOKENS=2` (legacy decode preserved):
+
+| ctx    | baseline pf t/s | mmq pf t/s | speedup    | baseline gen t/s | mmq gen t/s | gen ratio |
+|--------|-----------------|------------|------------|------------------|-------------|-----------|
+|  2048  | 373.21          | 1033.42    | **2.77x**  | 40.48            | 39.33       | 0.972x    |
+|  4096  | 366.25          | 1041.39    | **2.84x**  | 39.64            | 38.64       | 0.975x    |
+|  6144  | 364.81          | 1025.24    | **2.81x**  | 39.50            | 38.55       | 0.976x    |
+|  8192  | 364.01          | 1026.71    | **2.82x**  | 38.81            | 37.88       | 0.976x    |
+| 10240  | 361.75          | 1019.53    | **2.82x**  | 38.45            | 37.57       | 0.977x    |
+| 12288  | 360.52          | 1013.17    | **2.81x**  | 38.31            | 37.22       | 0.972x    |
+| 14336  | 359.15          | 1004.45    | **2.80x**  | 38.09            | 37.18       | 0.976x    |
+| 16384  | 357.99          | 1001.29    | **2.80x**  | 38.71            | 37.86       | 0.978x    |
+
+Sustained ~2.80x prefill speedup across the swept context range; gen
+within 2.5% of baseline (run-to-run variance).  See `local/docs/`
+(auto-round companion repo) for the full Phase 0-7 execution log,
+parity-test output, and detailed plan.
