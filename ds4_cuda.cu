@@ -6675,6 +6675,23 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
 
+    /* mmvq dense vec path (Step 6).  At n_tok=1 (attention projection
+     * decode) mmvq is structurally better than mmq's tile-based code:
+     * one CUDA block per output row, no column-tile waste.  Tries mmvq
+     * first; on failure falls through to mmq dense, which itself falls
+     * through to the legacy native kernels at the bottom of this function.
+     *
+     * Opt-out: DS4_CUDA_NO_MMVQ_DECODE=1 (same flag as routed_moe_launch). */
+    if (ds4_cuda_use_mmq() && (in_dim % 256u == 0) && n_tok == 1u &&
+        getenv("DS4_CUDA_NO_MMVQ_DECODE") == NULL) {
+        int rc = ds4_mmq_q8_0_dense_vec(wptr, (const float *)x->ptr, (float *)out->ptr,
+                                        (int)out_dim, (int)n_tok, (int)in_dim,
+                                        /*stream=*/0);
+        if (rc == 0) return 1;
+        fprintf(stderr, "ds4: ds4_mmq_q8_0_dense_vec returned %d (label='%s' in=%llu out=%llu); falling back to mmq\n",
+                rc, label ? label : "", (unsigned long long)in_dim, (unsigned long long)out_dim);
+    }
+
     /* mmq fused-dequant-matmul path.  Layout-compatible drop-in for the
      * legacy cuBLAS+dequant pipeline below: mmq's [out_dim, n_tok]
      * column-major output flattens to [n_tok, out_dim] row-major, which
@@ -11259,6 +11276,142 @@ static int routed_moe_launch(
             if (v >= 1 && v <= 0x10000) mmq_moe_min_tokens = (uint32_t)v;
         }
     }
+
+    /* mmvq decode branch (Step 6).  Routes the n_tokens=1 (and optionally
+     * a few short-prefill tokens) case through llama.cpp's vector matmul
+     * kernels, which are structurally optimised for small batch.
+     *
+     * Constraints:
+     *   - Down matmul ncols_dst = n_tokens * n_expert_used must stay
+     *     <= MMVQ_MAX_BATCH_SIZE=8.  For V4 Flash (top_k=6) this caps
+     *     n_tokens at 1.  Higher n_tokens fall through to the mmq path
+     *     below; that path is already great for medium/large batches.
+     *
+     * The DeepSeek V4 clamp (clamp=10 in this build) is applied by the
+     * existing moe_mmq_swiglu_weighted_clamp_kernel after the two matmuls.
+     * mmvq's built-in pair-fused SwiGLU (ds4_mmq_<>_moe_pair_vec) is NOT
+     * used here because that path applies silu without clamp; it stays
+     * available for future clamp-aware fusion work.
+     *
+     * Opt-out: DS4_CUDA_NO_MMVQ_DECODE=1.
+     * Threshold override: DS4_CUDA_MMVQ_DECODE_MAX_TOKENS=N (0 disables,
+     *   1 = decode-only [default], 8 = use vec for all short batches).
+     */
+    static int mmvq_decode_init = 0;
+    static uint32_t mmvq_decode_max_tokens = 1;
+    if (!mmvq_decode_init) {
+        mmvq_decode_init = 1;
+        if (getenv("DS4_CUDA_NO_MMVQ_DECODE")) {
+            mmvq_decode_max_tokens = 0;
+        }
+        const char *s = getenv("DS4_CUDA_MMVQ_DECODE_MAX_TOKENS");
+        if (s && *s) {
+            long v = strtol(s, NULL, 10);
+            if (v >= 0 && v <= 8) mmvq_decode_max_tokens = (uint32_t)v;
+        }
+    }
+    if (ds4_cuda_use_mmq() && n_tokens > 0u && n_tokens <= mmvq_decode_max_tokens) {
+        const uint32_t n_expert_used   = n_expert;
+        const uint32_t n_experts_total = 256u;
+        const uint64_t n_assignments   = (uint64_t)n_tokens * n_expert_used;
+        /* Both gate and down ncols_dst must fit under MMVQ_MAX_BATCH_SIZE=8.
+         * gate ncols_dst = n_tokens; down ncols_dst = n_assignments. */
+        if (n_assignments > 8u) {
+            /* Outside the mmvq vec path's batch envelope; fall through. */
+        } else {
+            int rc = -1;
+            /* 1. Two separate gate/up matmuls through mmvq.  Each call
+             *    re-quantizes the activation - acceptable for n_tokens=1
+             *    (4KB Q8_1 buffer) and avoids needing a shared-buffer API
+             *    in this first iteration. */
+            if (q4k_path) {
+                rc = ds4_mmq_q4_K_moe_vec(gate_w, (const float *)x->ptr,
+                                          (const int32_t *)selected->ptr,
+                                          (float *)gate->ptr,
+                                          (int)expert_mid_dim, (int)expert_in_dim,
+                                          (int)n_tokens, (int)n_experts_total,
+                                          (int)n_expert_used, /*stream=*/0);
+                if (rc != 0) {
+                    fprintf(stderr, "ds4: ds4_mmq_q4_K_moe_vec (gate) returned %d; falling back\n", rc);
+                    goto mmq_moe_fallback;
+                }
+                rc = ds4_mmq_q4_K_moe_vec(up_w, (const float *)x->ptr,
+                                          (const int32_t *)selected->ptr,
+                                          (float *)up->ptr,
+                                          (int)expert_mid_dim, (int)expert_in_dim,
+                                          (int)n_tokens, (int)n_experts_total,
+                                          (int)n_expert_used, /*stream=*/0);
+            } else {
+                rc = ds4_mmq_iq2_xxs_moe_vec(gate_w, (const float *)x->ptr,
+                                             (const int32_t *)selected->ptr,
+                                             (float *)gate->ptr,
+                                             (int)expert_mid_dim, (int)expert_in_dim,
+                                             (int)n_tokens, (int)n_experts_total,
+                                             (int)n_expert_used, /*stream=*/0);
+                if (rc != 0) {
+                    fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe_vec (gate) returned %d; falling back\n", rc);
+                    goto mmq_moe_fallback;
+                }
+                rc = ds4_mmq_iq2_xxs_moe_vec(up_w, (const float *)x->ptr,
+                                             (const int32_t *)selected->ptr,
+                                             (float *)up->ptr,
+                                             (int)expert_mid_dim, (int)expert_in_dim,
+                                             (int)n_tokens, (int)n_experts_total,
+                                             (int)n_expert_used, /*stream=*/0);
+            }
+            if (rc != 0) {
+                fprintf(stderr, "ds4: ds4_mmq_<>_moe_vec (up) returned %d; falling back\n", rc);
+                goto mmq_moe_fallback;
+            }
+
+            /* 2. SwiGLU + clamp + router_weight.  Same kernel as the mmq
+             *    path uses - applies the V4 clamp to gate/up BEFORE silu. */
+            {
+                const uint64_t mid_floats = n_assignments * expert_mid_dim;
+                moe_mmq_swiglu_weighted_clamp_kernel<<<(uint32_t)((mid_floats + 255) / 256), 256>>>(
+                    (float *)mid->ptr, /*gate_out_dbg=*/nullptr, /*up_out_dbg=*/nullptr,
+                    (const float *)gate->ptr, (const float *)up->ptr,
+                    (const float *)weights->ptr,
+                    expert_mid_dim, n_tokens, n_expert_used, clamp);
+                if (!cuda_ok(cudaGetLastError(), "mmvq routed_moe swiglu launch")) goto mmq_moe_fallback;
+            }
+
+            /* 3. Down matmul: same reinterpretation trick the mmq path uses -
+             *    treat each (token, slot) pair as a separate "token" with
+             *    one expert.  Routes through mmvq's multi-token MoE kernel
+             *    (mul_mat_vec_q_moe) at ncols_dst = n_assignments. */
+            if (q4k_path) {
+                rc = ds4_mmq_q4_K_moe_vec(down_w, (const float *)mid->ptr,
+                                          (const int32_t *)selected->ptr,
+                                          (float *)down->ptr,
+                                          (int)out_dim, (int)expert_mid_dim,
+                                          (int)n_assignments, (int)n_experts_total,
+                                          /*n_expert_used=*/1, /*stream=*/0);
+            } else {
+                rc = ds4_mmq_q2_K_moe_vec(down_w, (const float *)mid->ptr,
+                                          (const int32_t *)selected->ptr,
+                                          (float *)down->ptr,
+                                          (int)out_dim, (int)expert_mid_dim,
+                                          (int)n_assignments, (int)n_experts_total,
+                                          /*n_expert_used=*/1, /*stream=*/0);
+            }
+            if (rc != 0) {
+                fprintf(stderr, "ds4: ds4_mmq_<>_moe_vec (down) returned %d; falling back\n", rc);
+                goto mmq_moe_fallback;
+            }
+
+            /* 4. Sum across n_expert_used dim - same kernel as the mmq path. */
+            {
+                uint64_t n = (uint64_t)n_tokens * out_dim;
+                moe_sum_kernel<<<(uint32_t)((n + 255) / 256), 256>>>(
+                    (float *)out->ptr, (const float *)down->ptr,
+                    out_dim, n_expert_used, n_tokens);
+                if (!cuda_ok(cudaGetLastError(), "mmvq routed_moe sum launch")) goto mmq_moe_fallback;
+            }
+            return 1;
+        }
+    }
+
     if (ds4_cuda_use_mmq() && n_tokens >= mmq_moe_min_tokens) {
         const uint32_t n_expert_used = n_expert;   /* parameter name is a misnomer; this is top_k */
         const uint32_t n_experts_total = 256u;     /* matches the hardcoded constant at line 11437 */

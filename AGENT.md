@@ -81,12 +81,10 @@ to opt in to the newer paths.
   357-373 baseline (sustained ~2.80x), gen within run-to-run
   variance.
 - `DS4_CUDA_MMQ_MOE_MIN_TOKENS=N`: minimum `n_tokens` at which the
-  routed-MoE mmq path activates.  Default 2.  The legacy decode kernel
-  (`moe_gate_up_mid_decode_lut_qwarp32_kernel`) wins at `n_tokens=1`
-  because mmq's matrix-matrix-shaped path has higher per-launch fixed
-  cost than the legacy fused decode kernel.  Override to 1 to force
-  mmq even at decode (slower today; may flip if mmvq kernels are
-  lifted later).
+  routed-MoE mmq path activates.  Default 2.  At `n_tokens=1` mmq's
+  matrix-matrix-shaped path has higher per-launch fixed cost than the
+  vector path; that case is handled by the mmvq decode branch below.
+  Override to 1 to force mmq even at decode (likely slower than mmvq).
 - `DS4_CUDA_MMQ_X_MAX=N`: clip `get_mmq_x_max_host` to N (rounded down
   to a multiple of 8) when sweeping tile widths.  Diagnostic only; the
   vanilla 128 wins on sm_120 (RTX PRO 6000 Blackwell) so the default
@@ -94,6 +92,27 @@ to opt in to the newer paths.
   128} sweep against V4 Flash: X=32 lost ~20%, X=64 lost ~6%, X=96
   was within +/-1% of default but mixed across ctx points.  May be
   useful on other arches.
+- `DS4_CUDA_NO_MMVQ_DECODE` (default unset): opt-out of the vendored
+  llama.cpp `mul_mat_vec_q` (mmvq) decode path.  Step 6 of the
+  optimization plan: mmvq is structurally optimal for the n_tokens=1
+  routed-MoE and dense attention projection cases (one CUDA block per
+  output row, no wasted column tiling).  Wires in two places:
+    1. `routed_moe_launch` for the V4 Flash IQ2_XXS gate/up + Q2_K
+       down MoE shape AND the Q4_K-only MoE shape, gated on
+       `n_tokens * n_expert_used <= MMVQ_MAX_BATCH_SIZE` (8 on
+       Blackwell).  Two separate `ds4_mmq_<type>_moe_vec` calls
+       preserve the DeepSeek V4 clamp epilogue exactly; the fused
+       `ds4_mmq_<type>_moe_pair_vec` entry exists but is not yet
+       wired (fusion applies silu without clamp).
+    2. `cuda_matmul_q8_0_tensor_labeled` for n_tok=1 (attention
+       projection decode) via `ds4_mmq_q8_0_dense_vec`.
+  Set to `1` (or any non-empty value) to fall through to the legacy
+  paths and the existing mmq path.
+- `DS4_CUDA_MMVQ_DECODE_MAX_TOKENS=N` (default 1): cap on n_tokens
+  routed through the mmvq decode branch in `routed_moe_launch`.  Valid
+  range 0-8.  0 disables (same as `DS4_CUDA_NO_MMVQ_DECODE=1` for the
+  MoE path).  Values 2-8 extend mmvq coverage to short-prefill batches
+  but require n_tokens * n_expert_used &le; 8 for the down matmul.
 
 ## Testing
 
