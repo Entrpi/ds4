@@ -10663,6 +10663,7 @@ static bool metal_graph_decode2_run_batch_ffn_body_from_scalar_prefix(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const bool batch_q8_pair =
+        getenv("DS4_MTP_DECODE2_BATCH_FFN_BODY_Q8_PAIR") != NULL &&
         getenv("DS4_MTP_DECODE2_BATCH_FFN_BODY_NO_Q8_PAIR") == NULL &&
         getenv("DS4_CUDA_NO_BATCH_Q8_PAIR") == NULL;
     ds4_gpu_tensor *next_hc_view = next0 || next1 ? NULL : ds4_gpu_tensor_view(
