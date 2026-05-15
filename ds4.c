@@ -21097,6 +21097,11 @@ static bool ds4_mtp_exact_policy_use_seq(ds4_session *s) {
     if (getenv("DS4_MTP_EXACT_DECODE2") != NULL) return false;
     if (getenv("DS4_MTP_EXACT_SEQ_VERIFY") != NULL) return true;
     if (getenv("DS4_MTP_NO_EXACT_ADAPTIVE") != NULL) return true;
+    if (getenv("DS4_MTP_DECODE2_BATCH_FFN_BODY") != NULL &&
+        getenv("DS4_MTP_DECODE2_STATE_BARRIER") != NULL &&
+        getenv("DS4_MTP_DECODE2_NO_STATE_BARRIER") == NULL) {
+        return false;
+    }
     if (!s) return true;
 
     const uint32_t warmup = ds4_env_u32_default("DS4_MTP_EXACT_DECODE2_WARMUP", 8u);
