@@ -22,6 +22,8 @@
 #include <vector>
 #include <string>
 
+#include "cuda/mmq/ds4_mmq.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -7069,6 +7071,29 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
                                       n_comp, n_tokens, top_k);
     return cuda_ok(cudaGetLastError(), "topk mask launch");
 }
+/* DS4_CUDA_USE_MMQ env var: opt-in to the vendored llama.cpp mul_mat_q
+ * fused dequant+matmul kernels (cuda/mmq/) instead of the legacy
+ * cuda_q8_f16_ptr + cublasGemmEx pipeline.  Cached on first use.  Phase
+ * 5/6 wiring; default off until Phase 7 benchmark confirms the win and
+ * Phase 8 retires the legacy paths. */
+static int g_ds4_use_mmq_init = 0;
+static int g_ds4_use_mmq = 0;
+static int ds4_cuda_use_mmq() {
+    if (!g_ds4_use_mmq_init) {
+        g_ds4_use_mmq_init = 1;
+        if (getenv("DS4_CUDA_USE_MMQ") != NULL) {
+            int rc = ds4_mmq_init(0);
+            if (rc == 0) {
+                g_ds4_use_mmq = 1;
+                fprintf(stderr, "ds4: DS4_CUDA_USE_MMQ=1 - routing quantized matmuls through cuda/mmq\n");
+            } else {
+                fprintf(stderr, "ds4: DS4_CUDA_USE_MMQ requested but ds4_mmq_init failed (%d); falling back\n", rc);
+            }
+        }
+    }
+    return g_ds4_use_mmq;
+}
+
 static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
@@ -7079,6 +7104,25 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
+
+    /* mmq fused-dequant-matmul path.  Layout-compatible drop-in for the
+     * legacy cuBLAS+dequant pipeline below: mmq's [out_dim, n_tok]
+     * column-major output flattens to [n_tok, out_dim] row-major, which
+     * is exactly what ds4 stores in out->ptr.  Q8_0 weight is already in
+     * mmq's expected [out_dim rows, in_dim cols] row-major-of-blocks
+     * layout (the GGUF on-disk format).  mmq requires K (= in_dim) to
+     * be a multiple of QK_K = 256; V4 Flash satisfies this for every
+     * Q8_0 weight in the model, but we check anyway and fall through
+     * for any odd shapes. */
+    if (ds4_cuda_use_mmq() && (in_dim % 256u == 0) && n_tok > 0) {
+        int rc = ds4_mmq_q8_0_dense(wptr, (const float *)x->ptr, (float *)out->ptr,
+                                    (int)out_dim, (int)n_tok, (int)in_dim, /*stream=*/0);
+        if (rc == 0) return 1;
+        /* On failure, fall through to the legacy paths below. */
+        fprintf(stderr, "ds4: ds4_mmq_q8_0_dense returned %d (label='%s' in=%llu out=%llu n_tok=%llu); falling back\n",
+                rc, label ? label : "", (unsigned long long)in_dim, (unsigned long long)out_dim, (unsigned long long)n_tok);
+    }
+
     const int force_native_attention_output_b =
         cuda_q8_label_is_attention_output_b(label) &&
         n_tok == 2 &&
