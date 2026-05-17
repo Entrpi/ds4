@@ -1138,19 +1138,28 @@ static int cuda_vmm_arena_supported(void) {
     return 1;
 }
 
-// Default chunk size for a single cuMemCreate + cuMemMap. Mirrors the
-// ds4_weight_server default of 1024 MiB (overridable by --span-mb), so
-// in-process arena layout matches what bench harnesses already validate.
+// Per-call VMM chunk size. By default we match the request size exactly,
+// granularity-rounded -- this mirrors ds4_weight_server, which gives one
+// VMM allocation per coalesced plan range (138 ranges, ~80.77 GiB
+// allocated for a 80.76 GiB model -- 0.01% overhead). A 1024 MiB minimum
+// would have left ~500 MiB unused per range and ballooned VRAM use by
+// ~70% for the V4 Flash IQ2 model.
+//
+// DS4_CUDA_VMM_ARENA_CHUNK_MB is a *minimum* if set explicitly: lets
+// users coalesce small allocations into fewer VMM mappings if the
+// driver's per-process mapping limit becomes a concern.
 static uint64_t cuda_vmm_arena_chunk_bytes(uint64_t need) {
-    uint64_t mb = 1024;
+    uint64_t mb = 0;
     const char *env = getenv("DS4_CUDA_VMM_ARENA_CHUNK_MB");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long long v = strtoull(env, &end, 10);
         if (end != env && v > 0) mb = (uint64_t)v;
     }
-    if (mb < 64) mb = 64;
-    if (mb > 4096) mb = 4096;
+    if (mb != 0) {
+        if (mb < 64) mb = 64;
+        if (mb > 4096) mb = 4096;
+    }
     uint64_t bytes = mb * 1048576ull;
     if (bytes < need) bytes = need;
     if (g_vmm_granularity > 1) {
