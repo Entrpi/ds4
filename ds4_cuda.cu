@@ -1328,7 +1328,14 @@ static const char *cuda_model_range_ptr_from_fd(
         return cuda_model_ptr(model_map, offset);
     }
 
-    char *dev = cuda_model_arena_alloc(bytes, what);
+    // Prefer the VMM arena when supported: same backing storage the
+    // ds4_weight_server uses, gives us 2 MiB device pages and a 1.7-2.0x
+    // prefill win on PRO 6000. Hard-gated off when the sidecar is in use
+    // (DS4_CUDA_WEIGHT_IPC_MANIFEST), soft-gated by DS4_CUDA_VMM_ARENA=0.
+    // On any driver error during allocation we transparently retry via the
+    // existing cudaMalloc arena, so this is never a correctness regression.
+    char *dev = cuda_vmm_arena_alloc(bytes, what);
+    if (!dev) dev = cuda_model_arena_alloc(bytes, what);
     if (!dev) {
         if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
         return cuda_model_ptr(model_map, offset);
