@@ -136,6 +136,21 @@ struct cuda_model_arena {
     uint64_t used;
 };
 
+// In-process VMM-backed weight arena. Uses cuMemCreate + cuMemAddressReserve +
+// cuMemMap with CU_MEM_HANDLE_TYPE_NONE to obtain 2 MiB device pages, the same
+// layout the out-of-process ds4_weight_server gives imported workers. Wins
+// ~2x on prefill on discrete cards (TLB pressure on ~80 GiB of weights), and
+// is expected to be neutral-or-positive on integrated GPUs. Skipped entirely
+// when the worker has imported VMM ranges from ds4_weight_server, because the
+// sidecar already provides identical-quality ranges; running both would
+// double-allocate the model.
+struct cuda_vmm_arena {
+    CUmemGenericAllocationHandle handle;
+    CUdeviceptr va;
+    uint64_t alloc_bytes;
+    uint64_t used;
+};
+
 struct cuda_q8_f16_range {
     const void *host_base;
     uint64_t offset;
@@ -179,6 +194,9 @@ struct cuda_derived_range {
 
 static std::vector<cuda_model_range> g_model_ranges;
 static std::vector<cuda_model_arena> g_model_arenas;
+static std::vector<cuda_vmm_arena> g_vmm_arenas;
+static int g_vmm_supported = -1;        // -1 = unprobed, 0 = no, 1 = yes
+static uint64_t g_vmm_granularity = 0;  // recommended VMM granularity, bytes
 static std::unordered_map<uint64_t, size_t> g_model_range_by_offset;
 static std::vector<cuda_q8_f16_range> g_q8_f16_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
@@ -203,6 +221,7 @@ static cudaEvent_t g_model_stage_event[4];
 static uint64_t g_model_stage_bytes;
 
 static int cuda_ok(cudaError_t err, const char *what);
+static int driver_ok(CUresult result, const char *what);
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -1072,6 +1091,51 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
         bytes = (need + align - 1u) & ~(align - 1u);
     }
     return bytes;
+}
+
+// Returns 1 iff this process should serve its own VMM-backed weight arena.
+// Cached after first call. Hard-gated when the worker is already importing
+// ranges from ds4_weight_server (DS4_CUDA_WEIGHT_IPC_MANIFEST) -- the sidecar
+// is then authoritative and a second VMM allocation would double-book the
+// model. Soft-gated by DS4_CUDA_VMM_ARENA=0 as an escape hatch (profiler /
+// driver quirks). On hardware that lacks VMM, the probe records 0 and the
+// caller transparently falls back to the cudaMalloc arena below.
+static int cuda_vmm_arena_supported(void) {
+    if (g_vmm_supported != -1) return g_vmm_supported;
+    const char *off = getenv("DS4_CUDA_VMM_ARENA");
+    if (off && off[0] == '0' && off[1] == '\0') { g_vmm_supported = 0; return 0; }
+    if (getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST")) { g_vmm_supported = 0; return 0; }
+    if (!driver_ok(cuInit(0), "init for VMM probe")) { g_vmm_supported = 0; return 0; }
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void)cudaGetLastError(); g_vmm_supported = 0; return 0; }
+    CUdevice cu_dev;
+    if (cuDeviceGet(&cu_dev, dev) != CUDA_SUCCESS) { g_vmm_supported = 0; return 0; }
+    int vmm = 0;
+    if (cuDeviceGetAttribute(&vmm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu_dev) != CUDA_SUCCESS || !vmm) {
+        g_vmm_supported = 0;
+        return 0;
+    }
+    CUmemAllocationProp prop;
+    memset(&prop, 0, sizeof(prop));
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = dev;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
+    size_t gran = 0;
+    if (cuMemGetAllocationGranularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) != CUDA_SUCCESS || gran == 0) {
+        g_vmm_supported = 0;
+        return 0;
+    }
+    g_vmm_granularity = (uint64_t)gran;
+    g_vmm_supported = 1;
+    int integrated = 0;
+    (void)cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev);
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr,
+                "ds4: CUDA VMM arena enabled (integrated=%d granularity=%llu)\n",
+                integrated, (unsigned long long)g_vmm_granularity);
+    }
+    return 1;
 }
 
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
