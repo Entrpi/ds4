@@ -390,7 +390,7 @@ int main(int argc, char **argv) {
         return rc;
     }
 
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes\n");
+    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_tps_ss,first_token_sec,kvcache_bytes\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -424,6 +424,8 @@ int main(int argc, char **argv) {
 
         const double gen_t0 = bench_now_sec();
         int generated = 0;
+        double t_after_first = 0.0;
+        int first_call_tokens = 0;
         while (generated < cfg.gen_tokens) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
@@ -465,6 +467,10 @@ int main(int argc, char **argv) {
                 }
                 generated++;
             }
+            if (t_after_first == 0.0) {
+                t_after_first = bench_now_sec();
+                first_call_tokens = generated;
+            }
         }
         const double gen_t1 = bench_now_sec();
         if (rc != 0) break;
@@ -476,13 +482,19 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
+        const double first_token_sec = t_after_first > 0.0 ? t_after_first - gen_t0 : 0.0;
+        const double ss_sec = t_after_first > 0.0 ? gen_t1 - t_after_first : 0.0;
+        const int ss_tokens = cfg.gen_tokens - first_call_tokens;
+        const double gen_tps_ss = (ss_sec > 0.0 && ss_tokens > 0) ? (double)ss_tokens / ss_sec : 0.0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%llu\n",
+                "%d,%d,%.2f,%d,%.2f,%.2f,%.4f,%llu\n",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
                 cfg.gen_tokens,
                 gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
+                gen_tps_ss,
+                first_token_sec,
                 (unsigned long long)snap.len);
         fflush(out);
 
