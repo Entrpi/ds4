@@ -1138,6 +1138,131 @@ static int cuda_vmm_arena_supported(void) {
     return 1;
 }
 
+// Default chunk size for a single cuMemCreate + cuMemMap. Mirrors the
+// ds4_weight_server default of 1024 MiB (overridable by --span-mb), so
+// in-process arena layout matches what bench harnesses already validate.
+static uint64_t cuda_vmm_arena_chunk_bytes(uint64_t need) {
+    uint64_t mb = 1024;
+    const char *env = getenv("DS4_CUDA_VMM_ARENA_CHUNK_MB");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end != env && v > 0) mb = (uint64_t)v;
+    }
+    if (mb < 64) mb = 64;
+    if (mb > 4096) mb = 4096;
+    uint64_t bytes = mb * 1048576ull;
+    if (bytes < need) bytes = need;
+    if (g_vmm_granularity > 1) {
+        const uint64_t g = g_vmm_granularity;
+        bytes = ((bytes + g - 1u) / g) * g;
+    }
+    return bytes;
+}
+
+// Bump-allocate `bytes` from a VMM-backed weight arena. Falls back to NULL
+// on any driver error so callers can transparently retry via the existing
+// cudaMalloc arena. Read-only PROT for the mapped range; weight upload
+// happens through a separate PROT_READWRITE alias the caller obtains by
+// running the same pinned-staged copy path the cudaMalloc arena uses.
+static char *cuda_vmm_arena_alloc(uint64_t bytes, const char *what) {
+    if (bytes == 0) return NULL;
+    if (!cuda_vmm_arena_supported()) return NULL;
+    const uint64_t align = 256u;
+    const uint64_t aligned = (bytes + align - 1u) & ~(align - 1u);
+
+    // Re-use space in an existing arena chunk if it fits.
+    for (cuda_vmm_arena &a : g_vmm_arenas) {
+        const uint64_t used_aligned = (a.used + align - 1u) & ~(align - 1u);
+        if (used_aligned <= a.alloc_bytes && aligned <= a.alloc_bytes - used_aligned) {
+            char *ptr = (char *)(uintptr_t)(a.va + used_aligned);
+            a.used = used_aligned + aligned;
+            return ptr;
+        }
+    }
+
+    const uint64_t chunk_bytes = cuda_vmm_arena_chunk_bytes(aligned);
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void)cudaGetLastError(); return NULL; }
+
+    CUmemAllocationProp prop;
+    memset(&prop, 0, sizeof(prop));
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = dev;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_NONE;
+
+    CUmemGenericAllocationHandle handle;
+    memset(&handle, 0, sizeof(handle));
+    if (!driver_ok(cuMemCreate(&handle, (size_t)chunk_bytes, &prop, 0),
+                   "VMM arena create")) {
+        // Stop trying VMM for the rest of the run so we don't spam logs.
+        g_vmm_supported = 0;
+        return NULL;
+    }
+    CUdeviceptr va = 0;
+    if (!driver_ok(cuMemAddressReserve(&va, (size_t)chunk_bytes,
+                                       (size_t)g_vmm_granularity, 0, 0),
+                   "VMM arena reserve")) {
+        (void)cuMemRelease(handle);
+        g_vmm_supported = 0;
+        return NULL;
+    }
+    if (!driver_ok(cuMemMap(va, (size_t)chunk_bytes, 0, handle, 0),
+                   "VMM arena map")) {
+        (void)cuMemAddressFree(va, (size_t)chunk_bytes);
+        (void)cuMemRelease(handle);
+        g_vmm_supported = 0;
+        return NULL;
+    }
+    CUmemAccessDesc access;
+    memset(&access, 0, sizeof(access));
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id = dev;
+    // Read-write: the weight upload path writes through this same VA before
+    // any kernel reads, and the existing matmul callers treat weights as
+    // read-only by convention. Matches ds4_weight_server's owner-side path.
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (!driver_ok(cuMemSetAccess(va, (size_t)chunk_bytes, &access, 1),
+                   "VMM arena set access")) {
+        (void)cuMemUnmap(va, (size_t)chunk_bytes);
+        (void)cuMemAddressFree(va, (size_t)chunk_bytes);
+        (void)cuMemRelease(handle);
+        g_vmm_supported = 0;
+        return NULL;
+    }
+
+    cuda_vmm_arena a;
+    a.handle = handle;
+    a.va = va;
+    a.alloc_bytes = chunk_bytes;
+    a.used = aligned;
+    g_vmm_arenas.push_back(a);
+
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        uint64_t total = 0;
+        for (const cuda_vmm_arena &it : g_vmm_arenas) total += it.alloc_bytes;
+        fprintf(stderr,
+                "ds4: CUDA VMM arena allocated %.2f MiB for %s (chunks=%zu total=%.2f GiB)\n",
+                (double)chunk_bytes / 1048576.0,
+                what ? what : "weights",
+                g_vmm_arenas.size(),
+                (double)total / 1073741824.0);
+    }
+    return (char *)(uintptr_t)va;
+}
+
+static void cuda_vmm_arenas_release_all(void) {
+    for (cuda_vmm_arena &a : g_vmm_arenas) {
+        if (a.va && a.alloc_bytes) {
+            (void)cuMemUnmap(a.va, (size_t)a.alloc_bytes);
+            (void)cuMemAddressFree(a.va, (size_t)a.alloc_bytes);
+        }
+        if (a.handle) (void)cuMemRelease(a.handle);
+    }
+    g_vmm_arenas.clear();
+}
+
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
@@ -1405,6 +1530,11 @@ static void cuda_model_range_release_all(void) {
         if (a.device_ptr) (void)cudaFree(a.device_ptr);
     }
     g_model_arenas.clear();
+    // VMM-backed arenas own the device VA + handle for many ranges in
+    // g_model_ranges; the per-range pointers above are aliases into these
+    // arenas and must not be cudaFree'd individually. Release order:
+    // unmap, address-free, release handle -- matches ds4_weight_server.
+    cuda_vmm_arenas_release_all();
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
