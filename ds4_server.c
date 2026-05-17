@@ -4981,6 +4981,27 @@ static void openai_stream_drain_tokens(openai_stream *st, size_t limit,
     st->pending_n -= k;
 }
 
+/* When return_token_ids is on, snap an emission limit down to the largest
+ * pending token byte_end <= limit (token-aligned).  This guarantees the
+ * emitted chunk's text corresponds exactly to whole model tokens and that
+ * the drained token_ids array always covers all of that text.  Without this,
+ * the </think> hold-back can land mid-token and we'd emit text bytes with
+ * no token_ids attached, which forces llama-benchy back into local
+ * re-tokenization for the rest of the stream. */
+static size_t openai_stream_align_limit(const openai_stream *st, size_t emit_pos, size_t limit) {
+    if (!st || !st->return_token_ids) return limit;
+    if (st->pending_n == 0) return emit_pos;
+    size_t aligned = emit_pos;
+    for (size_t i = 0; i < st->pending_n; i++) {
+        if (st->pending_token_byte_ends[i] <= limit) {
+            aligned = st->pending_token_byte_ends[i];
+        } else {
+            break;  /* entries are in chronological/byte order */
+        }
+    }
+    return aligned;
+}
+
 static void openai_tool_stream_free(openai_tool_stream *ts) {
     if (!ts) return;
     for (int i = 0; i < ts->ids_cap; i++) free(ts->ids[i]);
@@ -5820,6 +5841,10 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
             limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
+        /* Snap to the largest pending model-token boundary so every emitted
+         * chunk has a complete token_ids array.  No-op when return_token_ids
+         * is off. */
+        limit = openai_stream_align_limit(st, st->emit_pos, limit);
 
         if (limit > st->emit_pos) {
             const int *tok_ids = NULL;
@@ -5848,6 +5873,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
+        limit = openai_stream_align_limit(st, st->emit_pos, limit);
 
         if (limit > st->emit_pos) {
             const int *tok_ids = NULL;
