@@ -184,7 +184,7 @@ cuda/mmq/mmid.o: cuda/mmq/mmid.cu cuda/mmq/mmid.cuh cuda/mmq/common.cuh
 cuda/mmq/mmvq.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq/quantize.cuh cuda/mmq/vecdotq.cuh cuda/mmq/unary.cuh
 	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -c -o $@ $<
 
-tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
+tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4_weight_server: tools/ds4_weight_server.cu
