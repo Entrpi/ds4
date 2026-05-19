@@ -211,6 +211,78 @@ static_assert(sizeof(struct ds4_decode_scalars) == 40u,
 static struct ds4_decode_scalars *g_decode_host = NULL;  /* cudaHostAlloc */
 static struct ds4_decode_scalars *g_decode_dev  = NULL;  /* cudaMalloc */
 
+/* --------------------------------------------------------------------
+ * Per-layer scalars (Step 4b: R6 substrate).
+ *
+ * Carries scalars whose value DIFFERS across the 43 layers within a token:
+ * n_comp, comp_row, index_row, plus per-layer flag bits.  R6 (empirically
+ * discovered during Step 4 Commit B parity testing; see plan doc sec 15
+ * and the kernel-side mismatch printer in commit b7b2902) proved that
+ * these values cannot share the single-buffer token-stable substrate
+ * above -- the CPU outpaces the GPU and the captured/eager async memcpy
+ * reads its host source at execution time, after the CPU has moved on.
+ *
+ * Substrate design (validated empirically by
+ * tests/cuda_graph_layer_array_probe.cu -- PASS on PRO 6000 sm_120):
+ *
+ *   - One device array g_layer_dev[DS4_LAYER_SCALARS_COUNT].  Address
+ *     is stable for the session; each per-layer captured graph bakes
+ *     &g_layer_dev[il] into its kernel-node arg list.
+ *
+ *   - Two pinned host arrays g_layer_host[2][...] (double-buffered).
+ *     CPU writes the active buffer at top of token; after queueing the
+ *     memcpy it swaps g_layer_dev_idx so the next token writes the OTHER
+ *     buffer.  This is DEFENSIVE: under today's end-of-token hard sync
+ *     (cudaDeviceSynchronize in end_commands + synchronous tensor_read of
+ *     logits) a single host buffer would also be safe.  The double-buffer
+ *     future-proofs the design against async-sampling work that may
+ *     eventually remove the end-of-token barrier.
+ *
+ *   - One captured cudaMemcpyAsync per token moves the full N-entry
+ *     array from g_layer_host[idx] to g_layer_dev; subsequent per-layer
+ *     kernels read &g_layer_dev[il] from their baked arg.
+ *
+ * The struct must match the layout the kernels read.  Field order is
+ * chosen so the most-read fields land in the first cache transaction:
+ * attention reads n_comp; emit reads comp_row / index_row; flags is
+ * cheap fall-through.
+ *
+ * DS4_LAYER_SCALARS_COUNT must match DS4_N_LAYER in ds4.c (43 for V4
+ * Flash).  Kept as a local constant rather than a header decl because
+ * the CUDA file doesn't include ds4.c's compile constants; if the model
+ * topology ever changes, both this constant and DS4_N_LAYER must move
+ * together (same discipline as DS4_N_HEAD_DIM / DS4_N_ROT etc.). */
+#define DS4_LAYER_SCALARS_COUNT 43u
+
+struct ds4_layer_scalars {
+    uint32_t n_comp;      /* post-this-token's-emit count for attention */
+    uint32_t comp_row;    /* pre-emit row index for fp8 row-kernel */
+    uint32_t index_row;   /* pre-emit row index for indexer_qat row-kernel */
+    uint32_t flags;       /* bit 0: emit_this_step; bit 1: indexed_active */
+};
+static_assert(sizeof(struct ds4_layer_scalars) == 16u,
+              "ds4_layer_scalars must be exactly 16 bytes");
+
+/* Double-buffered pinned host source.  CPU writes one buffer per token,
+ * alternates via g_layer_dev_idx.  Both buffers live at stable addresses
+ * for the session; only the CPU's choice of which to write rotates. */
+static struct ds4_layer_scalars *g_layer_host[2] = { NULL, NULL };
+
+/* Single device array.  Address is baked into captured kernel-node arg
+ * lists as &g_layer_dev[il] for each per-layer graph.  CPU never writes
+ * here directly; only the per-token cudaMemcpyAsync writes it.  Address
+ * stability is the load-bearing property; under no circumstances should
+ * this pointer be reallocated mid-session (see plan doc sec 15.8). */
+static struct ds4_layer_scalars *g_layer_dev   = NULL;
+
+/* CPU-private index alternating 0..1 per token.  Token N writes
+ * g_layer_host[g_layer_dev_idx], queues the memcpy with that as source,
+ * then flips g_layer_dev_idx so token N+1 writes the OTHER buffer.  The
+ * memcpy executes asynchronously; by the time the GPU reads from token
+ * N's buffer, token N+1's writes are landing in a different host page.
+ * Index is never sent to the GPU. */
+static int g_layer_dev_idx = 0;
+
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
@@ -1051,6 +1123,140 @@ extern "C" int ds4_gpu_decode_scalars_flush(void) {
                                    cudaMemcpyHostToDevice,
                                    ds4_current_stream()),
                    "decode scalars flush");
+}
+
+/* =====================================================================
+ * Layer-scalars substrate (Step 4b: R6 fix).
+ *
+ * See struct ds4_layer_scalars definition near the file top + plan doc
+ * sec 15 for the full design rationale.  These functions form the C-
+ * callable surface that ds4.c will wire up in Step 4c:
+ *
+ *   ds4_gpu_decode_layer_scalars_init()         once per GPU session
+ *   ds4_gpu_decode_layer_scalars_host()         once per decode token (top)
+ *   ds4_gpu_decode_layer_scalars_flush()        once per decode token (after host fill)
+ *   ds4_gpu_decode_layer_scalars_device_ptr()   pass to per-layer kernel shims
+ *   ds4_gpu_decode_layer_scalars_cleanup()      at GPU teardown
+ *
+ * No callers in this commit -- Step 4b is the scaffold-only landing.  The
+ * shim-side parameter and kernel-side reads come in Step 4c sub-commits
+ * R1', C1, C2, I1, I2, A1 (see plan doc sec 16 + 17).
+ *
+ * Init is idempotent.  Init failure leaves all three globals NULL and
+ * returns 0; the caller treats that as "layer-graphs-disabled" and stays
+ * on the inline-arg path.  Cleanup is also idempotent. */
+extern "C" int ds4_gpu_decode_layer_scalars_init(void) {
+    if (g_layer_host[0] != NULL && g_layer_host[1] != NULL && g_layer_dev != NULL) {
+        return 1;  /* already initialized */
+    }
+    const size_t bytes = (size_t)DS4_LAYER_SCALARS_COUNT * sizeof(struct ds4_layer_scalars);
+    for (int b = 0; b < 2; ++b) {
+        if (g_layer_host[b] == NULL) {
+            if (!cuda_ok(cudaHostAlloc((void **)&g_layer_host[b], bytes,
+                                       cudaHostAllocDefault),
+                         "layer scalars host alloc")) {
+                /* Roll back any partial allocations so a retry can re-init
+                 * cleanly. */
+                for (int c = 0; c < b; ++c) {
+                    if (g_layer_host[c]) {
+                        cudaFreeHost(g_layer_host[c]);
+                        g_layer_host[c] = NULL;
+                    }
+                }
+                return 0;
+            }
+        }
+    }
+    if (g_layer_dev == NULL) {
+        if (!cuda_ok(cudaMalloc((void **)&g_layer_dev, bytes),
+                     "layer scalars dev alloc")) {
+            for (int b = 0; b < 2; ++b) {
+                if (g_layer_host[b]) {
+                    cudaFreeHost(g_layer_host[b]);
+                    g_layer_host[b] = NULL;
+                }
+            }
+            g_layer_dev = NULL;
+            return 0;
+        }
+    }
+    /* Zero both host buffers so a first-token read of an unwritten slot is
+     * deterministic (n_comp=0, comp_row=0, index_row=0, flags=0).  Then
+     * prime the device array via a synchronous copy so kernels that read
+     * &g_layer_dev[il] before the first per-token flush see the same
+     * zeros rather than uninitialized memory.  Outside any graph capture. */
+    memset(g_layer_host[0], 0, bytes);
+    memset(g_layer_host[1], 0, bytes);
+    if (!cuda_ok(cudaMemcpy(g_layer_dev, g_layer_host[0], bytes,
+                            cudaMemcpyHostToDevice),
+                 "layer scalars prime")) {
+        cudaFree(g_layer_dev);
+        for (int b = 0; b < 2; ++b) {
+            cudaFreeHost(g_layer_host[b]);
+            g_layer_host[b] = NULL;
+        }
+        g_layer_dev = NULL;
+        return 0;
+    }
+    g_layer_dev_idx = 0;
+    return 1;
+}
+
+extern "C" void ds4_gpu_decode_layer_scalars_cleanup(void) {
+    if (g_layer_dev != NULL) {
+        cudaFree(g_layer_dev);
+        g_layer_dev = NULL;
+    }
+    for (int b = 0; b < 2; ++b) {
+        if (g_layer_host[b] != NULL) {
+            cudaFreeHost(g_layer_host[b]);
+            g_layer_host[b] = NULL;
+        }
+    }
+    g_layer_dev_idx = 0;
+}
+
+/* Returns the stable device-array base pointer.  Callers in Step 4c will
+ * compute per-layer pointers as `(const struct ds4_layer_scalars *)
+ * device_ptr + il` and forward to per-layer kernel shims.  May return NULL
+ * if init failed or was never called; callers should treat that as
+ * "layer-graphs-disabled" and fall back to inline-arg paths. */
+extern "C" const void *ds4_gpu_decode_layer_scalars_device_ptr(void) {
+    return (const void *)g_layer_dev;
+}
+
+/* Returns the currently-active host buffer.  Caller writes all
+ * DS4_LAYER_SCALARS_COUNT entries before calling _flush().  The pointer
+ * rotates between two stable addresses each token; callers must NOT
+ * cache it across token boundaries.  Returns NULL if init failed. */
+extern "C" void *ds4_gpu_decode_layer_scalars_host(void) {
+    return (void *)g_layer_host[g_layer_dev_idx];
+}
+
+/* Push the active host buffer to the device array and rotate the index.
+ * Issues one cudaMemcpyAsync of DS4_LAYER_SCALARS_COUNT * 16 bytes on
+ * ds4_current_stream() -- today eager on stream 0, under Step 6's wider
+ * per-token capture may become a captured node.
+ *
+ * The index rotation happens AFTER queueing the memcpy: the memcpy node
+ * has the current g_layer_host[idx] address burned into its source-pointer
+ * arg at queue time, and the GPU dereferences that address at execution
+ * time.  Rotating idx now only affects the NEXT token's CPU write target;
+ * the GPU still reads from the buffer it was just queued against.  See
+ * plan doc sec 15.3 for the full ordering proof.
+ *
+ * Returns 1 on success / no-op (init not run), 0 on infrastructure
+ * failure. */
+extern "C" int ds4_gpu_decode_layer_scalars_flush(void) {
+    if (g_layer_host[g_layer_dev_idx] == NULL || g_layer_dev == NULL) return 1;
+    const size_t bytes = (size_t)DS4_LAYER_SCALARS_COUNT * sizeof(struct ds4_layer_scalars);
+    int ok = cuda_ok(cudaMemcpyAsync(g_layer_dev, g_layer_host[g_layer_dev_idx],
+                                     bytes,
+                                     cudaMemcpyHostToDevice,
+                                     ds4_current_stream()),
+                     "layer scalars flush");
+    if (ok) g_layer_dev_idx ^= 1;
+    return ok;
 }
 
 static double cuda_wall_sec(void) {

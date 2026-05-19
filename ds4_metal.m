@@ -339,6 +339,35 @@ void ds4_gpu_decode_scalars_set_n_comp(uint32_t n_comp) {
     (void)n_comp;
 }
 
+/* Per-layer scalars substrate (Step 4b): no-op stubs on Metal.
+ *
+ * Metal already passes per-kernel scalars via setBytes/setBuffer; the
+ * array-of-43 + double-buffered host design doesn't apply.  The Step 4c
+ * shim signatures will accept the layer-scalars device pointer as an
+ * additional const-void argument; on Metal that pointer is NULL and the
+ * shims read scalars from their existing per-kernel inline args.
+ *
+ * Init returns 1 (success / no-op).  Cleanup is a no-op.  device_ptr and
+ * host return NULL so shim wrappers can detect the "Metal" case and route
+ * to the inline-arg path.  flush is a no-op returning success. */
+int ds4_gpu_decode_layer_scalars_init(void) {
+    return 1;
+}
+
+void ds4_gpu_decode_layer_scalars_cleanup(void) {}
+
+const void *ds4_gpu_decode_layer_scalars_device_ptr(void) {
+    return NULL;
+}
+
+void *ds4_gpu_decode_layer_scalars_host(void) {
+    return NULL;
+}
+
+int ds4_gpu_decode_layer_scalars_flush(void) {
+    return 1;
+}
+
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {

@@ -136,6 +136,49 @@ void  ds4_gpu_decode_scalars_set_emit_rows(uint32_t comp_row,
  * race during the Step 4b/4c transition. */
 void  ds4_gpu_decode_scalars_set_n_comp(uint32_t n_comp);
 
+/* =========================================================================
+ * Per-layer scalars substrate (Step 4b: R6 fix).
+ * =========================================================================
+ *
+ * Carries scalars whose value DIFFERS across the 43 layers within a token:
+ * n_comp, comp_row, index_row, plus per-layer flag bits.  See plan doc
+ * sec 15 for the full design rationale; sec 15.3 for the ordering proof;
+ * sec 15.8 for the cache-key invariant.
+ *
+ * Substrate is the array-of-43 + double-buffered host design empirically
+ * validated by tests/cuda_graph_layer_array_probe.cu (PASS on PRO 6000
+ * Blackwell sm_120).
+ *
+ * Lifecycle (will be wired in Step 4c):
+ *   ds4_gpu_decode_layer_scalars_init()         once per GPU session
+ *   ds4_gpu_decode_layer_scalars_host()         once per decode token: get
+ *                                               the active host buffer
+ *   <CPU writes all 43 entries>
+ *   ds4_gpu_decode_layer_scalars_flush()        once per decode token: queue
+ *                                               the H2D memcpy + rotate idx
+ *   ds4_gpu_decode_layer_scalars_device_ptr()   pass to per-layer kernel shims
+ *                                               (callers add `il * sizeof(...)`)
+ *   ds4_gpu_decode_layer_scalars_cleanup()      at GPU teardown
+ *
+ * Layer-count discipline: the substrate is sized for V4 Flash's 43 layers
+ * (DS4_LAYER_SCALARS_COUNT in ds4_cuda.cu).  The same constant lives at
+ * DS4_N_LAYER in ds4.c; both must move together if the model topology
+ * changes (same convention as DS4_N_HEAD_DIM / DS4_N_ROT).
+ *
+ * Backends other than CUDA implement these as no-ops; Metal stubs return
+ * 1 from init/flush and NULL from device_ptr/host so shim signatures stay
+ * uniform across backends.
+ *
+ * Symbol naming mirrors ds4_gpu_decode_scalars_* so the relationship is
+ * obvious at the call site:
+ *   decode_scalars       = token-stable (single struct, single buffer)
+ *   decode_layer_scalars = per-layer (43-entry array, double-buffered host) */
+int   ds4_gpu_decode_layer_scalars_init(void);
+void  ds4_gpu_decode_layer_scalars_cleanup(void);
+const void *ds4_gpu_decode_layer_scalars_device_ptr(void);
+void *ds4_gpu_decode_layer_scalars_host(void);
+int   ds4_gpu_decode_layer_scalars_flush(void);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
