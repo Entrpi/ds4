@@ -8860,7 +8860,11 @@ extern "C" int ds4_cuda_layer_graph_begin_or_replay(
         slot->hits = 0;
     }
     memcpy(&slot->key, key, sizeof(*key));
-    cudaError_t ge = cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal);
+    /* Step 7 determinism probe: try cudaStreamCaptureModeGlobal instead of
+     * ThreadLocal.  Global mode is stricter about cross-thread cuda calls
+     * during capture but may yield different scheduling on replay.  If
+     * determinism is restored, the capture-mode interaction is the source. */
+    cudaError_t ge = cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
     if (ge != cudaSuccess) {
         fprintf(stderr, "ds4: cudaStreamBeginCapture (layer %u) failed: %s\n",
                 il, cudaGetErrorString(ge));
