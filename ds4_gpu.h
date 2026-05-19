@@ -279,6 +279,21 @@ void ds4_cuda_layer_graph_end_or_commit(uint32_t il);
  * Used to bisect capture-mode incompatibilities by call site. */
 void ds4_cuda_layer_graph_debug_peek(const char *label);
 
+/* Step 7 per-kernel hash dump (DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1).
+ * Used to bisect the captured-vs-eager output divergence by hashing
+ * each shim's primary output buffer and printing the per-token table.
+ * - dump_hash_reset: clear the slot table; called once per token.
+ * - dump_hash_after: launch FNV-1a kernel on `tensor->ptr` for the next
+ *                    slot and record `label` for it.
+ * - dump_hash_flush: sync, copy hashes to host, print one line per slot
+ *                    used this token: "DS4_HASH pos=N slot=I hexhash label".
+ * Metal stubs all three as no-ops. */
+void ds4_cuda_dump_hash_reset(void);
+void ds4_cuda_dump_hash_after(const ds4_gpu_tensor *tensor,
+                                uint64_t n_elem,
+                                const char *label);
+void ds4_cuda_dump_hash_flush(uint32_t pos);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);

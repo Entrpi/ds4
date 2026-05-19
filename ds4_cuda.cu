@@ -8733,6 +8733,93 @@ static struct layer_graph_entry *layer_graph_slot(const struct ds4_layer_graph_k
     return &g_layer_graphs[layer_graph_hash(key) % DS4_LAYER_GRAPH_CACHE_SIZE];
 }
 
+/* ------------------------------------------------------------------------ *
+ * Step 7 per-kernel hash dump (DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1).
+ *
+ * Computes an FNV-1a hash of a device buffer's float contents and writes
+ * the result into a slot of a device-side hash array.  Gated by env so
+ * the standing parity gate isn't slowed down.  After end_or_commit
+ * completes, ds4_cuda_dump_hashes_flush() copies the hash array to host
+ * and prints "label: hex" per slot used so far this token.
+ *
+ * Usage: caller routes through ds4_cuda_dump_hash_after(tensor, n_elem,
+ * label) AFTER each shim it wants to probe.  Slot indices are assigned
+ * monotonically per token; labels are stored host-side in parallel.
+ * ds4_cuda_dump_hashes_reset() called at the start of each token; the
+ * flush at the end prints the per-token table. */
+#define DS4_CUDA_DUMP_HASH_SLOTS 1024
+__device__ static uint64_t g_dump_hashes_dev[DS4_CUDA_DUMP_HASH_SLOTS];
+static uint64_t g_dump_hashes_host[DS4_CUDA_DUMP_HASH_SLOTS];
+static const char *g_dump_labels[DS4_CUDA_DUMP_HASH_SLOTS];
+static uint32_t   g_dump_next = 0;
+
+__global__ static void ds4_cuda_dump_hash_fnv1a_kernel(
+        const float *buf, uint64_t n_elem, uint32_t slot) {
+    /* Single-thread FNV-1a over the float bit pattern.  Slow (~few us
+     * for 7168 floats) but deterministic and capture-safe. */
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (uint64_t i = 0; i < n_elem; i++) {
+        union { float f; uint32_t u; } x;
+        x.f = buf[i];
+        h ^= (uint64_t)x.u;
+        h *= 0x100000001b3ULL;
+    }
+    g_dump_hashes_dev[slot] = h;
+}
+
+static int ds4_cuda_dump_hash_enabled(void) {
+    static int init = 0, en = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_LAYER_GRAPHS_HASH_DUMP");
+        en = (s && *s && strcmp(s, "0") != 0) ? 1 : 0;
+    }
+    return en;
+}
+
+extern "C" void ds4_cuda_dump_hash_reset(void) {
+    if (!ds4_cuda_dump_hash_enabled()) return;
+    g_dump_next = 0;
+    for (uint32_t i = 0; i < DS4_CUDA_DUMP_HASH_SLOTS; i++) g_dump_labels[i] = NULL;
+}
+
+extern "C" void ds4_cuda_dump_hash_after(
+        const struct ds4_gpu_tensor *tensor,
+        uint64_t n_elem,
+        const char *label) {
+    if (!ds4_cuda_dump_hash_enabled() || !tensor) return;
+    if (g_dump_next >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    const uint32_t slot = g_dump_next++;
+    g_dump_labels[slot] = label;
+    /* Launch on ds4_current_stream() so the hash is recorded into the
+     * captured graph (or runs eagerly when capture is off). */
+    ds4_cuda_dump_hash_fnv1a_kernel<<<1, 1, 0, ds4_current_stream()>>>(
+            (const float *)tensor->ptr, n_elem, slot);
+}
+
+extern "C" void ds4_cuda_dump_hash_flush(uint32_t pos) {
+    if (!ds4_cuda_dump_hash_enabled()) return;
+    if (g_dump_next == 0) return;
+    /* Synchronize all pending captures + launches so device hashes are
+     * stable, then copy to host and print. */
+    cudaDeviceSynchronize();
+    cudaError_t e = cudaMemcpyFromSymbol(g_dump_hashes_host, g_dump_hashes_dev,
+                                          sizeof(g_dump_hashes_host),
+                                          0, cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "ds4: dump_hash_flush memcpy failed: %s\n",
+                cudaGetErrorString(e));
+        return;
+    }
+    for (uint32_t i = 0; i < g_dump_next; i++) {
+        fprintf(stderr, "DS4_HASH pos=%u slot=%3u %016lx %s\n",
+                pos, i, (unsigned long)g_dump_hashes_host[i],
+                g_dump_labels[i] ? g_dump_labels[i] : "(no-label)");
+    }
+}
+
 /* In-flight capture tracking.  begin_or_replay sets these when it returns 0
  * (capturing); end_or_commit reads them to find the slot to close.  Single-
  * threaded GPU work makes file-scope globals safe; if multi-threaded use

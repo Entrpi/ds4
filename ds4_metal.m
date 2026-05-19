@@ -424,6 +424,20 @@ void ds4_cuda_layer_graph_debug_peek(const char *label) {
     (void)label;  /* Step 6 diagnostic; CUDA-only. */
 }
 
+void ds4_cuda_dump_hash_reset(void) {
+    /* Step 7 hash dump; CUDA-only. */
+}
+
+void ds4_cuda_dump_hash_after(const ds4_gpu_tensor *tensor,
+                                uint64_t n_elem,
+                                const char *label) {
+    (void)tensor; (void)n_elem; (void)label;
+}
+
+void ds4_cuda_dump_hash_flush(uint32_t pos) {
+    (void)pos;
+}
+
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {
