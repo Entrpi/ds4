@@ -9051,7 +9051,17 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         struct dense_graph_entry *dslot = NULL;
         int dcapturing = 0;
         cudaStream_t moe_stream = ds4_cuda_moe_graphs_enabled() ? ds4_cuda_moe_stream() : (cudaStream_t)0;
-        if (ds4_cuda_moe_graphs_enabled() && moe_stream) {
+        /* R3 inner-bypass (Step 5, hardened in Step 6).  When an outer
+         * per-layer capture is active, skip the inner dense-graph cache
+         * entirely.  Both branches are unsafe under outer capture:
+         *   - HIT path (cudaGraphLaunch + sync events) creates an external
+         *     cross-stream dependency CUDA capture rejects with "operation
+         *     failed due to a previous error during capture".
+         *   - MISS path (cudaStreamBeginCapture) CUDA forbids as nested.
+         * The kernels in ds4_mmq_q8_0_dense_vec below already route
+         * through ds4_current_stream() (A2) which == moe_stream during
+         * outer capture, so they fold into the outer graph for free. */
+        if (ds4_cuda_moe_graphs_enabled() && moe_stream && !ds4_capture_active()) {
             struct dense_graph_key dkey;
             memset(&dkey, 0, sizeof(dkey));
             dkey.weight_offset = weight_offset;
@@ -9080,24 +9090,13 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 dslot->valid = 0;
                 dslot->hits = 0;
             }
-            /* R3 inner-bypass (Step 5).  If an outer per-layer capture is
-             * active, skip our own BeginCapture: (a) CUDA forbids nested
-             * begins on the same stream, and (b) the kernels launched
-             * below already route through ds4_current_stream() (A2 work)
-             * which == moe_stream during outer capture, so they fold into
-             * the outer graph for free.  When standalone (no outer
-             * capture), the inner cache works exactly as before. */
-            if (ds4_capture_active()) {
-                dslot = NULL;
+            cudaError_t ge = cudaStreamBeginCapture(moe_stream, cudaStreamCaptureModeThreadLocal);
+            if (ge == cudaSuccess) {
+                dcapturing = 1;
             } else {
-                cudaError_t ge = cudaStreamBeginCapture(moe_stream, cudaStreamCaptureModeThreadLocal);
-                if (ge == cudaSuccess) {
-                    dcapturing = 1;
-                } else {
-                    fprintf(stderr, "ds4: cudaStreamBeginCapture (dense) failed: %s\n",
-                            cudaGetErrorString(ge));
-                    dslot = NULL;
-                }
+                fprintf(stderr, "ds4: cudaStreamBeginCapture (dense) failed: %s\n",
+                        cudaGetErrorString(ge));
+                dslot = NULL;
             }
         }
 
@@ -14137,7 +14136,11 @@ static int routed_moe_launch(
             struct moe_graph_entry *graph_slot = NULL;
             int graph_capturing = 0;
             cudaStream_t moe_stream = ds4_cuda_moe_graphs_enabled() ? ds4_cuda_moe_stream() : (cudaStream_t)0;
-            if (ds4_cuda_moe_graphs_enabled() && moe_stream) {
+            /* R3 inner-bypass (Step 5, hardened in Step 6).  When an outer
+             * per-layer capture is active, skip the inner MoE-graph cache
+             * entirely (both HIT path and MISS path are unsafe under outer
+             * capture -- see the matching guard at the dense Q8_0 site). */
+            if (ds4_cuda_moe_graphs_enabled() && moe_stream && !ds4_capture_active()) {
                 struct moe_graph_key key;
                 memset(&key, 0, sizeof(key));
                 key.gate_offset     = gate_offset;
@@ -14184,29 +14187,19 @@ static int routed_moe_launch(
                     graph_slot->valid = 0;
                     graph_slot->hits = 0;
                 }
-                /* R3 inner-bypass (Step 5).  If an outer per-layer capture
-                 * is active, skip our own BeginCapture: CUDA forbids
-                 * nested begins on the same stream, and the kernels below
-                 * already route through ds4_current_stream() == moe_stream
-                 * under outer capture (A2 work) so they fold into the
-                 * outer graph.  Standalone path is byte-for-byte unchanged. */
-                if (ds4_capture_active()) {
-                    graph_slot = NULL;
+                cudaError_t ge = cudaStreamBeginCapture(moe_stream, cudaStreamCaptureModeThreadLocal);
+                if (ge == cudaSuccess) {
+                    graph_capturing = 1;
+                    /* Route the in-capture <<<>>> kernel launches at
+                     * moe_mmq_swiglu_weighted_clamp_kernel and moe_sum_kernel
+                     * to moe_stream so they record into the capture.  The
+                     * ds4_mmq_*_moe_vec calls below carry moe_stream as an
+                     * explicit parameter and are unaffected by this. */
+                    ds4_capture_set_stream(moe_stream);
                 } else {
-                    cudaError_t ge = cudaStreamBeginCapture(moe_stream, cudaStreamCaptureModeThreadLocal);
-                    if (ge == cudaSuccess) {
-                        graph_capturing = 1;
-                        /* Route the in-capture <<<>>> kernel launches at
-                         * moe_mmq_swiglu_weighted_clamp_kernel and moe_sum_kernel
-                         * to moe_stream so they record into the capture.  The
-                         * ds4_mmq_*_moe_vec calls below carry moe_stream as an
-                         * explicit parameter and are unaffected by this. */
-                        ds4_capture_set_stream(moe_stream);
-                    } else {
-                        fprintf(stderr, "ds4: cudaStreamBeginCapture failed: %s; graphs disabled this call\n",
-                                cudaGetErrorString(ge));
-                        graph_slot = NULL;
-                    }
+                    fprintf(stderr, "ds4: cudaStreamBeginCapture failed: %s; graphs disabled this call\n",
+                            cudaGetErrorString(ge));
+                    graph_slot = NULL;
                 }
             }
 
