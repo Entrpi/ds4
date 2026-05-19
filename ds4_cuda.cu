@@ -987,6 +987,15 @@ extern "C" void ds4_gpu_decode_scalars_set_emit_rows(uint32_t comp_row,
     g_decode_host->index_row = index_row;
 }
 
+/* Per-layer setter for the visible-compressed-token count.  n_comp varies
+ * per layer (g->layer_n_comp[il]) so it can't be set once at top of token.
+ * Called from ds4.c before the per-layer attention call(s); paired with
+ * flush() so the device sees the new value before the kernel reads it. */
+extern "C" void ds4_gpu_decode_scalars_set_n_comp(uint32_t n_comp) {
+    if (g_decode_host == NULL) return;
+    g_decode_host->n_comp = n_comp;
+}
+
 /* Push the current pinned-host struct contents to the device-side mirror.
  * Called from ds4.c once per decode token, after ds4_gpu_decode_scalars_set
  * and before the per-layer body starts issuing kernels that read

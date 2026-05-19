@@ -334,6 +334,11 @@ void ds4_gpu_decode_scalars_set_emit_rows(uint32_t comp_row,
     g_metal_decode_index_row = index_row;
 }
 
+void ds4_gpu_decode_scalars_set_n_comp(uint32_t n_comp) {
+    /* Metal stub: kernels read n_comp from their inline args; no-op. */
+    (void)n_comp;
+}
+
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {

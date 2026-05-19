@@ -97,6 +97,11 @@ int   ds4_gpu_decode_scalars_flush(void);
 void  ds4_gpu_decode_scalars_set_emit_rows(uint32_t comp_row,
                                              uint32_t index_row);
 
+/* Per-layer setter for n_comp (visible compressed-token count).  n_comp
+ * is g->layer_n_comp[il] which varies per layer; callers update it before
+ * each per-layer attention shim invocation, followed by flush(). */
+void  ds4_gpu_decode_scalars_set_n_comp(uint32_t n_comp);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
