@@ -13099,6 +13099,22 @@ static bool metal_graph_encode_token_raw_swa(
     if (ok && need_logits) {
         ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     }
+    /* Step 7 hash dump: hash the first 30 rows of raw_cache for a few
+     * layers to identify if KV cache writes differ between captured +
+     * eager paths (covers prefill rows + early decode rows). */
+    if (ok) {
+        static const char *kv_labels[] = {
+            "KV:L00_raw","KV:L05_raw","KV:L10_raw","KV:L20_raw",
+            "KV:L30_raw","KV:L42_raw",
+        };
+        static const uint32_t kv_layers[] = { 0, 5, 10, 20, 30, 42 };
+        const uint64_t rows_to_hash = 30;
+        const uint64_t hash_elems = rows_to_hash * DS4_N_HEAD_DIM;
+        for (uint32_t k = 0; k < (uint32_t)(sizeof(kv_layers)/sizeof(kv_layers[0])); k++) {
+            const uint32_t il = kv_layers[k];
+            ds4_cuda_dump_hash_after(g->layer_raw_cache[il], hash_elems, kv_labels[k]);
+        }
+    }
     /* Step 7 hash dump: print this token's hash table to stderr.  No-op
      * unless DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1. */
     ds4_cuda_dump_hash_flush(pos);
