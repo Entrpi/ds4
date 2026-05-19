@@ -298,6 +298,14 @@ void ds4_cuda_dump_hash_at_slot(const ds4_gpu_tensor *tensor,
                                   uint32_t slot);
 void ds4_cuda_dump_hash_flush(uint32_t pos);
 
+/* Step 7 narrowing: routed-MoE branch tag + tag-write helper.  Used to
+ * record which of the three routed-MoE dispatch paths (1=MMVQ-decode,
+ * 2=MMQ-batch, 3=legacy) actually ran for the most recent call, and
+ * to record categorical values into a hash dump slot. */
+int  ds4_cuda_dump_get_last_moe_branch(void);
+void ds4_cuda_dump_set_last_moe_branch(int b);
+void ds4_cuda_dump_tag_at_slot(uint32_t tag, const char *label, uint32_t slot);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);

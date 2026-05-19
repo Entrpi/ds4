@@ -445,6 +445,18 @@ void ds4_cuda_dump_hash_flush(uint32_t pos) {
     (void)pos;
 }
 
+int ds4_cuda_dump_get_last_moe_branch(void) {
+    return 0;
+}
+
+void ds4_cuda_dump_set_last_moe_branch(int b) {
+    (void)b;
+}
+
+void ds4_cuda_dump_tag_at_slot(uint32_t tag, const char *label, uint32_t slot) {
+    (void)tag; (void)label; (void)slot;
+}
+
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {

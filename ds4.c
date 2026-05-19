@@ -10057,9 +10057,32 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
     }
-    /* Step 7 probe: MoE output BEFORE shared FFN.  Strongest suspect:
-     * atomic_out adds in moe_q*_K_down kernels may produce different
-     * float results depending on captured-graph block-scheduling order. */
+    /* Step 7 narrowing probes (post-analyst-correction).  routed_out is
+     * the first divergent tensor at pos=25, but the default decode path
+     * uses MMVQ -> moe_sum_kernel, not the legacy atomicAdd down kernels.
+     * Probe each intermediate to localise the divergence to a specific
+     * sub-kernel:
+     *   212: branch tag (1=MMVQ-decode, 2=MMQ-batch, 3=legacy)
+     *   213: routed_gate (after gate matmul, pre-SwiGLU)
+     *   214: routed_up   (after up matmul, pre-SwiGLU)
+     *   215: routed_mid  (after SwiGLU+clamp+router_weight)
+     *   216: routed_down (after down matmul, pre-sum across experts)
+     *   209: routed_out  (after moe_sum_kernel; final per-token output) */
+    if (ok && dump_this_layer) {
+        int branch = ds4_cuda_dump_get_last_moe_branch();
+        ds4_cuda_dump_tag_at_slot((uint32_t)branch, "L0:MoE-branch", 212);
+        ds4_cuda_dump_hash_at_slot(g->routed_gate,
+            (uint64_t)DS4_N_EXPERT_USED * down_in_dim, "L0:routed_gate", 213);
+        ds4_cuda_dump_hash_at_slot(g->routed_up,
+            (uint64_t)DS4_N_EXPERT_USED * down_in_dim, "L0:routed_up", 214);
+        ds4_cuda_dump_hash_at_slot(g->routed_mid,
+            (uint64_t)DS4_N_EXPERT_USED * down_in_dim, "L0:routed_mid", 215);
+        ds4_cuda_dump_hash_at_slot(g->routed_down,
+            (uint64_t)DS4_N_EXPERT_USED * routed_out_dim, "L0:routed_down-pre-sum", 216);
+    }
+    /* Step 7 probe: MoE output AFTER moe_sum_kernel (cross-expert sum).  If
+     * routed_down (slot 216) matches across runs but routed_out (slot 209)
+     * differs, the divergence is in moe_sum_kernel's reduction ordering. */
     if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->routed_out, DS4_N_EMBD, "L0:routed_out", 209);
     const bool fuse_shared_gate_up =
         !g->quality &&

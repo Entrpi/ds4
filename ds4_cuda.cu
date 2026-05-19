@@ -8826,6 +8826,41 @@ extern "C" void ds4_cuda_dump_hash_at_slot(
             (const float *)tensor->ptr, n_elem, slot);
 }
 
+/* Step 7 narrowing: routed-MoE branch tag.  Tracks which of the three
+ * routed-MoE dispatch paths actually ran for the most recent
+ * routed_moe_launch call.  Set host-side at the entry of each branch
+ * (synchronous before kernel launches); read host-side by ds4.c after
+ * the routed_moe call to emit a tag at a fixed dump slot.  Values:
+ *   0 = no branch (routed_moe_launch bailed early)
+ *   1 = MMVQ decode (n_tok<=mmvq_decode_max_tokens vec path)
+ *   2 = MMQ batch (mid/large batch mmq tile path)
+ *   3 = legacy native kernels (sorted / direct-sum / tile / atomic) */
+static volatile int g_dump_last_moe_branch = 0;
+
+extern "C" int ds4_cuda_dump_get_last_moe_branch(void) {
+    return (int)g_dump_last_moe_branch;
+}
+
+extern "C" void ds4_cuda_dump_set_last_moe_branch(int b) {
+    g_dump_last_moe_branch = b;
+}
+
+/* Tag kernel: writes a constant uint32 (zero-extended to uint64) into
+ * a dump slot, bypassing the FNV-1a path.  Used to record categorical
+ * values (e.g. branch ids) alongside true hashes. */
+__global__ static void ds4_cuda_dump_tag_kernel(uint32_t tag, uint32_t slot) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    g_dump_hashes_dev[slot] = (uint64_t)tag;
+}
+
+extern "C" void ds4_cuda_dump_tag_at_slot(uint32_t tag, const char *label, uint32_t slot) {
+    if (!ds4_cuda_dump_hash_enabled()) return;
+    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    g_dump_labels[slot] = label;
+    ds4_cuda_dump_tag_kernel<<<1, 1, 0, ds4_current_stream()>>>(tag, slot);
+}
+
 extern "C" void ds4_cuda_dump_hash_flush(uint32_t pos) {
     if (!ds4_cuda_dump_hash_enabled()) return;
     /* Synchronize all pending captures + launches so device hashes are
@@ -14245,6 +14280,9 @@ static int routed_moe_launch(
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
         return 0;
     }
+    /* Step 7 narrowing: reset branch tag at entry so a downstream
+     * ds4_cuda_dump_get_last_moe_branch() reads 0 if every branch bails. */
+    g_dump_last_moe_branch = 0;
     const int q4k_path = (gate_type == 12u && down_type == 12u);
     if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
     /* Q4_K with shapes other than (n_tokens=1, n_expert=6) is supported only
@@ -14344,6 +14382,8 @@ static int routed_moe_launch(
         if (n_assignments > 8u) {
             /* Outside the mmvq vec path's batch envelope; fall through. */
         } else {
+            /* Step 7 narrowing: tag this branch as the one that executed. */
+            g_dump_last_moe_branch = 1;
             /* Step 8: graph cache fast path.  If enabled, check the cache
              * for a captured graph matching the current shape + pointers.
              * On hit: replay (cudaGraphLaunch).  On miss: capture the
@@ -14579,6 +14619,8 @@ static int routed_moe_launch(
     }
 
     if (ds4_cuda_use_mmq() && n_tokens >= mmq_moe_min_tokens) {
+        /* Step 7 narrowing: tag this branch as the one that executed. */
+        g_dump_last_moe_branch = 2;
         const uint32_t n_expert_used = n_expert;   /* parameter name is a misnomer; this is top_k */
         const uint32_t n_experts_total = 256u;     /* matches the hardcoded constant at line 11437 */
         const uint64_t n_assignments = (uint64_t)n_tokens * n_expert_used;
@@ -14660,6 +14702,8 @@ static int routed_moe_launch(
         return 1;
     }
 mmq_moe_fallback:
+    /* Step 7 narrowing: tag this branch as the one that executed. */
+    g_dump_last_moe_branch = 3;
     /* The legacy fallback dispatch handles Q4_K only for the V4-Flash decode
      * shape (n_tokens=1, n_expert=6).  Other Q4_K shapes can only succeed
      * through mmq above; reject here rather than crashing the legacy
