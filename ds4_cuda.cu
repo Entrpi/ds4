@@ -964,6 +964,26 @@ extern "C" void ds4_gpu_decode_scalars_set(
     g_decode_host->_pad       = 0;
 }
 
+/* Push the current pinned-host struct contents to the device-side mirror.
+ * Called from ds4.c once per decode token, after ds4_gpu_decode_scalars_set
+ * and before the per-layer body starts issuing kernels that read
+ * g_decode_dev->*.  Issued on ds4_current_stream() so it can either:
+ *   - run on the default stream outside capture (pilot path), where it is
+ *     ordered before subsequent kernels via the implicit-stream rule, or
+ *   - become a captured node inside an outer per-token graph (future
+ *     Step 5/6), where the captured-memcpy address-bound semantic lets the
+ *     same node propagate each replay's host update to the device.
+ *
+ * No-op if init never ran; that is the "graphs disabled" path. */
+extern "C" int ds4_gpu_decode_scalars_flush(void) {
+    if (g_decode_host == NULL || g_decode_dev == NULL) return 1;
+    return cuda_ok(cudaMemcpyAsync(g_decode_dev, g_decode_host,
+                                   sizeof(*g_decode_host),
+                                   cudaMemcpyHostToDevice,
+                                   ds4_current_stream()),
+                   "decode scalars flush");
+}
+
 static double cuda_wall_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -4106,6 +4126,78 @@ __global__ static void rope_tail_kernel(
     uint32_t t = tmp / n_head;
     uint32_t n_nope = head_dim - n_rot;
     uint32_t i = pair * 2;
+
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1), corr1);
+    }
+
+    float theta_extrap = (float)(pos0 + t * pos_stride) * powf(freq_base, -((float)i) / (float)n_rot);
+    float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    float mscale = attn_factor;
+    if (ext_factor != 0.0f) {
+        float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    float c = cosf(theta) * mscale;
+    float s = sinf(theta) * mscale;
+    if (inverse) s = -s;
+
+    float *tail = x + ((uint64_t)t * n_head + h) * head_dim + n_nope;
+    float x0 = tail[i];
+    float x1 = tail[i + 1];
+    tail[i] = x0 * c - x1 * s;
+    tail[i + 1] = x0 * s + x1 * c;
+}
+
+/* Step-3 pilot variant: identical math, but reads pos0 from the device-side
+ * decode_scalars struct rather than baking it into the kernel argument list.
+ * Required for full-layer CUDA-graph capture (under capture the kernel-node
+ * argument list is recorded at capture time; an inline pos0 would freeze the
+ * value baked at capture and break replay at any other token position).
+ *
+ * Effective_pos0 = (int32_t)s->pos0 + pos_offset, signed so callers can
+ * encode a negative offset (e.g., the compressor-emit RoPE at decode time
+ * uses pos+1-ratio, which is pos-3 at ratio=4).  Per-batch-token effective
+ * position is effective_pos0 + t * pos_stride exactly as the inline kernel.
+ *
+ * Body is byte-equivalent to rope_tail_kernel except for the pos0 source. */
+__global__ static void rope_tail_scalars_kernel(
+        float *x,
+        uint32_t n_tok,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        const struct ds4_decode_scalars * __restrict__ scalars,
+        int32_t pos_offset,
+        uint32_t pos_stride,
+        uint32_t n_ctx_orig,
+        int inverse,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t pairs = n_tok * n_head * (n_rot / 2);
+    if (gid >= pairs) return;
+    uint32_t pair = gid % (n_rot / 2);
+    uint32_t tmp = gid / (n_rot / 2);
+    uint32_t h = tmp % n_head;
+    uint32_t t = tmp / n_head;
+    uint32_t n_nope = head_dim - n_rot;
+    uint32_t i = pair * 2;
+
+    /* Load pos0 from the device-side scalars struct. __restrict__ lets the
+     * compiler hoist this above the body; uniform-broadcast in the warp. */
+    const uint32_t pos0 = (uint32_t)((int32_t)scalars->pos0 + pos_offset);
 
     float corr0 = 0.0f, corr1 = 0.0f;
     if (ext_factor != 0.0f) {
@@ -9174,6 +9266,51 @@ extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint3
     rope_tail_kernel<<<(pairs + 255) / 256, 256, 0, ds4_current_stream()>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
 }
+
+/* Step-3 pilot: device-scalars variant of ds4_gpu_rope_tail_tensor.
+ *
+ * Reads pos0 from the device-side decode_scalars struct (s) instead of
+ * baking the host-side value into the captured kernel-node arg list.
+ * Required for full-layer graph capture; harmless on non-capture paths
+ * (the device read costs one L1-cached 4-byte load per warp).
+ *
+ * `pos_offset` lets callers express a constant offset from s->pos0 (e.g.,
+ * the decode-time compressor-emit RoPE uses pos+1-ratio = pos-3 at
+ * ratio=4).  Signed so negative offsets are natural.  Decode-path callers
+ * pass 0; the compressor-update call passes 1 - (int32_t)ratio.
+ *
+ * Caller must ensure ds4_gpu_decode_scalars_set() + ds4_gpu_decode_scalars
+ * _flush() have run for this token before the launch, or that the launch
+ * is inside a captured per-token graph that contains the memcpy node. */
+extern "C" int ds4_gpu_rope_tail_scalars_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t n_tok,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        const void *scalars,    /* opaque from ds4_gpu_decode_scalars_device_ptr() */
+        int32_t  pos_offset,
+        uint32_t pos_stride,
+        uint32_t n_ctx_orig,
+        bool inverse,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    if (!x || !scalars || n_rot > head_dim || (n_rot & 1) ||
+        x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
+    uint32_t pairs = n_tok * n_head * (n_rot / 2);
+    rope_tail_scalars_kernel<<<(pairs + 255) / 256, 256, 0, ds4_current_stream()>>>(
+            (float *)x->ptr, n_tok, n_head, head_dim, n_rot,
+            (const struct ds4_decode_scalars *)scalars,
+            pos_offset, pos_stride,
+            n_ctx_orig, inverse ? 1 : 0,
+            freq_base, freq_scale, ext_factor, attn_factor,
+            beta_fast, beta_slow);
+    return cuda_ok(cudaGetLastError(), "rope_tail_scalars launch");
+}
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
         ds4_gpu_tensor *kv,
@@ -9317,10 +9454,28 @@ extern "C" int ds4_gpu_compressor_update_tensor(
     if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(comp_row_view, comp_row_view,
                                                        model_map, model_size, norm_offset,
                                                        head_dim, 1, rms_eps);
-    if (ok) ok = ds4_gpu_rope_tail_tensor(comp_row_view, 1, 1, head_dim, n_rot,
+    /* Step-3 pilot: route through the device-scalars shim so pos0 is read
+     * from g_decode_dev at execution time, not baked from `pos` at capture
+     * time.  pos_offset = 1 - ratio expresses the compressor-emit offset
+     * (pos+1-ratio) without touching the global host struct. */
+    if (ok) {
+        const void *dev_s = ds4_gpu_decode_scalars_device_ptr();
+        if (dev_s == NULL) {
+            /* Fallback if scalars-init never ran (legacy path). */
+            ok = ds4_gpu_rope_tail_tensor(comp_row_view, 1, 1, head_dim, n_rot,
                                             pos + 1u - ratio, n_ctx_orig, false,
                                             freq_base, freq_scale, ext_factor, attn_factor,
                                             beta_fast, beta_slow);
+        } else {
+            ok = ds4_gpu_rope_tail_scalars_tensor(comp_row_view, 1, 1, head_dim, n_rot,
+                                                    dev_s,
+                                                    1 - (int32_t)ratio, /* pos_offset */
+                                                    1u,                 /* pos_stride */
+                                                    n_ctx_orig, false,
+                                                    freq_base, freq_scale, ext_factor, attn_factor,
+                                                    beta_fast, beta_slow);
+        }
+    }
     ds4_gpu_tensor_free(comp_row_view);
     if (ok && ratio == 4u) {
         uint64_t half = 4ull * width;

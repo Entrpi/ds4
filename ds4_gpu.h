@@ -83,6 +83,12 @@ void  ds4_gpu_decode_scalars_set(
         uint32_t ratio,
         uint32_t n_comp,
         uint32_t flags);
+/* Push the most recent ds4_gpu_decode_scalars_set() values to the device-side
+ * mirror.  Backends that don't use the graph-capture path implement this as
+ * a no-op.  On CUDA this issues a single H2D memcpy on ds4_current_stream();
+ * under graph capture (future Step 5/6) the memcpy becomes a captured node.
+ * Returns 1 on success / no-op, 0 on infrastructure failure. */
+int   ds4_gpu_decode_scalars_flush(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
@@ -394,6 +400,35 @@ int ds4_gpu_rope_tail_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot,
         uint32_t          pos0,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow);
+
+/* Full-layer-graph-capture-compatible variant of the above (Step 3 pilot).
+ * Reads pos0 from the device-side decode_scalars struct rather than baking
+ * it into the kernel-node argument list.  `scalars` is the opaque pointer
+ * returned by ds4_gpu_decode_scalars_device_ptr().  `pos_offset` is added
+ * to s->pos0 at execution time (signed; pass 0 for plain decode, pass
+ * 1-(int)ratio for the compressor-emit caller).  `pos_stride` matches the
+ * inline-pos0 shim's hardcoded 1; pass higher values for batched prefill.
+ *
+ * Backends that don't implement layer-graph capture provide a stub that
+ * still does the right thing numerically (Metal stub computes pos0 on the
+ * CPU from the same struct fields).  Returns 1 on success, 0 on failure. */
+int ds4_gpu_rope_tail_scalars_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        const void       *scalars,
+        int32_t           pos_offset,
+        uint32_t          pos_stride,
         uint32_t          n_ctx_orig,
         bool              inverse,
         float             freq_base,

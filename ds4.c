@@ -9446,8 +9446,14 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                            DS4_N_ROT, pos,
+    /* Step 3 pilot: route Q-rope through the device-scalars shim.  Reads
+     * pos0 from g_decode_dev at execution time so a future captured
+     * full-layer graph replays correctly at any pos. */
+    if (ok) ok = ds4_gpu_rope_tail_scalars_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                            DS4_N_ROT,
+                                            ds4_gpu_decode_scalars_device_ptr(),
+                                            0,   /* pos_offset */
+                                            1u,  /* pos_stride */
                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                             false, freq_base, freq_scale, ext_factor, attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
@@ -9471,8 +9477,12 @@ static bool metal_graph_encode_decode_layer_impl(
             metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
         }
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->kv, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
-                                            DS4_N_ROT, pos,
+    /* Step 3 pilot: KV-rope migrated to device-scalars shim. */
+    if (ok) ok = ds4_gpu_rope_tail_scalars_tensor(g->kv, 1, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                                            DS4_N_ROT,
+                                            ds4_gpu_decode_scalars_device_ptr(),
+                                            0,   /* pos_offset */
+                                            1u,  /* pos_stride */
                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                             false, freq_base, freq_scale, ext_factor, attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
@@ -9676,11 +9686,14 @@ static bool metal_graph_encode_decode_layer_impl(
                                                          layer->indexer_attn_q_b->abs_offset,
                                                          q_rank, indexer_q_dim,
                                                          g->qr_norm, 1) != 0;
-                if (ok) ok = ds4_gpu_rope_tail_tensor(g->indexer_q, 1,
+                /* Step 3 pilot: indexer_q rope migrated to device-scalars shim. */
+                if (ok) ok = ds4_gpu_rope_tail_scalars_tensor(g->indexer_q, 1,
                                                         DS4_N_INDEXER_HEAD,
                                                         DS4_N_INDEXER_HEAD_DIM,
                                                         DS4_N_ROT,
-                                                        pos,
+                                                        ds4_gpu_decode_scalars_device_ptr(),
+                                                        0,   /* pos_offset */
+                                                        1u,  /* pos_stride */
                                                         compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                                         false,
                                                         freq_base,
@@ -9805,9 +9818,13 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_out", g->heads, q_dim, il, pos);
     }
-    if (ok) ok = ds4_gpu_rope_tail_tensor(g->heads,
+    /* Step 3 pilot: heads inverse-rope migrated to device-scalars shim. */
+    if (ok) ok = ds4_gpu_rope_tail_scalars_tensor(g->heads,
                                             1, DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                            DS4_N_ROT, pos,
+                                            DS4_N_ROT,
+                                            ds4_gpu_decode_scalars_device_ptr(),
+                                            0,   /* pos_offset */
+                                            1u,  /* pos_stride */
                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                             true,
                                             freq_base,
@@ -12842,6 +12859,26 @@ static bool metal_graph_encode_token_raw_swa(
     }
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
+
+    /* Step 3 / decode_scalars: publish the per-token position scalars to
+     * the GPU mirror before any layer kernel reads them.  Init is
+     * idempotent + lazy so the first decode token pays the alloc cost.
+     * Backends that don't use the captured-memcpy mechanism (Metal) treat
+     * these as plain CPU updates; only CUDA's flush actually issues an
+     * H2D copy on ds4_current_stream().
+     *
+     * `n_comp` is set to 0 here because rope_tail (the only kernel
+     * migrated to read s->* in this pilot) doesn't use it.  Later
+     * migrations will compute the correct per-token n_comp from
+     * g->layer_n_comp before each layer's kernels run. */
+    ds4_gpu_decode_scalars_init();
+    ds4_gpu_decode_scalars_set(pos,
+                                 g->raw_cap,
+                                 g->raw_window ? g->raw_window : g->raw_cap,
+                                 4u, /* ratio */
+                                 0u, /* n_comp (rope_tail-only pilot) */
+                                 0u  /* flags */);
+    ds4_gpu_decode_scalars_flush();
 
     bool ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
                                               model->map,

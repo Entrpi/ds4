@@ -299,6 +299,11 @@ const void *ds4_gpu_decode_scalars_device_ptr(void) {
     return NULL;
 }
 
+/* Metal records the most recent pos0 from set() so the *_scalars
+ * variant shims can synthesize a plain inline-pos0 launch.  Other fields
+ * aren't needed because Metal already passes them per-kernel via setBytes. */
+static uint32_t g_metal_decode_pos0 = 0;
+
 void ds4_gpu_decode_scalars_set(
         uint32_t pos0,
         uint32_t raw_cap,
@@ -306,8 +311,15 @@ void ds4_gpu_decode_scalars_set(
         uint32_t ratio,
         uint32_t n_comp,
         uint32_t flags) {
-    (void)pos0; (void)raw_cap; (void)raw_window;
+    g_metal_decode_pos0 = pos0;
+    (void)raw_cap; (void)raw_window;
     (void)ratio; (void)n_comp; (void)flags;
+}
+
+int ds4_gpu_decode_scalars_flush(void) {
+    /* Metal doesn't use the captured-memcpy mechanism; scalars are passed
+     * to each kernel via setBytes on the encoder.  Always succeeds. */
+    return 1;
 }
 
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
@@ -5969,6 +5981,42 @@ int ds4_gpu_rope_tail_tensor(
     }
 
     return 1;
+}
+
+/* Metal stub for the Step-3 device-scalars variant of RoPE tail.
+ * Forwards to the inline-pos0 path after computing the effective pos0
+ * from the most recent ds4_gpu_decode_scalars_set() call.  Metal doesn't
+ * use captured-memcpy semantics; the opaque `scalars` arg is ignored.
+ *
+ * pos_stride > 1 isn't supported by this stub (no Step-3 caller needs it;
+ * batched prefill paths still use the inline shim directly). */
+int ds4_gpu_rope_tail_scalars_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          n_tok,
+        uint32_t          n_head,
+        uint32_t          head_dim,
+        uint32_t          n_rot,
+        const void       *scalars,
+        int32_t           pos_offset,
+        uint32_t          pos_stride,
+        uint32_t          n_ctx_orig,
+        bool              inverse,
+        float             freq_base,
+        float             freq_scale,
+        float             ext_factor,
+        float             attn_factor,
+        float             beta_fast,
+        float             beta_slow) {
+    (void)scalars;
+    if (pos_stride != 1u) {
+        fprintf(stderr, "ds4: Metal rope_tail_scalars pos_stride=%u not supported\n", pos_stride);
+        return 0;
+    }
+    const uint32_t pos0 = (uint32_t)((int32_t)g_metal_decode_pos0 + pos_offset);
+    return ds4_gpu_rope_tail_tensor(x, n_tok, n_head, head_dim, n_rot,
+                                      pos0, n_ctx_orig, inverse,
+                                      freq_base, freq_scale, ext_factor,
+                                      attn_factor, beta_fast, beta_slow);
 }
 
 int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
