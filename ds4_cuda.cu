@@ -4829,6 +4829,17 @@ __global__ static void attention_decode_mixed_kernel(
          * and remain inline (no per-token variation). */
         const struct ds4_decode_scalars * __restrict__ s_override) {
     if (s_override) {
+        if (threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+            if (s_override->n_raw != n_raw ||
+                s_override->raw_start != raw_start ||
+                s_override->n_comp != n_comp) {
+                printf("ATTN_DECODE_MIXED MISMATCH: inline(n_raw=%u raw_start=%u n_comp=%u) "
+                       "s(n_raw=%u raw_start=%u n_comp=%u pos0=%u)\n",
+                       n_raw, raw_start, n_comp,
+                       s_override->n_raw, s_override->raw_start, s_override->n_comp,
+                       s_override->pos0);
+            }
+        }
         n_raw     = s_override->n_raw;
         raw_start = s_override->raw_start;
         n_comp    = s_override->n_comp;
