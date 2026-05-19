@@ -9870,6 +9870,8 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_out", g->heads, q_dim, il, pos);
     }
+    /* Step 7 probe: attention output (heads) before inverse RoPE. */
+    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->heads, q_dim, "L0:heads-after-attention", 207);
     /* Step 3 pilot: heads inverse-rope migrated to device-scalars shim. */
     if (ok) ok = ds4_gpu_rope_tail_scalars_tensor(g->heads,
                                             1, DS4_N_HEAD, DS4_N_HEAD_DIM,
@@ -9946,6 +9948,8 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
+    /* Step 7 probe: after attention output projection + HC expand add. */
+    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->after_attn_hc, hc_dim, "L0:after_attn_hc", 208);
     if (stop_at == METAL_GRAPH_DECODE_LAYER_AFTER_ATTN) return ok;
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
@@ -10053,6 +10057,10 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
     }
+    /* Step 7 probe: MoE output BEFORE shared FFN.  Strongest suspect:
+     * atomic_out adds in moe_q*_K_down kernels may produce different
+     * float results depending on captured-graph block-scheduling order. */
+    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->routed_out, DS4_N_EMBD, "L0:routed_out", 209);
     const bool fuse_shared_gate_up =
         !g->quality &&
         getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
