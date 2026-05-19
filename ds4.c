@@ -10116,6 +10116,8 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_shexp", g->shared_out, DS4_N_EMBD, il, pos);
     }
+    /* Step 7 probe: shared FFN output. */
+    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->shared_out, DS4_N_EMBD, "L0:shared_out", 210);
     if (ok && keep_ffn_out) {
         ok = metal_graph_ensure_ffn_out(g) &&
              ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
@@ -10123,6 +10125,8 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok && keep_ffn_out) {
         metal_graph_debug_dump_tensor("ffn_out", g->ffn_out, DS4_N_EMBD, il, pos);
     }
+    /* Step 7 probe: after shared+routed add. */
+    if (ok && keep_ffn_out && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->ffn_out, DS4_N_EMBD, "L0:ffn_out", 211);
     if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_ffn(g, g->ffn_out, il, 1);
     }
