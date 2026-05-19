@@ -7491,6 +7491,50 @@ static cudaStream_t ds4_cuda_moe_stream(void) {
     return g_moe_stream;
 }
 
+/* --------------------------------------------------------------------
+ * Thread-local capture stream override (Step A: full-layer graphs).
+ *
+ * Step 8/8.2 wrap individual kernel clusters (dense Q8_0 vec at n_tok=1,
+ * routed MoE at n_assignments<=8) in their own cudaStreamBeginCapture
+ * scopes on g_moe_stream.  Each shim explicitly threads moe_stream
+ * through to its inner kernel launches.
+ *
+ * Opp A captures an entire metal_graph_encode_decode_layer body at
+ * n_tok=1.  That body issues kernels via dozens of ds4_gpu_* shims,
+ * each of which today launches on the implicit default stream.  Threading
+ * an explicit cudaStream_t through every shim's ABI would touch 100+
+ * call sites and change the cross-platform interface.
+ *
+ * Instead, expose a thread-local stream override.  Every kernel launch
+ * and cuda*Async call reachable from the per-layer decode body queries
+ * ds4_current_stream(); when t_ds4_capture_stream is set (during outer
+ * capture), the launch lands on that stream and gets recorded.  When
+ * unset (the default), launches land on stream=0 as before -- preserves
+ * all non-decode-1 code paths byte-for-byte.
+ *
+ * The inner Step 8/8.2 captures detect the active outer capture via
+ * ds4_current_stream() != 0 and skip their own cudaStreamBeginCapture
+ * (CUDA doesn't allow nested begins), letting the outer capture absorb
+ * their kernels. */
+static thread_local cudaStream_t t_ds4_capture_stream = (cudaStream_t)0;
+
+static inline void ds4_capture_set_stream(cudaStream_t s) {
+    t_ds4_capture_stream = s;
+}
+
+static inline cudaStream_t ds4_current_stream(void) {
+    /* Returns the active capture stream, or stream=0 (default) when no
+     * outer capture is in progress.  Designed so call sites can use it
+     * unconditionally: when capture is inactive the result is identical
+     * to passing 0 explicitly, which is what every legacy launch did
+     * implicitly. */
+    return t_ds4_capture_stream;
+}
+
+static inline int ds4_capture_active(void) {
+    return t_ds4_capture_stream != (cudaStream_t)0;
+}
+
 /* Cross-stream sync events for the captured graph paths.
  *
  * The captured cudaGraphLaunch runs on g_moe_stream while the rest of
