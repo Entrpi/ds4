@@ -9571,16 +9571,15 @@ static bool metal_graph_encode_decode_layer_impl(
                                                         DS4_ROPE_YARN_BETA_SLOW,
                                                         DS4_RMS_EPS) != 0;
         if (ok && emit) {
-            /* R1: replace transient row view + tensor_view/tensor_free pair
-             * with a single base+s->comp_row launch.  Set the row scalar
-             * for this layer's emit, flush so the device-side struct sees
-             * the update before the kernel reads it. */
-            ds4_gpu_decode_scalars_set_emit_rows(comp_row, g->layer_n_index_comp[il]);
-            ds4_gpu_decode_scalars_flush();
+            /* Step 4c R1': read comp_row from g_layer_dev[il].comp_row in
+             * the per-layer substrate (populated at top of token in
+             * metal_graph_encode_token_raw_swa).  Closes P1a -- the racy
+             * set_emit_rows + flush pair is gone, and the per-layer host
+             * source means no within-token CPU writes to the host buffer. */
             ok = ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
                     g->layer_attn_comp_cache[il],
                     DS4_N_HEAD_DIM, DS4_N_ROT,
-                    ds4_gpu_decode_scalars_device_ptr()) != 0;
+                    il) != 0;
             if (ok && metal_graph_debug_wants("KVcompress", il, pos)) {
                 /* Debug-only path (DS4_METAL_GRAPH_DUMP_PREFIX env-gated).
                  * The synchronize inside the dumper is incompatible with
@@ -9664,14 +9663,13 @@ static bool metal_graph_encode_decode_layer_impl(
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS) != 0;
             if (ok && emit) {
-                /* R1: index emit uses base+s->index_row instead of a
-                 * transient row view.  set_emit_rows + flush ran a few
-                 * lines above for the comp emit; index_row in the device
-                 * struct is already this layer's g->layer_n_index_comp[il]. */
+                /* Step 4c R1': index emit reads index_row from
+                 * g_layer_dev[il].index_row in the per-layer substrate.
+                 * Symmetric to the comp emit above. */
                 ok = ds4_gpu_dsv4_indexer_qat_row_tensor(
                         g->layer_index_comp_cache[il],
                         DS4_N_INDEXER_HEAD_DIM,
-                        ds4_gpu_decode_scalars_device_ptr()) != 0;
+                        il) != 0;
             }
             if (ok && emit) g->layer_n_index_comp[il]++;
             const uint32_t decode_top_k = metal_graph_decode_indexer_top_k(g);
@@ -12899,6 +12897,28 @@ static bool metal_graph_encode_token_raw_swa(
                                  0u, /* n_comp (rope_tail-only pilot) */
                                  0u  /* flags */);
     ds4_gpu_decode_scalars_flush();
+
+    /* Step 4c R1': populate the per-layer scalars substrate.  For R1' only
+     * comp_row and index_row are read by migrated kernels; n_comp and
+     * flags stay zero until later sub-commits (C1/C2 read n_comp via the
+     * compressor cluster; A1 reads ls->n_comp for attention's lift off
+     * the inline arg).  Pre-emit values: g->layer_n_comp[il] /
+     * g->layer_n_index_comp[il] are pre-increment (the increment fires
+     * inside the per-layer body after the emit kernel writes its row).
+     *
+     * One tight loop populates the active double-buffered host array; one
+     * cudaMemcpyAsync moves all 43 * 16 = 688 B to g_layer_dev; the per-
+     * layer kernels later read &g_layer_dev[il] via baked pointers.  See
+     * plan doc sec 15.5 for the precompute protocol. */
+    ds4_gpu_decode_layer_scalars_init();
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_decode_layer_scalars_set(il,
+                                            0u, /* n_comp -- filled in C1/A1 */
+                                            g->layer_n_comp[il],
+                                            g->layer_n_index_comp[il],
+                                            0u  /* flags -- filled in C1/A1 */);
+    }
+    ds4_gpu_decode_layer_scalars_flush();
 
     bool ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
                                               model->map,

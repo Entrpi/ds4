@@ -322,16 +322,30 @@ int ds4_gpu_decode_scalars_flush(void) {
     return 1;
 }
 
-/* Metal records the most recent comp_row / index_row from set_emit_rows
- * so the R1 row-variant shims (defined in ds4_metal.m alongside the row-
- * view callers) can forward to the inline-pos0 path with the correct row. */
-static uint32_t g_metal_decode_comp_row  = 0;
-static uint32_t g_metal_decode_index_row = 0;
+/* Per-layer scalars (Step 4b/4c): Metal mirrors the per-layer-array
+ * substrate's host-side values so the R1 row-variant shims (which now
+ * take `il` rather than a device pointer) can look up the correct
+ * comp_row / index_row at launch time.  Capacity matches DS4_N_LAYER.
+ *
+ * Single buffer (not double-buffered like CUDA) because Metal stubs are
+ * synchronous from the CPU's perspective: when the row-shim fires, the
+ * preceding set() calls have already happened, and Metal has no captured-
+ * memcpy semantics to race against. */
+#define DS4_METAL_LAYER_SCALARS_COUNT 43u
+typedef struct {
+    uint32_t n_comp;
+    uint32_t comp_row;
+    uint32_t index_row;
+    uint32_t flags;
+} ds4_metal_layer_scalars;
+static ds4_metal_layer_scalars g_metal_layer_scalars[DS4_METAL_LAYER_SCALARS_COUNT];
 
+/* UNSAFE pending removal in Step 4c (see plan doc sec 4.2 P1a).  Stub
+ * remains so existing in-tree callers don't break during the transition
+ * window; the R1 row-shims no longer consult this state. */
 void ds4_gpu_decode_scalars_set_emit_rows(uint32_t comp_row,
                                             uint32_t index_row) {
-    g_metal_decode_comp_row  = comp_row;
-    g_metal_decode_index_row = index_row;
+    (void)comp_row; (void)index_row;
 }
 
 void ds4_gpu_decode_scalars_set_n_comp(uint32_t n_comp) {
@@ -366,6 +380,25 @@ void *ds4_gpu_decode_layer_scalars_host(void) {
 
 int ds4_gpu_decode_layer_scalars_flush(void) {
     return 1;
+}
+
+/* Metal records per-layer scalars so the R1 row-variant shims (which on
+ * Metal forward to an inline-tensor shim with a transient row view at the
+ * recorded comp_row / index_row) see the correct values when they fire.
+ * The CUDA substrate's double-buffer + captured-memcpy machinery has no
+ * Metal analogue; Metal's stub just stores the values in a flat array
+ * indexed by `il`. */
+void ds4_gpu_decode_layer_scalars_set(
+        uint32_t il,
+        uint32_t n_comp,
+        uint32_t comp_row,
+        uint32_t index_row,
+        uint32_t flags) {
+    if (il >= DS4_METAL_LAYER_SCALARS_COUNT) return;
+    g_metal_layer_scalars[il].n_comp    = n_comp;
+    g_metal_layer_scalars[il].comp_row  = comp_row;
+    g_metal_layer_scalars[il].index_row = index_row;
+    g_metal_layer_scalars[il].flags     = flags;
 }
 
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
@@ -6118,18 +6151,19 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
     return 1;
 }
 
-/* R1 row-variant stub: forwards to the inline-tensor shim with a transient
- * view at the most recently set comp_row.  Metal doesn't use captured-memcpy
- * semantics so the opaque `scalars` arg is ignored. */
+/* R1 row-variant stub (Step 4c R1'): forwards to the inline-tensor shim
+ * with a transient view at g_metal_layer_scalars[il].comp_row.  Metal
+ * doesn't use the CUDA captured-memcpy machinery so the transient view
+ * is safe here -- there's no graph capture replaying with stale rows. */
 int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t          head_dim,
         uint32_t          n_rot,
-        const void       *scalars) {
-    (void)scalars;
-    if (!base) return 0;
+        uint32_t          il) {
+    if (!base || il >= DS4_METAL_LAYER_SCALARS_COUNT) return 0;
+    const uint32_t comp_row = g_metal_layer_scalars[il].comp_row;
     ds4_gpu_tensor *row_view = ds4_gpu_tensor_view(base,
-        (uint64_t)g_metal_decode_comp_row * head_dim * sizeof(float),
+        (uint64_t)comp_row * head_dim * sizeof(float),
         (uint64_t)head_dim * sizeof(float));
     if (!row_view) return 0;
     int ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(row_view, 1, head_dim, n_rot);
@@ -6177,16 +6211,16 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
     return 1;
 }
 
-/* R1 row-variant stub: forwards to the inline-tensor shim with a transient
- * view at the most recently set index_row. */
+/* R1 row-variant stub (Step 4c R1'): forwards to the inline-tensor shim
+ * with a transient view at g_metal_layer_scalars[il].index_row. */
 int ds4_gpu_dsv4_indexer_qat_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t          head_dim,
-        const void       *scalars) {
-    (void)scalars;
-    if (!base) return 0;
+        uint32_t          il) {
+    if (!base || il >= DS4_METAL_LAYER_SCALARS_COUNT) return 0;
+    const uint32_t index_row = g_metal_layer_scalars[il].index_row;
     ds4_gpu_tensor *row_view = ds4_gpu_tensor_view(base,
-        (uint64_t)g_metal_decode_index_row * head_dim * sizeof(float),
+        (uint64_t)index_row * head_dim * sizeof(float),
         (uint64_t)head_dim * sizeof(float));
     if (!row_view) return 0;
     int ok = ds4_gpu_dsv4_indexer_qat_tensor(row_view, 1, head_dim);

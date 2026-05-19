@@ -179,6 +179,31 @@ const void *ds4_gpu_decode_layer_scalars_device_ptr(void);
 void *ds4_gpu_decode_layer_scalars_host(void);
 int   ds4_gpu_decode_layer_scalars_flush(void);
 
+/* Write all four per-layer scalar fields of the currently-active host
+ * buffer for layer `il`.  Caller invokes this in a loop over 0..42 at
+ * top of token (after ds4_gpu_decode_scalars_set / _flush) and then
+ * calls ds4_gpu_decode_layer_scalars_flush() once so the H2D memcpy
+ * fires before per-layer kernels read from the device side.
+ *
+ * Field semantics:
+ *   n_comp     -- post-this-token's-emit visible-compressed count.
+ *                 Read by attention's ls_override path (Step 4c A1).
+ *   comp_row   -- pre-emit row index for fp8 row-kernel.  Equals
+ *                 g->layer_n_comp[il] (pre-increment).
+ *   index_row  -- pre-emit row index for indexer_qat row-kernel.  Equals
+ *                 g->layer_n_index_comp[il] (pre-increment).
+ *   flags      -- bit 0: emit_this_step (set on ratio-4 emit tokens);
+ *                 bit 1: indexed_active (set when n_comp > decode_top_k).
+ *
+ * Backends other than CUDA stub this as a no-op (Metal kernels read
+ * inline args). */
+void  ds4_gpu_decode_layer_scalars_set(
+        uint32_t il,
+        uint32_t n_comp,
+        uint32_t comp_row,
+        uint32_t index_row,
+        uint32_t flags);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
@@ -477,28 +502,31 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         uint32_t          head_dim,
         uint32_t          n_rot);
 
-/* R1 row-variant: writes one row of `base` at index s->comp_row.
- * Replaces the (transient view, n_tok=1) form used in the decode-time
- * compressor emit path so the captured kernel-node arg list bakes a
- * stable base pointer + the session-stable scalars pointer, not a per-
- * token row pointer.  See local/docs/ds4_full_layer_graph_capture_plan
- * .html R1. */
+/* R1 row-variant (Step 4c R1' migration to layer-scalars substrate):
+ * writes one row of `base` at the index taken from the per-layer device
+ * array g_layer_dev[il].comp_row.  Replaces the (transient view, n_tok=1)
+ * form used in the decode-time compressor emit path so the captured
+ * kernel-node arg list bakes a stable base pointer + a per-layer baked
+ * ls pointer, not a per-token row pointer.  The shim computes the
+ * per-layer ls = &g_layer_dev[il] internally.  See plan doc R1 + sec
+ * 15.4. */
 int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t          head_dim,
         uint32_t          n_rot,
-        const void       *scalars);
+        uint32_t          il);
 
 int ds4_gpu_dsv4_indexer_qat_tensor(
         ds4_gpu_tensor *x,
         uint32_t          n_rows,
         uint32_t          head_dim);
 
-/* R1 row-variant: writes one row of `base` at index s->index_row. */
+/* R1 row-variant (Step 4c R1'): writes one row of `base` at the index
+ * taken from g_layer_dev[il].index_row. */
 int ds4_gpu_dsv4_indexer_qat_row_tensor(
         ds4_gpu_tensor *base,
         uint32_t          head_dim,
-        const void       *scalars);
+        uint32_t          il);
 
 int ds4_gpu_rope_tail_tensor(
         ds4_gpu_tensor *x,
