@@ -9810,7 +9810,7 @@ static bool metal_graph_encode_decode_layer_impl(
                     ds4_layer_compress_ratio(il),
                     DS4_N_HEAD,
                     DS4_N_HEAD_DIM,
-                    ds4_gpu_decode_scalars_device_ptr()) != 0;
+                    /* DEBUG: temporarily NULL to bisect parity */ NULL) != 0;
             if (ok && decode_index_stage_profile) {
                 ok = metal_graph_indexer_stage_profile_boundary("decode_attention",
                                                                 il,
@@ -9831,7 +9831,7 @@ static bool metal_graph_encode_decode_layer_impl(
                                                          NULL,
                                                          0,
                                                          DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                                         ds4_gpu_decode_scalars_device_ptr()) != 0;
+                                                         /* DEBUG: temporarily NULL */ NULL) != 0;
         }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attention");
