@@ -8603,6 +8603,245 @@ static struct dense_graph_entry *dense_graph_slot(const struct dense_graph_key *
     return &g_dense_graphs[dense_graph_hash(key) % DS4_DENSE_GRAPH_CACHE_SIZE];
 }
 
+/* ------------------------------------------------------------------------ *
+ * Step 5: full per-layer graph cache.
+ *
+ * Each iteration of the per-layer decode body (ds4.c metal_graph_encode_
+ * decode_layer_impl, line ~9292) becomes its own cudaStreamBeginCapture
+ * scope.  The captured graph contains every kernel the body issues --
+ * embed (for il=0), attention, compressor, indexer, KV store, MoE/dense
+ * FFN, layer add, etc.  Cached by (il, structural bits, tensor base set).
+ * 43 layers * a handful of variants (decode1 vs decode2, emit vs no-emit,
+ * indexed vs non-indexed) = ~100-200 distinct keys per session.  Sized at
+ * 256 for headroom; FNV-1a hash mod size.
+ *
+ * Per-token scalars do NOT enter the key.  They flow through the two
+ * device-side substrates set up earlier in this stack:
+ *   - token-stable: g_decode_dev (40 B, includes pos0, raw_row, n_raw,
+ *                   raw_start, raw_window, etc.)
+ *   - per-layer:    g_layer_dev[43] (16 B each: n_comp, n_index_comp,
+ *                   comp_row, index_row).
+ * Both have stable device addresses baked into kernel-node arg lists at
+ * capture time; the GPU dereferences them at execution time on every
+ * replay.  See plan doc sec 4.2 + 15 for the full design.
+ *
+ * Entry-point contract (Step 6 wires the per-layer loop):
+ *   int  ds4_cuda_layer_graph_begin_or_replay(uint32_t il,
+ *                                              const struct layer_graph_key *key);
+ *       returns  1: replayed (caller skips body encoding for this layer)
+ *                0: capturing (caller proceeds; close with end_or_commit)
+ *               -1: graphs disabled / unavailable (caller proceeds eagerly)
+ *   void ds4_cuda_layer_graph_end_or_commit(uint32_t il);
+ *
+ * Step 5 scope: cache infra + entry points + R3 inner-bypass.  No callers
+ * yet (Step 6 adds them).  Gate is "compile clean".
+ * ------------------------------------------------------------------------ */
+
+struct layer_graph_key {
+    /* Structural bits.  Per-layer scalars (n_comp, comp_row, etc.) do NOT
+     * enter the key -- the ds4_layer_scalars substrate carries them via
+     * a baked &g_layer_dev[il] pointer that's stable across replays. */
+    uint32_t il;          /* layer index, 0..DS4_N_LAYER-1 */
+    uint32_t n_tok;       /* 1 for normal decode, 2 for MTP decode2-exact */
+    uint32_t flags;       /* bit 0: emit_this_step  (ratio-4 emit token)
+                           * bit 1: indexed_active  (n_comp > decode_top_k)
+                           * bit 2: compressed_layer (ratio != 0)
+                           * bit 3: ratio4 vs ratio1 (compressor schedule)
+                           * bits 4..31: reserved */
+    uint32_t _pad;        /* align to 8 for the pointer block below */
+    /* Pointer set: tensor base addresses referenced by the captured
+     * kernels.  Reallocation invalidates the cached graph (eviction +
+     * recapture).  Domain of the P1c pointer validator added in Step 7. */
+    void    *cur_hc;
+    void    *after_ffn_hc;
+    void    *raw_cache;
+    void    *comp_cache;
+    void    *index_comp_cache;
+    void    *q;
+    void    *kv;
+    void    *heads;
+    void    *indexer_q;
+    void    *indexer_weights;
+    void    *indexer_scores;
+    void    *comp_selected;
+    void    *comp_kv_cur;
+    void    *comp_sc_cur;
+    void    *attn_state_kv;
+    void    *attn_state_score;
+    void    *index_state_kv;
+    void    *index_state_score;
+};
+
+struct layer_graph_entry {
+    struct layer_graph_key key;
+    cudaGraphExec_t        exec;
+    int                    valid;
+    uint64_t               hits;
+};
+
+#define DS4_LAYER_GRAPH_CACHE_SIZE 256
+
+static struct layer_graph_entry g_layer_graphs[DS4_LAYER_GRAPH_CACHE_SIZE];
+
+/* Env-var enable.  Default OFF for Step 5; Step 8 flips to ON after Step 7
+ * proves bit-identical determinism + perf uplift.  Recognized values for
+ * enable: 1, on, ON, yes, YES, true, TRUE.  Anything else is disable. */
+static int ds4_cuda_layer_graphs_enabled(void) {
+    static int init = 0;
+    static int enabled = 0;
+    if (!init) {
+        init = 1;
+        const char *s = getenv("DS4_CUDA_LAYER_GRAPHS");
+        if (s && *s &&
+            (strcmp(s, "1") == 0 ||
+             strcmp(s, "on") == 0 || strcmp(s, "ON") == 0 ||
+             strcmp(s, "yes") == 0 || strcmp(s, "YES") == 0 ||
+             strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0)) {
+            enabled = 1;
+            fprintf(stderr, "ds4: DS4_CUDA_LAYER_GRAPHS=%s - per-layer graph capture enabled\n", s);
+        }
+    }
+    return enabled;
+}
+
+static uint64_t layer_graph_hash(const struct layer_graph_key *k) {
+    /* FNV-1a over the key bytes.  Matches moe_graph_hash / dense_graph_hash. */
+    uint64_t h = 0xcbf29ce484222325ULL;
+    const uint8_t *p = (const uint8_t *)k;
+    for (size_t i = 0; i < sizeof(*k); i++) {
+        h ^= p[i];
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+static struct layer_graph_entry *layer_graph_slot(const struct layer_graph_key *key) {
+    return &g_layer_graphs[layer_graph_hash(key) % DS4_LAYER_GRAPH_CACHE_SIZE];
+}
+
+/* In-flight capture tracking.  begin_or_replay sets these when it returns 0
+ * (capturing); end_or_commit reads them to find the slot to close.  Single-
+ * threaded GPU work makes file-scope globals safe; if multi-threaded use
+ * appears later, switch to __thread / thread_local. */
+static struct layer_graph_entry *g_layer_graph_capturing_slot = NULL;
+static uint32_t                  g_layer_graph_capturing_il   = UINT32_MAX;
+
+extern "C" int ds4_cuda_layer_graph_begin_or_replay(
+        uint32_t il,
+        const struct layer_graph_key *key) {
+    if (!ds4_cuda_layer_graphs_enabled()) return -1;
+    if (il >= DS4_LAYER_SCALARS_COUNT || !key) return -1;
+    if (g_layer_graph_capturing_slot != NULL) {
+        /* Caller error: a prior begin_or_replay returned 0 but didn't get
+         * matched by end_or_commit.  Refuse rather than corrupt state. */
+        fprintf(stderr, "ds4: layer_graph begin_or_replay called with prior "
+                        "capture still in flight (il=%u, prior il=%u)\n",
+                il, g_layer_graph_capturing_il);
+        return -1;
+    }
+    cudaStream_t s = ds4_cuda_moe_stream();
+    if (!s) return -1;
+
+    struct layer_graph_entry *slot = layer_graph_slot(key);
+    if (slot->valid && memcmp(&slot->key, key, sizeof(*key)) == 0) {
+        /* Replay path.  Cross-stream sync brackets mirror the moe_graph
+         * pattern: pre-sync stream=0 -> moe_stream so the captured graph
+         * sees current inputs; post-sync moe_stream -> stream=0 so the
+         * next layer body sees current outputs. */
+        ds4_cuda_moe_stream_sync_pre(s);
+        cudaError_t ge = cudaGraphLaunch(slot->exec, s);
+        if (ge != cudaSuccess) {
+            fprintf(stderr, "ds4: cudaGraphLaunch (layer %u) failed: %s; recapturing\n",
+                    il, cudaGetErrorString(ge));
+            cudaGraphExecDestroy(slot->exec);
+            slot->valid = 0;
+            slot->hits = 0;
+            /* Fall through to capture path below. */
+        } else {
+            ds4_cuda_moe_stream_sync_post(s);
+            slot->hits++;
+            return 1;
+        }
+    }
+
+    /* Capture path.  Evict any stale exec at this slot; install the new
+     * key; begin capture; signal caller to encode the body. */
+    if (slot->valid) {
+        cudaGraphExecDestroy(slot->exec);
+        slot->valid = 0;
+        slot->hits = 0;
+    }
+    memcpy(&slot->key, key, sizeof(*key));
+    cudaError_t ge = cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal);
+    if (ge != cudaSuccess) {
+        fprintf(stderr, "ds4: cudaStreamBeginCapture (layer %u) failed: %s\n",
+                il, cudaGetErrorString(ge));
+        return -1;
+    }
+    /* Route all reachable ds4_current_stream() launches onto s for the
+     * duration of this capture.  end_or_commit restores to (cudaStream_t)0.
+     * R3 inner-bypass branches detect ds4_capture_active() and skip their
+     * own BeginCapture (CUDA forbids nested begins). */
+    ds4_capture_set_stream(s);
+    g_layer_graph_capturing_slot = slot;
+    g_layer_graph_capturing_il   = il;
+    return 0;
+}
+
+extern "C" void ds4_cuda_layer_graph_end_or_commit(uint32_t il) {
+    struct layer_graph_entry *slot = g_layer_graph_capturing_slot;
+    if (slot == NULL || g_layer_graph_capturing_il != il) {
+        /* Either begin_or_replay returned 1 or -1 for this il, or the
+         * caller mismatched il values.  Either way there's nothing to
+         * commit; leave state unchanged. */
+        return;
+    }
+    g_layer_graph_capturing_slot = NULL;
+    g_layer_graph_capturing_il   = UINT32_MAX;
+
+    cudaStream_t s = ds4_cuda_moe_stream();
+    cudaGraph_t graph = NULL;
+    cudaError_t ge = cudaStreamEndCapture(s, &graph);
+    /* Restore default stream BEFORE any error returns so the thread-local
+     * doesn't leak the captured stream into post-capture eager launches. */
+    ds4_capture_set_stream((cudaStream_t)0);
+    if (ge != cudaSuccess) {
+        fprintf(stderr, "ds4: cudaStreamEndCapture (layer %u) failed: %s\n",
+                il, cudaGetErrorString(ge));
+        slot->valid = 0;
+        slot->hits = 0;
+        return;
+    }
+
+    cudaGraphExec_t exec = NULL;
+    ge = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+    cudaGraphDestroy(graph);
+    if (ge != cudaSuccess) {
+        fprintf(stderr, "ds4: cudaGraphInstantiate (layer %u) failed: %s\n",
+                il, cudaGetErrorString(ge));
+        slot->valid = 0;
+        slot->hits = 0;
+        return;
+    }
+    slot->exec  = exec;
+    slot->valid = 1;
+    slot->hits  = 0;
+
+    /* First replay: launch the just-captured graph with the standard
+     * pre/post sync.  Failure here invalidates the slot but doesn't try
+     * to recapture (caller has already moved on to the next layer). */
+    ds4_cuda_moe_stream_sync_pre(s);
+    ge = cudaGraphLaunch(exec, s);
+    if (ge != cudaSuccess) {
+        fprintf(stderr, "ds4: cudaGraphLaunch (layer %u, first replay) failed: %s\n",
+                il, cudaGetErrorString(ge));
+        cudaGraphExecDestroy(exec);
+        slot->valid = 0;
+        return;
+    }
+    ds4_cuda_moe_stream_sync_post(s);
+}
+
 /* Bug 2 / Option D gate.  See local/docs/ds4_mmq_mtp_correctness_plan.html
  * in the auto-round companion repo for the full mechanism.  mmq's Q8_0 dense
  * FP32 reduction order drifts ~1 ULP/layer vs the legacy warp8 kernel; the
@@ -8834,13 +9073,24 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 dslot->valid = 0;
                 dslot->hits = 0;
             }
-            cudaError_t ge = cudaStreamBeginCapture(moe_stream, cudaStreamCaptureModeThreadLocal);
-            if (ge == cudaSuccess) {
-                dcapturing = 1;
-            } else {
-                fprintf(stderr, "ds4: cudaStreamBeginCapture (dense) failed: %s\n",
-                        cudaGetErrorString(ge));
+            /* R3 inner-bypass (Step 5).  If an outer per-layer capture is
+             * active, skip our own BeginCapture: (a) CUDA forbids nested
+             * begins on the same stream, and (b) the kernels launched
+             * below already route through ds4_current_stream() (A2 work)
+             * which == moe_stream during outer capture, so they fold into
+             * the outer graph for free.  When standalone (no outer
+             * capture), the inner cache works exactly as before. */
+            if (ds4_capture_active()) {
                 dslot = NULL;
+            } else {
+                cudaError_t ge = cudaStreamBeginCapture(moe_stream, cudaStreamCaptureModeThreadLocal);
+                if (ge == cudaSuccess) {
+                    dcapturing = 1;
+                } else {
+                    fprintf(stderr, "ds4: cudaStreamBeginCapture (dense) failed: %s\n",
+                            cudaGetErrorString(ge));
+                    dslot = NULL;
+                }
             }
         }
 
@@ -13927,19 +14177,29 @@ static int routed_moe_launch(
                     graph_slot->valid = 0;
                     graph_slot->hits = 0;
                 }
-                cudaError_t ge = cudaStreamBeginCapture(moe_stream, cudaStreamCaptureModeThreadLocal);
-                if (ge == cudaSuccess) {
-                    graph_capturing = 1;
-                    /* Route the in-capture <<<>>> kernel launches at
-                     * moe_mmq_swiglu_weighted_clamp_kernel and moe_sum_kernel
-                     * to moe_stream so they record into the capture.  The
-                     * ds4_mmq_*_moe_vec calls below carry moe_stream as an
-                     * explicit parameter and are unaffected by this. */
-                    ds4_capture_set_stream(moe_stream);
-                } else {
-                    fprintf(stderr, "ds4: cudaStreamBeginCapture failed: %s; graphs disabled this call\n",
-                            cudaGetErrorString(ge));
+                /* R3 inner-bypass (Step 5).  If an outer per-layer capture
+                 * is active, skip our own BeginCapture: CUDA forbids
+                 * nested begins on the same stream, and the kernels below
+                 * already route through ds4_current_stream() == moe_stream
+                 * under outer capture (A2 work) so they fold into the
+                 * outer graph.  Standalone path is byte-for-byte unchanged. */
+                if (ds4_capture_active()) {
                     graph_slot = NULL;
+                } else {
+                    cudaError_t ge = cudaStreamBeginCapture(moe_stream, cudaStreamCaptureModeThreadLocal);
+                    if (ge == cudaSuccess) {
+                        graph_capturing = 1;
+                        /* Route the in-capture <<<>>> kernel launches at
+                         * moe_mmq_swiglu_weighted_clamp_kernel and moe_sum_kernel
+                         * to moe_stream so they record into the capture.  The
+                         * ds4_mmq_*_moe_vec calls below carry moe_stream as an
+                         * explicit parameter and are unaffected by this. */
+                        ds4_capture_set_stream(moe_stream);
+                    } else {
+                        fprintf(stderr, "ds4: cudaStreamBeginCapture failed: %s; graphs disabled this call\n",
+                                cudaGetErrorString(ge));
+                        graph_slot = NULL;
+                    }
                 }
             }
 
