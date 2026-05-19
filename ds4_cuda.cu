@@ -8782,7 +8782,13 @@ static int ds4_cuda_dump_hash_enabled(void) {
 extern "C" void ds4_cuda_dump_hash_reset(void) {
     if (!ds4_cuda_dump_hash_enabled()) return;
     g_dump_next = 0;
-    for (uint32_t i = 0; i < DS4_CUDA_DUMP_HASH_SLOTS; i++) g_dump_labels[i] = NULL;
+    /* Labels persist across resets: fixed-slot probes (e.g. L0 sub-probes
+     * at slots 200..206) are captured into layer-graph kernels that fire
+     * on replay without the CPU re-calling dump_hash_at_slot.  If we
+     * cleared labels here, flush would skip those slots on replay tokens
+     * (label NULL) even though their device-side hashes were written by
+     * the replay.  Auto-slot probes write their labels each token before
+     * the kernel launch, so they're always current. */
 }
 
 extern "C" void ds4_cuda_dump_hash_after(
