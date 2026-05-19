@@ -261,11 +261,15 @@ static struct ds4_decode_scalars *g_decode_dev  = NULL;  /* cudaMalloc */
 #define DS4_COMPRESSOR_ROW_INDEX  1
 
 struct ds4_layer_scalars {
-    uint32_t n_comp;      /* post-this-token's-emit count for attention */
-    uint32_t comp_row;    /* pre-emit row index for fp8 row-kernel */
-    uint32_t index_row;   /* pre-emit row index for indexer_qat row-kernel */
-    uint32_t flags;       /* bit 0: emit_this_step; bit 1: indexed_active */
+    uint32_t n_comp;       /* attention compressed count, post-emit */
+    uint32_t n_index_comp; /* indexer compressed count, post-emit (PC3) */
+    uint32_t comp_row;     /* pre-emit row index for fp8 row-kernel */
+    uint32_t index_row;    /* pre-emit row index for indexer_qat row-kernel */
 };
+/* PC3: the earlier `flags` field (bit 0 emit, bit 1 indexed_active) had
+ * no in-tree consumers and was always populated as 0.  Replaced by
+ * `n_index_comp` to feed PC5's I1/I2 max-grid + bounds-check pilot.
+ * Struct stays at 16 B (4 uint32_t, naturally aligned). */
 static_assert(sizeof(struct ds4_layer_scalars) == 16u,
               "ds4_layer_scalars must be exactly 16 bytes");
 
@@ -1248,22 +1252,24 @@ extern "C" void *ds4_gpu_decode_layer_scalars_host(void) {
  * MUST call _flush() once after all entries are written so the H2D
  * memcpy fires before the per-layer kernels read from the device side.
  *
- * Argument order is "(reader order)" -- n_comp first because attention
- * is the most common reader; then the two emit-row fields; flags last
- * because they're cheap bit-tests usually predicated by other state. */
+ * Argument order (PC3-revised): the two counts first (attention then
+ * indexer -- attention is the most common reader), then the two emit-
+ * row fields paired the same way.  The old `flags` arg is removed --
+ * its bit 0 (emit_this_step) and bit 1 (indexed_active) had no in-tree
+ * consumers; recompute on-demand from n_comp / n_index_comp if needed. */
 extern "C" void ds4_gpu_decode_layer_scalars_set(
         uint32_t il,
         uint32_t n_comp,
+        uint32_t n_index_comp,
         uint32_t comp_row,
-        uint32_t index_row,
-        uint32_t flags) {
+        uint32_t index_row) {
     if (g_layer_host[g_layer_dev_idx] == NULL ||
         il >= DS4_LAYER_SCALARS_COUNT) return;
     struct ds4_layer_scalars *e = &g_layer_host[g_layer_dev_idx][il];
-    e->n_comp    = n_comp;
-    e->comp_row  = comp_row;
-    e->index_row = index_row;
-    e->flags     = flags;
+    e->n_comp       = n_comp;
+    e->n_index_comp = n_index_comp;
+    e->comp_row     = comp_row;
+    e->index_row    = index_row;
 }
 
 /* Push the active host buffer to the device array and rotate the index.

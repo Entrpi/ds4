@@ -188,21 +188,23 @@ int   ds4_gpu_decode_layer_scalars_flush(void);
  * Field semantics:
  *   n_comp     -- post-this-token's-emit visible-compressed count.
  *                 Read by attention's ls_override path (Step 4c A1).
+ *   n_index_comp -- indexer compressed count, post-emit (PC3).  Equals
+ *                 g->layer_n_index_comp[il] + (emit_il ? 1 : 0).
+ *                 First consumer is PC5's I1/I2 max-grid + bounds-check
+ *                 indexer kernel pilot.
  *   comp_row   -- pre-emit row index for fp8 row-kernel.  Equals
  *                 g->layer_n_comp[il] (pre-increment).
  *   index_row  -- pre-emit row index for indexer_qat row-kernel.  Equals
  *                 g->layer_n_index_comp[il] (pre-increment).
- *   flags      -- bit 0: emit_this_step (set on ratio-4 emit tokens);
- *                 bit 1: indexed_active (set when n_comp > decode_top_k).
  *
  * Backends other than CUDA stub this as a no-op (Metal kernels read
  * inline args). */
 void  ds4_gpu_decode_layer_scalars_set(
         uint32_t il,
         uint32_t n_comp,
+        uint32_t n_index_comp,
         uint32_t comp_row,
-        uint32_t index_row,
-        uint32_t flags);
+        uint32_t index_row);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);

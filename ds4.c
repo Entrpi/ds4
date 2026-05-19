@@ -12921,15 +12921,22 @@ static bool metal_graph_encode_token_raw_swa(
      * plan doc sec 15.5 for the precompute protocol. */
     ds4_gpu_decode_layer_scalars_init();
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        const uint32_t il_ratio      = ds4_layer_compress_ratio(il);
-        const bool     emit_il       = (il_ratio != 0u) && (((pos + 1u) % il_ratio) == 0u);
-        const uint32_t comp_row_pre  = g->layer_n_comp[il];
-        const uint32_t n_comp_post   = comp_row_pre + (emit_il ? 1u : 0u);
+        const uint32_t il_ratio          = ds4_layer_compress_ratio(il);
+        const bool     emit_il           = (il_ratio != 0u) && (((pos + 1u) % il_ratio) == 0u);
+        const uint32_t comp_row_pre      = g->layer_n_comp[il];
+        const uint32_t index_row_pre     = g->layer_n_index_comp[il];
+        const uint32_t n_comp_post       = comp_row_pre  + (emit_il ? 1u : 0u);
+        const uint32_t n_index_comp_post = index_row_pre + (emit_il ? 1u : 0u);
+        /* PC3: n_index_comp replaces the unused `flags` slot.  Indexer and
+         * attention share the same emit gate (ratio-4); the post-emit count
+         * mirrors n_comp_post.  First consumer is PC5's I1/I2 max-grid
+         * indexer kernel pilot.  Cache-key bits (was the documented future
+         * use of `flags`) move to dedicated key-derivation logic in Step 5. */
         ds4_gpu_decode_layer_scalars_set(il,
                                             n_comp_post,
+                                            n_index_comp_post,
                                             comp_row_pre,
-                                            g->layer_n_index_comp[il],
-                                            0u  /* flags -- reserved for Step 5 cache-key bits */);
+                                            index_row_pre);
     }
     ds4_gpu_decode_layer_scalars_flush();
 

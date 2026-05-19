@@ -334,9 +334,9 @@ int ds4_gpu_decode_scalars_flush(void) {
 #define DS4_METAL_LAYER_SCALARS_COUNT 43u
 typedef struct {
     uint32_t n_comp;
+    uint32_t n_index_comp;  /* PC3: indexer compressed count, post-emit */
     uint32_t comp_row;
     uint32_t index_row;
-    uint32_t flags;
 } ds4_metal_layer_scalars;
 static ds4_metal_layer_scalars g_metal_layer_scalars[DS4_METAL_LAYER_SCALARS_COUNT];
 
@@ -391,14 +391,14 @@ int ds4_gpu_decode_layer_scalars_flush(void) {
 void ds4_gpu_decode_layer_scalars_set(
         uint32_t il,
         uint32_t n_comp,
+        uint32_t n_index_comp,
         uint32_t comp_row,
-        uint32_t index_row,
-        uint32_t flags) {
+        uint32_t index_row) {
     if (il >= DS4_METAL_LAYER_SCALARS_COUNT) return;
-    g_metal_layer_scalars[il].n_comp    = n_comp;
-    g_metal_layer_scalars[il].comp_row  = comp_row;
-    g_metal_layer_scalars[il].index_row = index_row;
-    g_metal_layer_scalars[il].flags     = flags;
+    g_metal_layer_scalars[il].n_comp       = n_comp;
+    g_metal_layer_scalars[il].n_index_comp = n_index_comp;
+    g_metal_layer_scalars[il].comp_row     = comp_row;
+    g_metal_layer_scalars[il].index_row    = index_row;
 }
 
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
