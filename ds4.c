@@ -9335,17 +9335,18 @@ static bool metal_graph_encode_decode_layer_impl(
             ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
     } while (0)
-    /* Step 7 hash-dump probes: only for layer 0 to keep the output
-     * small; if the divergence is in a later layer, expand to more. */
+    /* Step 7 hash-dump probes: only for layer 0.  Use FIXED slots
+     * 200..206 so captured-graph writes don't collide with eager
+     * post-capture L0n_out probes (which auto-number from slot 0). */
     const bool dump_this_layer = (il == 0);
     ds4_cuda_layer_graph_debug_peek("dbg:enter-layer-body");
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     ds4_cuda_layer_graph_debug_peek("dbg:after-rms_norm_plain");
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_after(g->flat_hc, hc_dim, "L0:flat_hc-after-rms_norm_plain");
+    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->flat_hc, hc_dim, "L0:flat_hc-after-rms_norm_plain", 200);
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
                                                  hc_dim, mix_hc, g->flat_hc, 1);
     ds4_cuda_layer_graph_debug_peek("dbg:after-matmul_plain(hc_mix)");
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_after(g->hc_mix, mix_hc, "L0:hc_mix-after-matmul_plain");
+    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->hc_mix, mix_hc, "L0:hc_mix-after-matmul_plain", 201);
     const bool fuse_hc_norm =
         !metal_graph_use_reference_hc_decode() &&
         !metal_graph_use_reference_hc_norm_decode();
@@ -9386,13 +9387,13 @@ static bool metal_graph_encode_decode_layer_impl(
         metal_graph_debug_dump_tensor("hc_attn_pre", g->attn_cur, DS4_N_EMBD, il, pos);
     }
     ds4_cuda_layer_graph_debug_peek("dbg:after-hc_split_or_pre");
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_after(g->attn_cur, DS4_N_EMBD, "L0:attn_cur-after-hc_split_or_pre");
+    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->attn_cur, DS4_N_EMBD, "L0:attn_cur-after-hc_split_or_pre", 202);
     if (ok && !fuse_hc_norm) ok = ds4_gpu_rms_norm_weight_tensor(g->attn_norm, g->attn_cur,
                                                                    model->map, model->size,
                                                                    layer->attn_norm->abs_offset,
                                                                    DS4_N_EMBD, DS4_RMS_EPS) != 0;
     ds4_cuda_layer_graph_debug_peek("dbg:after-rms_norm_weight");
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_after(g->attn_norm, DS4_N_EMBD, "L0:attn_norm-after-rms_norm_weight");
+    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->attn_norm, DS4_N_EMBD, "L0:attn_norm-after-rms_norm_weight", 203);
     DS4_METAL_PROFILE_DECODE_STAGE("attn_norm");
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
@@ -9454,19 +9455,19 @@ static bool metal_graph_encode_decode_layer_impl(
         metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
     ds4_cuda_layer_graph_debug_peek("dbg:before-matmul_q8_0(q_b)");
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_after(g->qr_norm, q_rank, "L0:qr_norm-before-matmul_q8_0_q_b");
+    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->qr_norm, q_rank, "L0:qr_norm-before-matmul_q8_0_q_b", 204);
     if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->q, model->map, model->size,
                                               layer->attn_q_b->abs_offset,
                                               q_rank, q_dim,
                                               g->qr_norm, 1) != 0;
     ds4_cuda_layer_graph_debug_peek("dbg:after-matmul_q8_0(q_b)");
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_after(g->q, q_dim, "L0:q-after-matmul_q8_0_q_b");
+    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->q, q_dim, "L0:q-after-matmul_q8_0_q_b", 205);
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
     }
     if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
     ds4_cuda_layer_graph_debug_peek("dbg:after-head_rms_norm");
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_after(g->q, q_dim, "L0:q-after-head_rms_norm");
+    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->q, q_dim, "L0:q-after-head_rms_norm", 206);
     if (ok) {
         metal_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
     }

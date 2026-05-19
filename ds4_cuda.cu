@@ -8799,6 +8799,26 @@ extern "C" void ds4_cuda_dump_hash_after(
             (const float *)tensor->ptr, n_elem, slot);
 }
 
+extern "C" void ds4_cuda_dump_hash_at_slot(
+        const struct ds4_gpu_tensor *tensor,
+        uint64_t n_elem,
+        const char *label,
+        uint32_t slot) {
+    /* Fixed-slot variant.  Useful for probes inside captured regions
+     * where the auto-incrementing g_dump_next would collide with eager
+     * post-capture probes (e.g. L0 sub-probes baked into layer 0's
+     * captured graph at slots 0..6, while L0n_out probes also start
+     * auto-numbering from slot 0 on replay tokens).  Reserve a high
+     * range for fixed-slot probes (e.g. 200..299) and let auto-slot
+     * probes occupy the low range. */
+    if (!ds4_cuda_dump_hash_enabled() || !tensor) return;
+    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    g_dump_labels[slot] = label;
+    if (slot >= g_dump_next) g_dump_next = slot + 1;
+    ds4_cuda_dump_hash_fnv1a_kernel<<<1, 1, 0, ds4_current_stream()>>>(
+            (const float *)tensor->ptr, n_elem, slot);
+}
+
 extern "C" void ds4_cuda_dump_hash_flush(uint32_t pos) {
     if (!ds4_cuda_dump_hash_enabled()) return;
     if (g_dump_next == 0) return;

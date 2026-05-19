@@ -292,6 +292,10 @@ void ds4_cuda_dump_hash_reset(void);
 void ds4_cuda_dump_hash_after(const ds4_gpu_tensor *tensor,
                                 uint64_t n_elem,
                                 const char *label);
+void ds4_cuda_dump_hash_at_slot(const ds4_gpu_tensor *tensor,
+                                  uint64_t n_elem,
+                                  const char *label,
+                                  uint32_t slot);
 void ds4_cuda_dump_hash_flush(uint32_t pos);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);

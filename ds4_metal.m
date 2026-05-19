@@ -434,6 +434,13 @@ void ds4_cuda_dump_hash_after(const ds4_gpu_tensor *tensor,
     (void)tensor; (void)n_elem; (void)label;
 }
 
+void ds4_cuda_dump_hash_at_slot(const ds4_gpu_tensor *tensor,
+                                  uint64_t n_elem,
+                                  const char *label,
+                                  uint32_t slot) {
+    (void)tensor; (void)n_elem; (void)label; (void)slot;
+}
+
 void ds4_cuda_dump_hash_flush(uint32_t pos) {
     (void)pos;
 }
