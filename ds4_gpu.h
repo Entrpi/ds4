@@ -55,11 +55,27 @@ int ds4_gpu_synchronize(void);
  * Decode-time position scalars (full-layer CUDA-graph capture, Step A).
  * =========================================================================
  *
- * A 32-byte device-side struct (pos0, raw_row, raw_start, n_raw, n_comp,
- * emit_phase, flags) referenced by position-dependent kernels via a
- * `const ds4_decode_scalars *` argument.  Per-token the CPU updates a
- * pinned host buffer; an in-graph captured cudaMemcpyAsync node propagates
- * the new values to the device on the next replay.
+ * Two parallel substrates carry position-derived scalars to position-
+ * dependent kernels:
+ *
+ *   1. TOKEN-STABLE struct (ds4_decode_scalars, 40 B device-side).  Carries
+ *      scalars whose value is constant across all 43 layers within a token:
+ *      pos0, raw_row, raw_start, n_raw, emit_phase, flags.  Single pinned
+ *      host buffer + single device address; one H2D memcpy per token,
+ *      currently EAGER on ds4_current_stream() (outside any captured-graph
+ *      scope).  Under Step 6's wider per-token graph the memcpy can become
+ *      a captured node; the captured-memcpy semantic is probe-validated
+ *      address-bound.  The struct's three per-layer fields (n_comp,
+ *      comp_row, index_row) are LEGACY today and will be retired in
+ *      Step 4c; see plan doc local/docs/ds4_full_layer_graph_capture_plan
+ *      .html sec 4.2 (P1a) for why they cannot safely carry per-layer
+ *      values through a single pinned buffer.
+ *
+ *   2. PER-LAYER ARRAY (ds4_layer_scalars[43], 688 B device-side, double-
+ *      buffered pinned host).  Carries scalars that DIFFER across layers
+ *      within a token: n_comp, comp_row, index_row, per-layer flag bits.
+ *      Added in Step 4b after R6 proved a shared single-buffer substrate
+ *      races the GPU.  See plan doc sec 15 for the full design.
  *
  * Backends other than CUDA may implement these as no-ops if they don't
  * use the graph-capture path.  On Metal the same scalars are passed via
@@ -68,6 +84,7 @@ int ds4_gpu_synchronize(void);
  * Lifecycle:
  *   ds4_gpu_decode_scalars_init()             once per GPU session
  *   ds4_gpu_decode_scalars_set(pos, ...)      once per decode token
+ *   ds4_gpu_decode_scalars_flush()            once per decode token
  *   ds4_gpu_decode_scalars_cleanup()          on teardown
  *
  * The opaque device pointer returned by *_device_ptr() is the value passed
@@ -85,21 +102,38 @@ void  ds4_gpu_decode_scalars_set(
         uint32_t flags);
 /* Push the most recent ds4_gpu_decode_scalars_set() values to the device-side
  * mirror.  Backends that don't use the graph-capture path implement this as
- * a no-op.  On CUDA this issues a single H2D memcpy on ds4_current_stream();
- * under graph capture (future Step 5/6) the memcpy becomes a captured node.
- * Returns 1 on success / no-op, 0 on infrastructure failure. */
+ * a no-op.  On CUDA this issues a single H2D memcpy on ds4_current_stream(),
+ * eager (outside captured-graph scope) today; Step 6 may bring it inside a
+ * wider per-token graph at which point the memcpy is captured into the
+ * outer graph node list.  Returns 1 on success / no-op, 0 on infrastructure
+ * failure. */
 int   ds4_gpu_decode_scalars_flush(void);
 
-/* Per-emit setter for the row scalars used by the R1 row-variant shims.
+/* UNSAFE pending removal in Step 4c (see plan doc sec 4.2 P1a).
+ *
+ * Per-emit setter for the row scalars used by the R1 row-variant shims.
  * Called from ds4.c at each per-layer emit step (compressor + indexer),
  * followed by ds4_gpu_decode_scalars_flush() so the new values reach the
- * device before the next kernel reads them.  Other scalar fields preserved. */
+ * device before the next kernel reads them.  Other scalar fields preserved.
+ *
+ * STRUCTURAL RACE: the host source (g_decode_host->comp_row/index_row) is
+ * overwritten by the next layer's set_emit_rows() while the previous
+ * layer's queued cudaMemcpyAsync may still be pending.  Bit-identical
+ * parity holds today by accident only (all 43 compressed layers see
+ * identical g->layer_n_comp[il] at any ratio-4 emit pos).  Do not call
+ * from new code; Step 4c migrates the R1 row-view kernels to read row
+ * scalars from the per-layer ds4_layer_scalars substrate and removes
+ * these setters. */
 void  ds4_gpu_decode_scalars_set_emit_rows(uint32_t comp_row,
                                              uint32_t index_row);
 
-/* Per-layer setter for n_comp (visible compressed-token count).  n_comp
- * is g->layer_n_comp[il] which varies per layer; callers update it before
- * each per-layer attention shim invocation, followed by flush(). */
+/* UNSAFE pending removal in Step 4c (see plan doc sec 4.2 P1a + R6).
+ *
+ * Per-layer setter for n_comp.  Same single-buffer race as set_emit_rows;
+ * R6 was originally discovered via this setter.  No current callers (the
+ * c587d96 fixup-2 attention path stopped using it).  Retained as a header
+ * declaration only so existing code doesn't accidentally re-introduce the
+ * race during the Step 4b/4c transition. */
 void  ds4_gpu_decode_scalars_set_n_comp(uint32_t n_comp);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);

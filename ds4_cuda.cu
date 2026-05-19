@@ -138,23 +138,41 @@ static inline int ds4_capture_active(void) {
 /* --------------------------------------------------------------------
  * Device-side decode scalars (Step A.2: full-layer graphs).
  *
- * Moves position-derived scalars out of the kernel argument list and into a
- * 32-byte struct that lives at a fixed device address.  Position-dependent
- * kernels gain a `const struct ds4_decode_scalars * __restrict__ s` argument
- * and read `s->pos0` etc. at the top.  Per token, the CPU writes the pinned
- * host buffer (single 32-byte store) and a captured `cudaMemcpyAsync` node
- * propagates the new values to the device.
+ * Moves position-derived scalars out of the kernel argument list and into
+ * device-side structures at fixed addresses.  Position-dependent kernels
+ * receive a `const struct ds4_decode_scalars * __restrict__ s` argument
+ * (token-stable substrate) and/or a `const struct ds4_layer_scalars *
+ * __restrict__ ls` argument (per-layer substrate, Step 4b pending).
  *
- * The captured memcpy is ADDRESS-bound (validated empirically by
- * tests/cuda_graph_memcpy_probe.cu — PASS on PRO 6000 Blackwell sm_120).
- * Updating *g_decode_host between cudaGraphLaunch replays causes subsequent
- * launches to see the new values on the device.  This is the same pattern
- * PyTorch's static_tensor.copy_(new_data) and vLLM's CUDAGraphRunner use.
+ * Two parallel substrates (see plan doc sec 15):
+ *
+ *   1. TOKEN-STABLE struct (this file, ds4_decode_scalars, 40 B).
+ *      Carries pos0, raw_row, raw_start, n_raw, emit_phase, flags +
+ *      legacy n_comp/comp_row/index_row fields (the three legacy fields
+ *      will be retired in Step 4c after R1 row-views and attention
+ *      migrate to the per-layer substrate).  Single pinned host buffer
+ *      + single device address; one EAGER H2D memcpy per token on
+ *      ds4_current_stream() (today, outside any captured-graph scope).
+ *      Step 6 may bring this memcpy inside a wider per-token graph; the
+ *      captured-memcpy semantic is address-bound (probe-validated, PASS
+ *      on PRO 6000 Blackwell sm_120 in tests/cuda_graph_memcpy_probe.cu).
+ *
+ *   2. PER-LAYER ARRAY (Step 4b pending; not yet in tree).  43-entry
+ *      struct ds4_layer_scalars[] with double-buffered pinned host source
+ *      and a single stable device address.  Carries scalars that DIFFER
+ *      across layers within a token: n_comp, comp_row, index_row, per-
+ *      layer flag bits.  R6 (empirically discovered during Step 4 Commit
+ *      B parity testing) proved that a single pinned-buffer substrate
+ *      races the GPU when scalars vary per-layer; the array-of-43 with
+ *      double-buffered host closes the race by construction.
+ *
+ * This is the same pattern PyTorch's static_tensor.copy_(new_data) and
+ * vLLM's CUDAGraphRunner use, generalized to ds4's two-substrate needs.
  *
  * Fields are denormalized: raw_row is just pos0 % raw_cap, but precomputing
  * on the CPU avoids a divide-per-thread on the GPU and keeps kernel bodies
- * branch-free.  Flags is the only multi-bit field; see ds4_full_layer_graph
- * _capture_plan.html for semantics.
+ * branch-free.  Flags is the only multi-bit field; see plan doc for
+ * semantics.
  *
  * Struct definition must precede every kernel that uses it; placed here
  * (before the first __global__ at line 257) for clean compilation.  The
@@ -976,10 +994,21 @@ extern "C" void ds4_gpu_decode_scalars_set(
     g_decode_host->_pad       = 0;
 }
 
-/* Per-emit setter for the row scalars.  Called from ds4.c at each per-layer
- * emit step (compressor + indexer), immediately before invoking the row-view
- * row-shim variants.  Followed by ds4_gpu_decode_scalars_flush() so the new
- * row values reach the device before the kernels read them. */
+/* UNSAFE pending removal in Step 4c.  See plan doc local/docs/
+ * ds4_full_layer_graph_capture_plan.html sec 4.2 (P1a).
+ *
+ * Per-emit setter for the row scalars.  Today called from ds4.c at each
+ * per-layer emit step (compressor + indexer); each call mutates a SINGLE
+ * pinned host buffer (g_decode_host) shared across all 43 layers.  R6
+ * mechanism: the queued async H2D reads its host source at execution
+ * time, so the CPU's next-layer set_emit_rows() overwrites the source
+ * before the previous layer's memcpy executes.  Bit-identical parity
+ * holds today by accident only -- all 43 compressed layers see identical
+ * g->layer_n_comp[il] at any ratio-4 emit pos, so the racy overwrite
+ * happens to write the same value.  Step 4c migrates the R1 row-view
+ * kernels (fp8_kv_quantize_row_kernel, indexer_hadamard_fp4_row_kernel)
+ * to read row scalars from the per-layer ds4_layer_scalars substrate
+ * and removes these setters.  Do not call from new code. */
 extern "C" void ds4_gpu_decode_scalars_set_emit_rows(uint32_t comp_row,
                                                        uint32_t index_row) {
     if (g_decode_host == NULL) return;
@@ -987,10 +1016,18 @@ extern "C" void ds4_gpu_decode_scalars_set_emit_rows(uint32_t comp_row,
     g_decode_host->index_row = index_row;
 }
 
-/* Per-layer setter for the visible-compressed-token count.  n_comp varies
- * per layer (g->layer_n_comp[il]) so it can't be set once at top of token.
- * Called from ds4.c before the per-layer attention call(s); paired with
- * flush() so the device sees the new value before the kernel reads it. */
+/* UNSAFE pending removal in Step 4c.  See plan doc sec 4.2 (P1a) + R6.
+ *
+ * Per-layer setter for the visible-compressed-token count.  This was the
+ * function that originally exhibited R6: writing g_decode_host->n_comp per
+ * layer races the GPU's queued async memcpy from the same pinned buffer.
+ * Step 4 Commit B fixup-2 (c587d96) stopped calling it; the attention
+ * kernel overrides only token-stable scalars (n_raw, raw_start) from the
+ * shared struct and keeps n_comp inline.  Retained as a no-op-when-unused
+ * declaration only so existing in-tree callers don't accidentally re-
+ * introduce the race during the Step 4b/4c transition.  Step 4c migrates
+ * n_comp into the per-layer ds4_layer_scalars substrate and removes this
+ * setter.  Do not call from new code. */
 extern "C" void ds4_gpu_decode_scalars_set_n_comp(uint32_t n_comp) {
     if (g_decode_host == NULL) return;
     g_decode_host->n_comp = n_comp;
