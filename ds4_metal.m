@@ -282,6 +282,34 @@ int ds4_gpu_in_mtp_verifier(void) {
     return 0;
 }
 
+/* Decode-time scalars: no-op stubs on Metal.
+ * Metal already passes per-kernel scalars via setBytes/setBuffer; the
+ * full-layer CUDA-graph machinery doesn't apply.  Step 4+ may extend the
+ * shim signatures to take the device pointer; on Metal the pointer is
+ * unused (NULL) and the shims read scalars from their existing arguments.
+ *
+ * Keep behavior identical to pre-Step-A Metal builds. */
+int ds4_gpu_decode_scalars_init(void) {
+    return 1;
+}
+
+void ds4_gpu_decode_scalars_cleanup(void) {}
+
+const void *ds4_gpu_decode_scalars_device_ptr(void) {
+    return NULL;
+}
+
+void ds4_gpu_decode_scalars_set(
+        uint32_t pos0,
+        uint32_t raw_cap,
+        uint32_t raw_window,
+        uint32_t ratio,
+        uint32_t n_comp,
+        uint32_t flags) {
+    (void)pos0; (void)raw_cap; (void)raw_window;
+    (void)ratio; (void)n_comp; (void)flags;
+}
+
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {

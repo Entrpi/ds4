@@ -51,6 +51,39 @@ int ds4_gpu_flush_commands(void);
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* =========================================================================
+ * Decode-time position scalars (full-layer CUDA-graph capture, Step A).
+ * =========================================================================
+ *
+ * A 32-byte device-side struct (pos0, raw_row, raw_start, n_raw, n_comp,
+ * emit_phase, flags) referenced by position-dependent kernels via a
+ * `const ds4_decode_scalars *` argument.  Per-token the CPU updates a
+ * pinned host buffer; an in-graph captured cudaMemcpyAsync node propagates
+ * the new values to the device on the next replay.
+ *
+ * Backends other than CUDA may implement these as no-ops if they don't
+ * use the graph-capture path.  On Metal the same scalars are passed via
+ * a buffer-pointer kernel argument (see ds4_metal.m).
+ *
+ * Lifecycle:
+ *   ds4_gpu_decode_scalars_init()             once per GPU session
+ *   ds4_gpu_decode_scalars_set(pos, ...)      once per decode token
+ *   ds4_gpu_decode_scalars_cleanup()          on teardown
+ *
+ * The opaque device pointer returned by *_device_ptr() is the value passed
+ * to per-kernel shims that depend on the scalars.  It is session-stable
+ * and may be cached by the caller after the first init. */
+int   ds4_gpu_decode_scalars_init(void);
+void  ds4_gpu_decode_scalars_cleanup(void);
+const void *ds4_gpu_decode_scalars_device_ptr(void);
+void  ds4_gpu_decode_scalars_set(
+        uint32_t pos0,
+        uint32_t raw_cap,
+        uint32_t raw_window,
+        uint32_t ratio,
+        uint32_t n_comp,
+        uint32_t flags);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);

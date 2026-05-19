@@ -135,6 +135,55 @@ static inline int ds4_capture_active(void) {
     return t_ds4_capture_stream != (cudaStream_t)0;
 }
 
+/* --------------------------------------------------------------------
+ * Device-side decode scalars (Step A.2: full-layer graphs).
+ *
+ * Moves position-derived scalars out of the kernel argument list and into a
+ * 32-byte struct that lives at a fixed device address.  Position-dependent
+ * kernels gain a `const struct ds4_decode_scalars * __restrict__ s` argument
+ * and read `s->pos0` etc. at the top.  Per token, the CPU writes the pinned
+ * host buffer (single 32-byte store) and a captured `cudaMemcpyAsync` node
+ * propagates the new values to the device.
+ *
+ * The captured memcpy is ADDRESS-bound (validated empirically by
+ * tests/cuda_graph_memcpy_probe.cu — PASS on PRO 6000 Blackwell sm_120).
+ * Updating *g_decode_host between cudaGraphLaunch replays causes subsequent
+ * launches to see the new values on the device.  This is the same pattern
+ * PyTorch's static_tensor.copy_(new_data) and vLLM's CUDAGraphRunner use.
+ *
+ * Fields are denormalized: raw_row is just pos0 % raw_cap, but precomputing
+ * on the CPU avoids a divide-per-thread on the GPU and keeps kernel bodies
+ * branch-free.  Flags is the only multi-bit field; see ds4_full_layer_graph
+ * _capture_plan.html for semantics.
+ *
+ * Struct definition must precede every kernel that uses it; placed here
+ * (before the first __global__ at line 257) for clean compilation.  The
+ * allocation + updater functions live further down with the other cuda_ok
+ * users; see ds4_gpu_decode_scalars_init / _set / _cleanup. */
+struct ds4_decode_scalars {
+    uint32_t pos0;        /* base sequence position; advances every token */
+    uint32_t raw_row;     /* pos0 % raw_cap; KV ring-buffer slot */
+    uint32_t raw_start;   /* window base in raw cache (post-mod) */
+    uint32_t n_raw;       /* min(pos0 + 1, raw_window); raw count */
+    uint32_t n_comp;      /* visible compressed tokens this step */
+    uint32_t emit_phase;  /* pos0 % ratio; compressor cyclic slot */
+    uint32_t flags;       /* bit 0: emit FP8 KV this step
+                           * bit 1: indexed-attention path active
+                           * bit 2: ratio4 compressor schedule
+                           * bits 3..31: reserved (must be 0) */
+    uint32_t _pad;        /* align to 32 B (one transaction on Blackwell) */
+};
+static_assert(sizeof(struct ds4_decode_scalars) == 32u,
+              "ds4_decode_scalars must be exactly 32 bytes");
+
+/* Allocated once at first init; reused for every replay.
+ * Host buffer is pinned (cudaHostAlloc) so the captured async H2D doesn't
+ * silently revert to a synchronous copy.  Device buffer's address is baked
+ * into captured kernel-node arg lists and into the captured memcpy node's
+ * destination — both pointers must outlive every cached graph. */
+static struct ds4_decode_scalars *g_decode_host = NULL;  /* cudaHostAlloc */
+static struct ds4_decode_scalars *g_decode_dev  = NULL;  /* cudaMalloc */
+
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
@@ -799,6 +848,120 @@ static int cuda_ok(cudaError_t err, const char *what) {
     if (err == cudaSuccess) return 1;
     fprintf(stderr, "ds4: CUDA %s failed: %s\n", what, cudaGetErrorString(err));
     return 0;
+}
+
+/* --------------------------------------------------------------------
+ * Device-side decode scalars: allocation + per-token update.
+ *
+ * See the struct definition near the file top for the design rationale.
+ * These three functions form the C-callable surface: ds4.c calls
+ *   ds4_gpu_decode_scalars_init()                    once per session,
+ *   ds4_gpu_decode_scalars_set(pos, raw_cap, ...)    once per token,
+ *   ds4_gpu_decode_scalars_cleanup()                 at GPU teardown.
+ * Plus an opaque-pointer accessor for shims that need to forward the
+ * device-side struct address to position-dependent kernels.
+ *
+ * Both allocations are session-lifetime.  Init is idempotent.  Init
+ * failure leaves the globals NULL and returns 0; the caller is expected
+ * to treat layer-graphs-disabled as the fallback path.  Cleanup is also
+ * idempotent and safe to call multiple times. */
+extern "C" int ds4_gpu_decode_scalars_init(void) {
+    if (g_decode_host != NULL && g_decode_dev != NULL) {
+        return 1;  /* already initialized */
+    }
+    if (g_decode_host == NULL) {
+        if (!cuda_ok(cudaHostAlloc((void **)&g_decode_host,
+                                   sizeof(*g_decode_host),
+                                   cudaHostAllocDefault),
+                     "decode scalars host alloc")) {
+            g_decode_host = NULL;
+            return 0;
+        }
+    }
+    if (g_decode_dev == NULL) {
+        if (!cuda_ok(cudaMalloc((void **)&g_decode_dev,
+                                sizeof(*g_decode_dev)),
+                     "decode scalars dev alloc")) {
+            cudaFreeHost(g_decode_host);
+            g_decode_host = NULL;
+            g_decode_dev = NULL;
+            return 0;
+        }
+    }
+    memset(g_decode_host, 0, sizeof(*g_decode_host));
+    /* Prime the device copy so any first-token kernel that reads s->*
+     * before the first captured memcpy fires sees deterministic zeros
+     * rather than uninitialized memory.  Outside any graph capture. */
+    if (!cuda_ok(cudaMemcpy(g_decode_dev, g_decode_host,
+                            sizeof(*g_decode_host),
+                            cudaMemcpyHostToDevice),
+                 "decode scalars prime")) {
+        cudaFree(g_decode_dev);
+        cudaFreeHost(g_decode_host);
+        g_decode_dev = NULL;
+        g_decode_host = NULL;
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" void ds4_gpu_decode_scalars_cleanup(void) {
+    if (g_decode_dev != NULL) {
+        cudaFree(g_decode_dev);
+        g_decode_dev = NULL;
+    }
+    if (g_decode_host != NULL) {
+        cudaFreeHost(g_decode_host);
+        g_decode_host = NULL;
+    }
+}
+
+/* Returns the stable device-side struct pointer that callers forward to
+ * position-dependent kernel shims.  May return NULL if init failed or
+ * was never called; callers should treat that as "skip layer graphs". */
+extern "C" const void *ds4_gpu_decode_scalars_device_ptr(void) {
+    return (const void *)g_decode_dev;
+}
+
+/* Write the host struct in-place for the next replay.  Caller passes:
+ *   pos0       -- base sequence position (0 for first decode token, etc.)
+ *   raw_cap    -- raw KV ring capacity (model constant)
+ *   raw_window -- raw-attention window length (model constant)
+ *   ratio      -- compressor ratio (4 for V4 Flash)
+ *   n_comp     -- compressed tokens visible this step (caller-computed
+ *                 because indexed-attention shortens the count)
+ *   flags      -- bit 0: emit FP8 KV this step
+ *                 bit 1: indexed-attention path
+ *                 bit 2: ratio4 (reserved; informational)
+ *
+ * Outside graph capture this just touches a pinned page; cost is one
+ * 32-byte store + a uint32 divmod.  Inside replay it is invisible (the
+ * captured memcpy fires from the per-graph schedule).
+ *
+ * No-ops harmlessly if init has not run; that is the "graphs disabled"
+ * path. */
+extern "C" void ds4_gpu_decode_scalars_set(
+        uint32_t pos0,
+        uint32_t raw_cap,
+        uint32_t raw_window,
+        uint32_t ratio,
+        uint32_t n_comp,
+        uint32_t flags) {
+    if (g_decode_host == NULL) return;
+    const uint32_t cap = raw_cap ? raw_cap : 1u;
+    const uint32_t r   = ratio   ? ratio   : 1u;
+    const uint32_t pos1   = pos0 + 1u;
+    const uint32_t n_raw  = (pos1 < raw_window) ? pos1 : raw_window;
+    /* raw_start = (pos1 - n_raw) % raw_cap; n_raw <= pos1 so no underflow. */
+    const uint32_t raw_start = (pos1 - n_raw) % cap;
+    g_decode_host->pos0       = pos0;
+    g_decode_host->raw_row    = pos0 % cap;
+    g_decode_host->raw_start  = raw_start;
+    g_decode_host->n_raw      = n_raw;
+    g_decode_host->n_comp     = n_comp;
+    g_decode_host->emit_phase = pos0 % r;
+    g_decode_host->flags      = flags;
+    g_decode_host->_pad       = 0;
 }
 
 static double cuda_wall_sec(void) {
