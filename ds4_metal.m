@@ -11231,8 +11231,9 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim,
-        const void             *scalars) {
-    (void)scalars;  /* Metal stub ignores -- inline args carry the values */
+        const void             *scalars,
+        uint32_t                il_for_decode1) {
+    (void)scalars; (void)il_for_decode1;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv || !comp_kv || !topk ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
@@ -11513,8 +11514,9 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim,
-        const void             *scalars) {
-    (void)scalars;  /* Metal stub ignores -- inline args carry the values */
+        const void             *scalars,
+        uint32_t                il_for_decode1) {
+    (void)scalars; (void)il_for_decode1;  /* Metal stub ignores -- inline args carry the values */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!heads || !model_map || !q || !raw_kv ||
         n_raw == 0 || n_head == 0 || head_dim == 0 ||

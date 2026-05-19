@@ -9810,7 +9810,8 @@ static bool metal_graph_encode_decode_layer_impl(
                     ds4_layer_compress_ratio(il),
                     DS4_N_HEAD,
                     DS4_N_HEAD_DIM,
-                    ds4_gpu_decode_scalars_device_ptr()) != 0;
+                    ds4_gpu_decode_scalars_device_ptr(),
+                    il /* A1: per-layer substrate for n_comp */) != 0;
             if (ok && decode_index_stage_profile) {
                 ok = metal_graph_indexer_stage_profile_boundary("decode_attention",
                                                                 il,
@@ -9831,7 +9832,8 @@ static bool metal_graph_encode_decode_layer_impl(
                                                          NULL,
                                                          0,
                                                          DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                                         ds4_gpu_decode_scalars_device_ptr()) != 0;
+                                                         ds4_gpu_decode_scalars_device_ptr(),
+                                                         il /* A1: per-layer substrate for n_comp */) != 0;
         }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attention");
@@ -12900,13 +12902,13 @@ static bool metal_graph_encode_token_raw_swa(
                                  0u  /* flags */);
     ds4_gpu_decode_scalars_flush();
 
-    /* Step 4c R1': populate the per-layer scalars substrate.  For R1' only
-     * comp_row and index_row are read by migrated kernels; n_comp and
-     * flags stay zero until later sub-commits (C1/C2 read n_comp via the
-     * compressor cluster; A1 reads ls->n_comp for attention's lift off
-     * the inline arg).  Pre-emit values: g->layer_n_comp[il] /
-     * g->layer_n_index_comp[il] are pre-increment (the increment fires
-     * inside the per-layer body after the emit kernel writes its row).
+    /* Step 4c R1' + A1: populate the per-layer scalars substrate.
+     *   comp_row  = g->layer_n_comp[il]        (pre-emit; R1' fp8 emit row)
+     *   index_row = g->layer_n_index_comp[il]  (pre-emit; R1' indexer emit row)
+     *   n_comp    = comp_row + (emit_il ? 1 : 0)  -- post-emit visible count
+     *               for attention's ls_override read (A1).  Matches the
+     *               existing inline `n_comp = g->layer_n_comp[il]` at
+     *               ds4.c:9776 (taken AFTER the per-layer body's ++).
      *
      * One tight loop populates the active double-buffered host array; one
      * cudaMemcpyAsync moves all 43 * 16 = 688 B to g_layer_dev; the per-
@@ -12914,11 +12916,15 @@ static bool metal_graph_encode_token_raw_swa(
      * plan doc sec 15.5 for the precompute protocol. */
     ds4_gpu_decode_layer_scalars_init();
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t il_ratio      = ds4_layer_compress_ratio(il);
+        const bool     emit_il       = (il_ratio != 0u) && (((pos + 1u) % il_ratio) == 0u);
+        const uint32_t comp_row_pre  = g->layer_n_comp[il];
+        const uint32_t n_comp_post   = comp_row_pre + (emit_il ? 1u : 0u);
         ds4_gpu_decode_layer_scalars_set(il,
-                                            0u, /* n_comp -- filled in C1/A1 */
-                                            g->layer_n_comp[il],
+                                            n_comp_post,
+                                            comp_row_pre,
                                             g->layer_n_index_comp[il],
-                                            0u  /* flags -- filled in C1/A1 */);
+                                            0u  /* flags -- reserved for Step 5 cache-key bits */);
     }
     ds4_gpu_decode_layer_scalars_flush();
 
@@ -14281,7 +14287,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               ratio,
                                                                               DS4_N_HEAD,
                                                                               DS4_N_HEAD_DIM,
-                                                                              /* scalars (batch path) */ NULL) != 0;
+                                                                              /* scalars (batch path) */ NULL, UINT32_MAX /* A1: no substrate */) != 0;
                     if (ok && index_stage_profile) {
                         ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                         il,
@@ -14394,7 +14400,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                           ratio,
                                                                           DS4_N_HEAD,
                                                                           DS4_N_HEAD_DIM,
-                                                                          /* scalars (batch path) */ NULL) != 0;
+                                                                          /* scalars (batch path) */ NULL, UINT32_MAX /* A1: no substrate */) != 0;
                 if (ok && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                     il,
@@ -14520,7 +14526,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               ratio,
                                                                               DS4_N_HEAD,
                                                                               DS4_N_HEAD_DIM,
-                                                                              /* scalars (batch path) */ NULL) != 0;
+                                                                              /* scalars (batch path) */ NULL, UINT32_MAX /* A1: no substrate */) != 0;
                 } else if (ok) {
                     ok = ds4_gpu_attention_decode_heads_tensor(heads_view,
                                                                  model->map,
@@ -14537,7 +14543,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                  n_selected,
                                                                  DS4_N_HEAD,
                                                                  DS4_N_HEAD_DIM,
-                                                                 /* scalars (batch path) */ NULL) != 0;
+                                                                 /* scalars (batch path) */ NULL, UINT32_MAX /* A1: no substrate */) != 0;
                 }
                 ds4_gpu_tensor_free(heads_view);
                 ds4_gpu_tensor_free(kv_cache_view);

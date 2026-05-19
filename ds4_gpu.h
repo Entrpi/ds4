@@ -747,7 +747,11 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim,
-        const void             *scalars);
+        const void             *scalars,
+        /* Step 4c A1: per-layer index for the ds4_layer_scalars substrate.
+         * Decode1 passes il (0..42) to lift n_comp off the inline arg;
+         * decode2-exact + batch callers pass UINT32_MAX (no substrate). */
+        uint32_t                il_for_decode1);
 
 int ds4_gpu_attention_prefill_raw_heads_tensor(
         ds4_gpu_tensor       *heads,
@@ -822,7 +826,10 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim,
-        const void             *scalars);
+        const void             *scalars,
+        /* Step 4c A1: per-layer index for ds4_layer_scalars substrate.
+         * UINT32_MAX = no substrate. */
+        uint32_t                il_for_decode1);
 
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,

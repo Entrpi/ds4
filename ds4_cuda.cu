@@ -5190,22 +5190,25 @@ __global__ static void attention_decode_mixed_kernel(
         uint32_t n_head,
         uint32_t head_dim,
         /* Optional device-side scalars override (Step-4 Commit B / R5).
-         * When non-NULL the kernel reads n_raw, raw_start, n_comp from
-         * the struct at execution time instead of using the inline args.
-         * pos0, n_tokens, window, ratio are passed = 0 by the decode shim
-         * and remain inline (no per-token variation). */
-        const struct ds4_decode_scalars * __restrict__ s_override) {
-    /* Step 4 / R5: override only the TOKEN-STABLE scalars from the device-
-     * side struct.  n_comp is PER-LAYER (g->layer_n_comp[il]) so it can't
-     * be safely propagated through a single pinned host buffer (the CPU's
-     * per-layer overwrites race with the GPU's queued async memcpy).
-     * Per-layer scalars need a per-layer source — a 43-entry host array or
-     * one host buffer per layer.  Deferred to Step 5/6's layer-graph
-     * capture design.  Until then, n_comp stays inline (baked at launch);
-     * acceptable pre-capture because the inline value is per-call accurate. */
+         * When non-NULL the kernel reads n_raw, raw_start from the struct
+         * at execution time instead of using the inline args.  pos0,
+         * n_tokens, window, ratio are passed = 0 by the decode shim and
+         * remain inline (no per-token variation). */
+        const struct ds4_decode_scalars * __restrict__ s_override,
+        /* Optional per-layer scalars override (Step 4c A1).  When non-
+         * NULL the kernel reads n_comp from ls_override->n_comp at
+         * execution time, closing the R6 race for the attention path.
+         * Pre-capture this produces the same value as the inline arg
+         * (the prologue populates ls->n_comp = post-this-token's-emit
+         * count); under capture (Step 5/6) ls_override becomes the
+         * load-bearing source. */
+        const struct ds4_layer_scalars  * __restrict__ ls_override) {
     if (s_override) {
         n_raw     = s_override->n_raw;
         raw_start = s_override->raw_start;
+    }
+    if (ls_override) {
+        n_comp    = ls_override->n_comp;
     }
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
@@ -5375,11 +5378,16 @@ __global__ static void attention_indexed_mixed_kernel(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim,
-        const struct ds4_decode_scalars * __restrict__ s_override) {
-    /* See attention_decode_mixed_kernel: token-stable scalars only. */
+        const struct ds4_decode_scalars * __restrict__ s_override,
+        /* Step 4c A1: per-layer n_comp override.  See
+         * attention_decode_mixed_kernel for rationale. */
+        const struct ds4_layer_scalars  * __restrict__ ls_override) {
     if (s_override) {
         n_raw     = s_override->n_raw;
         raw_start = s_override->raw_start;
+    }
+    if (ls_override) {
+        n_comp    = ls_override->n_comp;
     }
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
@@ -6004,11 +6012,15 @@ __global__ static void attention_decode_mixed_heads8_online_kernel(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim,
-        const struct ds4_decode_scalars * __restrict__ s_override) {
-    /* See attention_decode_mixed_kernel: token-stable scalars only. */
+        const struct ds4_decode_scalars * __restrict__ s_override,
+        /* Step 4c A1: per-layer n_comp override. */
+        const struct ds4_layer_scalars  * __restrict__ ls_override) {
     if (s_override) {
         n_raw     = s_override->n_raw;
         raw_start = s_override->raw_start;
+    }
+    if (ls_override) {
+        n_comp    = ls_override->n_comp;
     }
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
@@ -10416,7 +10428,12 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                use_mask,
         uint32_t                n_head,
         uint32_t                head_dim,
-        const void             *scalars) {
+        const void             *scalars,
+        /* Step 4c A1: per-layer index for the ds4_layer_scalars substrate.
+         * When il < DS4_LAYER_SCALARS_COUNT, the kernel reads n_comp from
+         * g_layer_dev[il].n_comp at execution time (capture-safe).  Pass
+         * UINT32_MAX to use the inline n_comp arg (decode2-exact paths). */
+        uint32_t                il_for_decode1) {
     if (!heads || !q || !raw_kv || !model_map || n_raw == 0 || raw_cap < n_raw ||
         raw_start >= raw_cap || (n_comp != 0 && !comp_kv) || (use_mask && !comp_mask) ||
         sinks_offset > model_size ||
@@ -10431,6 +10448,9 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
     const float *sinks = (const float *)cuda_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    const struct ds4_layer_scalars *ls_override =
+        (g_layer_dev != NULL && il_for_decode1 < DS4_LAYER_SCALARS_COUNT)
+            ? g_layer_dev + il_for_decode1 : NULL;
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_mask && head_dim == 512u &&
             getenv("DS4_CUDA_NO_WINDOW_ATTENTION") == NULL) {
@@ -10450,7 +10470,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                                               0,
                                                                               n_head,
                                                                               head_dim,
-                                                                              (const struct ds4_decode_scalars *)scalars);
+                                                                              (const struct ds4_decode_scalars *)scalars,
+                                                                              ls_override);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
@@ -10466,7 +10487,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                                  use_mask,
                                                  1, 0, n_raw, raw_cap, raw_start, n_comp,
                                                  0, 0, n_head, head_dim,
-                                                 (const struct ds4_decode_scalars *)scalars);
+                                                 (const struct ds4_decode_scalars *)scalars,
+                                                 ls_override);
     return cuda_ok(cudaGetLastError(), "attention decode launch");
 }
 extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset, const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
@@ -10623,7 +10645,7 @@ static int attention_decode_batch_launch(
                                                                               ratio,
                                                                               n_head,
                                                                               head_dim,
-                                                                              /* s_override */ (const struct ds4_decode_scalars *)NULL);
+                                                                              /* s_override */ (const struct ds4_decode_scalars *)NULL, /* ls_override */ (const struct ds4_layer_scalars *)NULL);
             return cuda_ok(cudaGetLastError(), "attention decode online launch");
         }
         fprintf(stderr, "ds4: CUDA attention score buffer too small for %u compressed rows\n", n_comp);
@@ -10648,7 +10670,7 @@ static int attention_decode_batch_launch(
                                                                    ratio,
                                                                    n_head,
                                                                    head_dim,
-                                                                   /* s_override */ (const struct ds4_decode_scalars *)NULL);
+                                                                   /* s_override */ (const struct ds4_decode_scalars *)NULL, /* ls_override */ (const struct ds4_layer_scalars *)NULL);
         return cuda_ok(cudaGetLastError(), "attention decode window launch");
     }
     dim3 grid(n_tokens, n_head, 1);
@@ -10660,7 +10682,7 @@ static int attention_decode_batch_launch(
                                                  use_comp_mask ? (const float *)comp_mask->ptr : NULL,
                                                  use_comp_mask, n_tokens, pos0, n_raw, raw_cap,
                                                  raw_start, n_comp, window, ratio, n_head, head_dim,
-                                                 /* s_override */ (const struct ds4_decode_scalars *)NULL);
+                                                 /* s_override */ (const struct ds4_decode_scalars *)NULL, /* ls_override */ (const struct ds4_layer_scalars *)NULL);
     return cuda_ok(cudaGetLastError(), "attention decode batch launch");
 }
 
@@ -10731,7 +10753,12 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim,
-        const void             *scalars) {
+        const void             *scalars,
+        /* Step 4c A1: per-layer index for the ds4_layer_scalars substrate.
+         * When il < count, ls_override = &g_layer_dev[il]; the indexed
+         * attention kernel reads n_comp from there.  UINT32_MAX = no
+         * substrate (decode2-exact / batch paths use inline n_comp). */
+        uint32_t                il_for_decode1) {
     if (!heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         n_comp == 0 || top_k == 0 ||
@@ -10801,6 +10828,9 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                  head_dim);
         return cuda_ok(cudaGetLastError(), "attention indexed heads8 launch");
     }
+    const struct ds4_layer_scalars *ls_override =
+        (g_layer_dev != NULL && il_for_decode1 < DS4_LAYER_SCALARS_COUNT)
+            ? g_layer_dev + il_for_decode1 : NULL;
     dim3 grid(n_tokens, n_head, 1);
     attention_indexed_mixed_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)heads->ptr,
                                                   sinks,
@@ -10819,7 +10849,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                   ratio,
                                                   n_head,
                                                   head_dim,
-                                                  (const struct ds4_decode_scalars *)scalars);
+                                                  (const struct ds4_decode_scalars *)scalars,
+                                                  ls_override);
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
 }
 
