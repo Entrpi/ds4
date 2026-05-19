@@ -8740,11 +8740,33 @@ static struct layer_graph_entry *layer_graph_slot(const struct ds4_layer_graph_k
 static struct layer_graph_entry *g_layer_graph_capturing_slot = NULL;
 static uint32_t                  g_layer_graph_capturing_il   = UINT32_MAX;
 
+/* Step 6 fixup: pre-warm session-global scratch buffers that lazy-grow
+ * via cudaMalloc.  Capture mode forbids cudaMalloc/cudaFree, so the first
+ * captured kernel that triggers growth (e.g. indexer_topk_tree scratch
+ * scaling with n_comp) puts the stream into sticky-error state.
+ *
+ * Pre-allocating once to a max-decode-conservative size sidesteps the
+ * issue entirely: every cuda_tmp_alloc call in the captured region then
+ * hits the cached pointer (g_cuda_tmp_bytes >= request) and skips the
+ * malloc.  4 MB is ~330x the largest observed decode-time scratch
+ * (indexer_topk_tree at max n_comp=comp_cap=8194, n_tokens=1, ~12 KB)
+ * and absorbs any growth from MTP n_tok=2 paths or future kernels. */
+static void ds4_cuda_layer_graph_warm_tmp_scratch(void) {
+    static int warmed = 0;
+    if (warmed) return;
+    warmed = 1;
+    /* cuda_tmp_alloc returns the cached pointer when already large enough;
+     * when sized below the request it does cudaFree(old) + cudaMalloc(new).
+     * Pass 4 MiB to force at least that much. */
+    (void)cuda_tmp_alloc((uint64_t)4 * 1024 * 1024, "layer_graph_warmup");
+}
+
 extern "C" int ds4_cuda_layer_graph_begin_or_replay(
         uint32_t il,
         const struct ds4_layer_graph_key *key) {
     if (!ds4_cuda_layer_graphs_enabled()) return -1;
     if (il >= DS4_LAYER_SCALARS_COUNT || !key) return -1;
+    ds4_cuda_layer_graph_warm_tmp_scratch();
     if (g_layer_graph_capturing_slot != NULL) {
         /* Caller error: a prior begin_or_replay returned 0 but didn't get
          * matched by end_or_commit.  Refuse rather than corrupt state. */
