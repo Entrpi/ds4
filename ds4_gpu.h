@@ -611,6 +611,16 @@ int ds4_gpu_store_raw_kv_batch_tensor(
  * and optional indexer masks.
  */
 
+/* PC2: row-field selector for ds4_gpu_compressor_update_tensor().  The
+ * shim has two distinct callers in decode1 (primary compressor + indexer
+ * compressor) which need to read different fields from the same per-layer
+ * substrate entry.  Encoded as a tiny enum-like pair rather than packing
+ * into the high bit of `il` (which complicates Step 5's cache-key
+ * machinery).  Decode2-exact callers pass DS4_COMPRESSOR_ROW_COMP with
+ * il = UINT32_MAX -- row_field is then ignored. */
+#define DS4_COMPRESSOR_ROW_COMP   0
+#define DS4_COMPRESSOR_ROW_INDEX  1
+
 int ds4_gpu_compressor_update_tensor(
         const ds4_gpu_tensor *kv_cur,
         const ds4_gpu_tensor *sc_cur,
@@ -636,11 +646,14 @@ int ds4_gpu_compressor_update_tensor(
         float                   beta_fast,
         float                   beta_slow,
         float                   rms_eps,
-        /* Step 4c C2: layer index for the per-layer scalars substrate.
-         * Decode1 path passes il (0..42); decode2-exact + Metal callers
-         * pass UINT32_MAX to signal "no substrate" (kernels fall back to
-         * inline comp_row).  See plan doc sec 16 commit C2 / sec 15.8. */
-        uint32_t                il_for_decode1);
+        /* Step 4c C2 + PC2: per-layer substrate selector.  Decode1 path
+         * passes il (0..42) + DS4_COMPRESSOR_ROW_COMP (primary) or
+         * DS4_COMPRESSOR_ROW_INDEX (indexer).  Decode2-exact + Metal
+         * callers pass il = UINT32_MAX to signal "no substrate"; kernels
+         * fall back to inline comp_row and row_field is ignored.  See
+         * plan doc sec 16 commit C2 / sec 15.8. */
+        uint32_t                il,
+        int                     row_field);
 
 int ds4_gpu_compressor_store_batch_tensor(
         const ds4_gpu_tensor *kv,

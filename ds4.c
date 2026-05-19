@@ -9570,7 +9570,8 @@ static bool metal_graph_encode_decode_layer_impl(
                                                         DS4_ROPE_YARN_BETA_FAST,
                                                         DS4_ROPE_YARN_BETA_SLOW,
                                                         DS4_RMS_EPS,
-                                                        il /* Step 4c C2: per-layer substrate index for emit-row */) != 0;
+                                                        il,                          /* PC2: per-layer substrate index for emit-row */
+                                                        DS4_COMPRESSOR_ROW_COMP      /* PC2: primary compressor -> ls->comp_row */) != 0;
         if (ok && emit) {
             /* Step 4c R1': read comp_row from g_layer_dev[il].comp_row in
              * the per-layer substrate (populated at top of token in
@@ -9663,7 +9664,8 @@ static bool metal_graph_encode_decode_layer_impl(
                                                             DS4_ROPE_YARN_BETA_FAST,
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS,
-                                                            il | 0x80000000u /* C2: indexer compressor -- bit31 selects index_row in per-layer substrate */) != 0;
+                                                            il,                          /* PC2: per-layer substrate index for emit-row */
+                                                            DS4_COMPRESSOR_ROW_INDEX     /* PC2: indexer compressor -> ls->index_row */) != 0;
             if (ok && emit) {
                 /* Step 4c R1': index emit reads index_row from
                  * g_layer_dev[il].index_row in the per-layer substrate.
@@ -9780,12 +9782,13 @@ static bool metal_graph_encode_decode_layer_impl(
 
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
-        /* Step 4: n_raw and raw_start are token-stable (same across all
-         * layers within a token) and were set once at the top of the token.
-         * n_comp is PER-LAYER and stays as an inline kernel arg in this
-         * step.  Under Step 5/6's layer-graph capture, per-layer scalars
-         * will need a per-layer source (array of host buffers) to avoid
-         * the single-buffer reuse race with queued async memcpys. */
+        /* Step 4a + 4c A1: n_raw and raw_start are token-stable (same
+         * across all layers within a token) and live in the token-stable
+         * struct ds4_decode_scalars (set once at the top of the token).
+         * n_comp is PER-LAYER and now lives in g_layer_dev[il].n_comp via
+         * the layer-scalars substrate (Step 4b); the attention shim
+         * passes il so the kernel reads ls->n_comp via ls_override at
+         * execution time -- capture-safe.  See plan doc sec 15 / sec 16. */
         if (n_comp != 0 && comp_selected != NULL && n_selected != 0) {
             /* Step 4: in-decode-body caller passes the device-side scalars
              * pointer so the kernel reads n_raw/raw_start/n_comp from there
@@ -12907,8 +12910,10 @@ static bool metal_graph_encode_token_raw_swa(
      *   index_row = g->layer_n_index_comp[il]  (pre-emit; R1' indexer emit row)
      *   n_comp    = comp_row + (emit_il ? 1 : 0)  -- post-emit visible count
      *               for attention's ls_override read (A1).  Matches the
-     *               existing inline `n_comp = g->layer_n_comp[il]` at
-     *               ds4.c:9776 (taken AFTER the per-layer body's ++).
+     *               value the attention shim previously took as an inline
+     *               arg from `n_comp = g->layer_n_comp[il]` (after the
+     *               per-layer body's ++); that inline path is gone after
+     *               A1 + PC2 -- attention reads ls->n_comp at execution.
      *
      * One tight loop populates the active double-buffered host array; one
      * cudaMemcpyAsync moves all 43 * 16 = 688 B to g_layer_dev; the per-
@@ -13861,7 +13866,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                             DS4_ROPE_YARN_BETA_FAST,
                                                             DS4_ROPE_YARN_BETA_SLOW,
                                                             DS4_RMS_EPS,
-                                                            UINT32_MAX /* C2: decode2-exact path, no substrate; inline comp_row */) != 0;
+                                                            UINT32_MAX,                  /* PC2: decode2-exact, no substrate; inline comp_row */
+                                                            DS4_COMPRESSOR_ROW_COMP      /* PC2: row_field ignored when il==UINT32_MAX */) != 0;
                     if (ok && emit) {
                         ds4_gpu_tensor *comp_row_view = ds4_gpu_tensor_view(
                                 g->layer_attn_comp_cache[il],
@@ -14156,7 +14162,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                 DS4_ROPE_YARN_BETA_FAST,
                                                                 DS4_ROPE_YARN_BETA_SLOW,
                                                                 DS4_RMS_EPS,
-                                                                UINT32_MAX /* C2: decode2-exact indexer, no substrate */) != 0;
+                                                                UINT32_MAX,                  /* PC2: decode2-exact indexer, no substrate */
+                                                                DS4_COMPRESSOR_ROW_INDEX     /* PC2: row_field ignored when il==UINT32_MAX */) != 0;
                         if (ok && emit) {
                             ds4_gpu_tensor *index_row_view = ds4_gpu_tensor_view(
                                     g->layer_index_comp_cache[il],

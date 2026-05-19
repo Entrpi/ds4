@@ -8209,8 +8209,10 @@ int ds4_gpu_compressor_update_tensor(
         float                   beta_fast,
         float                   beta_slow,
         float                   rms_eps,
-        uint32_t                il_for_decode1) {
-    (void)il_for_decode1;  /* Metal kernels read inline args; no per-layer substrate. */
+        uint32_t                il,
+        int                     row_field) {
+    (void)il;         /* Metal kernels read inline args; no per-layer substrate. */
+    (void)row_field;  /* PC2: substrate selector ignored on Metal. */
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || head_dim == 0 || ratio == 0 ||

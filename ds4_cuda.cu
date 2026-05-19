@@ -10027,14 +10027,21 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         float                   beta_fast,
         float                   beta_slow,
         float                   rms_eps,
-        /* Step 4c C2: layer index for the per-layer scalars substrate.
-         * Decode1 path passes the actual `il` in 0..42 so the emit
-         * kernels read row index from g_layer_dev[il].comp_row.  Decode2-
-         * exact paths pass UINT32_MAX (or any value >= DS4_LAYER_SCALARS
-         * _COUNT) to signal "no substrate"; the kernels fall back to the
-         * inline comp_row arg.  Closes P1b by eliminating the transient
-         * comp_row_view from this shim's capture-reachable path. */
-        uint32_t                il_for_decode1) {
+        /* Step 4c C2 + PC2: per-layer substrate selector.
+         *   il         -- layer index in 0..DS4_LAYER_SCALARS_COUNT-1
+         *                  selects which entry of g_layer_dev[]; pass
+         *                  UINT32_MAX (or any value >= count) to signal
+         *                  "no substrate" and fall back to the inline
+         *                  comp_row arg (decode2-exact + Metal stub).
+         *   row_field  -- DS4_COMPRESSOR_ROW_COMP (0) selects ls->comp_row
+         *                 (primary compressor); DS4_COMPRESSOR_ROW_INDEX
+         *                 (1) selects ls->index_row (indexer compressor).
+         *                 Ignored when il indicates no-substrate.
+         * Replaces the earlier `il | 0x80000000u` bit-31 encoding so
+         * Step 5's cache-key/validator logic doesn't have to special-
+         * case the high-bit packing. */
+        uint32_t                il,
+        int                     row_field) {
     if (!kv_cur || !sc_cur || !state_kv || !state_score || !comp_cache ||
         !model_map || head_dim == 0 || ratio == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
@@ -10072,31 +10079,24 @@ extern "C" int ds4_gpu_compressor_update_tensor(
     }
     if (!emit) return 1;
 
-    /* Step 4c C2 (P1b fix): the three emit-row kernels (compressor pool
-     * update + rms-norm + rope-tail) all operate on the same row of
-     * comp_cache.  Previously addressed via a transient
+    /* Step 4c C2 (P1b fix) + PC2 explicit selector: the three emit-row
+     * kernels (compressor pool update + rms-norm + rope-tail) all operate
+     * on the same row of comp_cache.  Previously addressed via a transient
      * ds4_gpu_tensor_view (comp_row_view) whose ptr was baked into the
      * captured kernel-node arg lists -- not capture-safe.  Now all three
-     * read the row index from a device-side uint32 the shim selects
-     * (primary compressor caller -> &g_layer_dev[il].comp_row;
-     *  indexer compressor caller  -> &g_layer_dev[il].index_row).
-     *
-     * il_for_decode1 encoding (compact ABI extension):
-     *   bit 31:    0 = use comp_row field, 1 = use index_row field
-     *   bits 0-30: layer index (must be < DS4_LAYER_SCALARS_COUNT to
-     *              activate the substrate; UINT32_MAX with bit31 clear
-     *              signals "no substrate", inline comp_row used).
+     * read the row index from a device-side uint32 the shim selects:
+     *   row_field == DS4_COMPRESSOR_ROW_COMP  -> &g_layer_dev[il].comp_row
+     *   row_field == DS4_COMPRESSOR_ROW_INDEX -> &g_layer_dev[il].index_row
+     * il >= DS4_LAYER_SCALARS_COUNT signals "no substrate"; the kernels
+     * fall back to the inline comp_row arg (decode2-exact path).
      *
      * The R5 audit gate `git grep ds4_gpu_tensor_view ds4_cuda.cu` within
      * this function body returns 0 hits after this commit. */
-    const uint32_t USE_INDEX_ROW_BIT = 0x80000000u;
-    const bool     use_index_row     = (il_for_decode1 & USE_INDEX_ROW_BIT) != 0u;
-    const uint32_t il_clean          = il_for_decode1 & ~USE_INDEX_ROW_BIT;
     const uint32_t *row_ptr_dev = NULL;
-    if (g_layer_dev != NULL && il_clean < DS4_LAYER_SCALARS_COUNT) {
-        row_ptr_dev = use_index_row
-            ? &g_layer_dev[il_clean].index_row
-            : &g_layer_dev[il_clean].comp_row;
+    if (g_layer_dev != NULL && il < DS4_LAYER_SCALARS_COUNT) {
+        row_ptr_dev = (row_field == DS4_COMPRESSOR_ROW_INDEX)
+            ? &g_layer_dev[il].index_row
+            : &g_layer_dev[il].comp_row;
     }
     compressor_update_pool_kernel<<<(head_dim + 255) / 256, 256, 0, ds4_current_stream()>>>(
             (float *)comp_cache->ptr,
