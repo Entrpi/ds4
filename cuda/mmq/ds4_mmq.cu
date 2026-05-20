@@ -765,6 +765,14 @@ extern "C" const void *ds4_mmvq_get_probe_pre_shared_ptr(void);
 extern "C" const void *ds4_mmvq_get_probe_post_shared_ptr(void);
 extern "C" const void *ds4_mmvq_get_probe_post_shuffle_ptr(void);
 
+/* Step 7 task #32: input-verification probe pointers from mmvq.cu.
+ * grid_hash = FNV-1a of the iq2xxs_grid table; weight_hash = FNV-1a of
+ * the IQ2_XXS weight blocks block (0,0,0) reads.  Each is a device uint64;
+ * dumped to slots 223/224 as a 2-float raw hash (a deterministic detector
+ * of whether the underlying uint64 differs across MATCH/MISS runs). */
+extern "C" const void *ds4_mmvq_get_probe_grid_hash_ptr(void);
+extern "C" const void *ds4_mmvq_get_probe_weight_hash_ptr(void);
+
 namespace {
 
 template <ggml_type type>
@@ -970,6 +978,16 @@ int ds4_mmq_moe_vec_impl(
                                         /*n_floats=*/1u,
                                         "MoE:warp0-post-shuffle",
                                         /*slot=*/222u);
+        // Task #32: hash the dot product's other two inputs (8-byte
+        // device uint64 each -> 2 floats).
+        ds4_cuda_dump_hash_raw_at_slot(ds4_mmvq_get_probe_grid_hash_ptr(),
+                                        /*n_floats=*/2u,
+                                        "MoE:iq2xxs-grid-hash",
+                                        /*slot=*/223u);
+        ds4_cuda_dump_hash_raw_at_slot(ds4_mmvq_get_probe_weight_hash_ptr(),
+                                        /*n_floats=*/2u,
+                                        "MoE:gate-weight-hash",
+                                        /*slot=*/224u);
     }
 
     return 0;

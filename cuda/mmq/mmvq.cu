@@ -441,6 +441,36 @@ extern "C" const void *ds4_mmvq_get_probe_post_shuffle_ptr(void) {
     return p;
 }
 
+// ds4 Step 7 task #32: input-verification probes.  Task #31 localised the
+// divergence to the K-loop -- each thread's partial sum (slot 220) differs
+// across processes despite identical Q8_1 input (slot 217).  The K-loop's
+// vec_dot_iq2_xxs_q8_1 reads exactly three inputs: the Q8_1 activations
+// (verified), the IQ2_XXS weight blocks, and the iq2xxs_grid lookup table.
+// These two probes hash the latter two at the point of use for block
+// (0,0,0), so we can prove whether the dot product's inputs are
+// byte-identical across MATCH and MISS processes.
+//   grid_hash:   FNV-1a over all 256 entries of iq2xxs_grid (the
+//                static const __device__ table).
+//   weight_hash: FNV-1a over the IQ2_XXS weight blocks block (0,0,0)
+//                actually reads -- blocks_per_row_x contiguous
+//                block_iq2_xxs starting at kbx_offset.
+// If either differs between MATCH and MISS, that input is the bug.  If
+// both match, the dot product has provably identical inputs and the
+// divergence is in kernel execution itself (codegen / hardware / driver).
+__device__ unsigned long long g_ds4_mmvq_probe_grid_hash[1];
+__device__ unsigned long long g_ds4_mmvq_probe_weight_hash[1];
+
+extern "C" const void *ds4_mmvq_get_probe_grid_hash_ptr(void) {
+    void *p = nullptr;
+    cudaGetSymbolAddress(&p, g_ds4_mmvq_probe_grid_hash);
+    return p;
+}
+extern "C" const void *ds4_mmvq_get_probe_weight_hash_ptr(void) {
+    void *p = nullptr;
+    cudaGetSymbolAddress(&p, g_ds4_mmvq_probe_weight_hash);
+    return p;
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -532,6 +562,34 @@ static __global__ void mul_mat_vec_q(
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+
+    // ds4 Step 7 task #32: hash the dot product's non-Q8_1 inputs for
+    // block (0,0,0).  iq2xxs_grid (the static const __device__ table) and
+    // the IQ2_XXS weight blocks this block reads.  If either differs
+    // across MATCH/MISS processes, that input is the bug; if both match,
+    // the divergence is in kernel execution, not the inputs.
+    if constexpr (type == GGML_TYPE_IQ2_XXS && ncols_dst == 1) {
+        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tid == 0) {
+            unsigned long long gh = 0xcbf29ce484222325ULL;
+#pragma unroll 1
+            for (int gi = 0; gi < 256; ++gi) {
+                gh ^= (unsigned long long) iq2xxs_grid[gi];
+                gh *= 0x100000001b3ULL;
+            }
+            g_ds4_mmvq_probe_grid_hash[0] = gh;
+
+            unsigned long long wh = 0xcbf29ce484222325ULL;
+            const unsigned char * wp =
+                (const unsigned char *) ((const block_iq2_xxs *) vx + kbx_offset);
+            const int wbytes = blocks_per_row_x * (int) sizeof(block_iq2_xxs);
+#pragma unroll 1
+            for (int wb = 0; wb < wbytes; ++wb) {
+                wh ^= (unsigned long long) wp[wb];
+                wh *= 0x100000001b3ULL;
+            }
+            g_ds4_mmvq_probe_weight_hash[0] = wh;
+        }
+    }
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
