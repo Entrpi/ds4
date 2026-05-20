@@ -12080,6 +12080,21 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
         else hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
         if (!hash) ok = 0;
     }
+    /* Step 7 task #35: router-arg probe.  On L0 (hash_mode), router_selected
+     * is a pure lookup hash[tok*6+j] -- it does NOT depend on logits/probs.
+     * So a bistable router_selected with bit-identical router_probs can only
+     * come from a divergent tok / hash pointer / hash_rows / mode.  Print the
+     * exact host-side args at capture/eager time so they can be diffed across
+     * processes.  Gated on DS4_CUDA_ROUTER_ARG_PROBE + L0. */
+    if (ok && g_dump_current_layer == 0 && getenv("DS4_CUDA_ROUTER_ARG_PROBE") != NULL) {
+        fprintf(stderr,
+                "DS4_ROUTER_ARG L0 capture_active=%d tok=%d hash_mode=%d has_bias=%d "
+                "hash_rows=%u hash_ptr=%p bias_ptr=%p selected_ptr=%p logits_ptr=%p\n",
+                ds4_capture_active() ? 1 : 0, (int)tok, hash_mode ? 1 : 0,
+                (has_bias && !hash_mode) ? 1 : 0, hash_rows, (const void *)hash,
+                (const void *)bias, (const void *)selected->ptr, (const void *)logits->ptr);
+        fflush(stderr);
+    }
     if (ok) {
         if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
             getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
