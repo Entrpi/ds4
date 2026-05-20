@@ -9838,6 +9838,10 @@ static bool metal_graph_encode_decode_layer_impl(
     }
     DS4_METAL_PROFILE_DECODE_STAGE("compressor_indexer");
 
+    /* Step 7 task #39: dump the device decode_scalars (raw window state)
+     * from inside layer 5's captured body -- on replay slots 280-283 show
+     * whether raw_start/n_raw are live across the pos=128 SWA boundary. */
+    if (ok && il == 5u) ds4_cuda_decode_scalars_probe(280u);
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
         /* Step 4a + 4c A1: n_raw and raw_start are token-stable (same

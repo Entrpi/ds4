@@ -299,6 +299,12 @@ void ds4_cuda_dump_hash_at_slot(const ds4_gpu_tensor *tensor,
                                   uint32_t slot);
 void ds4_cuda_dump_hash_flush(uint32_t pos);
 
+/* Step 7 task #39: device-side decode_scalars probe.  Dumps the live
+ * g_decode_dev pos0/raw_row/raw_start/n_raw into slots slot0..slot0+3.
+ * Recorded into the captured layer graph so replay tokens show what the
+ * captured attention/KV kernels read.  Metal stubs as a no-op. */
+void ds4_cuda_decode_scalars_probe(uint32_t slot0);
+
 /* Step 7 narrowing: routed-MoE branch tag + tag-write helper.  Used to
  * record which of the three routed-MoE dispatch paths (1=MMVQ-decode,
  * 2=MMQ-batch, 3=legacy) actually ran for the most recent call, and

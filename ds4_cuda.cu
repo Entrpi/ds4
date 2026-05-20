@@ -8961,6 +8961,33 @@ extern "C" void ds4_cuda_emit_row_probe(
             slot_row, slot_hash);
 }
 
+/* Step 7 task #39: device-side decode_scalars probe.  Reads the live
+ * device mirror (g_decode_dev) of pos0/raw_row/raw_start/n_raw into four
+ * consecutive slots.  Recorded into the captured layer graph so on
+ * replay the slots reflect what the captured attention/KV kernels see
+ * for the raw-KV sliding window -- answers whether raw_start is live on
+ * replay across the pos=128 SWA-saturation boundary. */
+__global__ static void ds4_decode_scalars_probe_kernel(
+        const struct ds4_decode_scalars *s, uint32_t slot0) {
+    if (threadIdx.x != 0 || blockIdx.x != 0 || !s) return;
+    if (slot0 + 3u >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    g_dump_hashes_dev[slot0 + 0] = (uint64_t)s->pos0;
+    g_dump_hashes_dev[slot0 + 1] = (uint64_t)s->raw_row;
+    g_dump_hashes_dev[slot0 + 2] = (uint64_t)s->raw_start;
+    g_dump_hashes_dev[slot0 + 3] = (uint64_t)s->n_raw;
+}
+
+extern "C" void ds4_cuda_decode_scalars_probe(uint32_t slot0) {
+    if (!ds4_cuda_dump_hash_enabled() || g_decode_dev == NULL) return;
+    if (slot0 + 3u >= DS4_CUDA_DUMP_HASH_SLOTS) return;
+    g_dump_labels[slot0 + 0] = "ds.pos0";
+    g_dump_labels[slot0 + 1] = "ds.raw_row";
+    g_dump_labels[slot0 + 2] = "ds.raw_start";
+    g_dump_labels[slot0 + 3] = "ds.n_raw";
+    ds4_decode_scalars_probe_kernel<<<1, 1, 0, ds4_current_stream()>>>(
+            g_decode_dev, slot0);
+}
+
 /* Step 7 deep-narrowing: one-shot probe-slot handoff between TUs.
  *
  * Background: the routed-MoE intra-branch probes (slots 213-216) showed

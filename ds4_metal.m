@@ -446,6 +446,10 @@ void ds4_cuda_dump_hash_flush(uint32_t pos) {
     (void)pos;
 }
 
+void ds4_cuda_decode_scalars_probe(uint32_t slot0) {
+    (void)slot0;
+}
+
 int ds4_cuda_dump_get_last_moe_branch(void) {
     return 0;
 }
