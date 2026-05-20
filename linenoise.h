@@ -102,6 +102,7 @@ char *linenoiseEditFeed(struct linenoiseState *l);
 char *linenoiseEditFeedByte(struct linenoiseState *l, char c);
 int linenoiseEditQueueInput(struct linenoiseState *l, const char *buf, size_t len);
 size_t linenoiseEditQueuedInput(struct linenoiseState *l);
+void linenoiseEditClear(struct linenoiseState *l);
 int linenoiseEditSetStatus(struct linenoiseState *l, const char *status,
                            const char *start_escape, const char *end_escape);
 void linenoiseEditSetLayoutCallback(struct linenoiseState *l,

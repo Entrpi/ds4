@@ -1549,6 +1549,19 @@ void linenoiseShow(struct linenoiseState *l) {
     }
 }
 
+/* Clear the live nonblocking edit buffer and redraw the prompt/status.  This is
+ * used by clients that want Ctrl+C to cancel the current edit without tearing
+ * down the line editor. */
+void linenoiseEditClear(struct linenoiseState *l) {
+    l->buf[0] = '\0';
+    l->len = 0;
+    l->pos = 0;
+    l->oldpos = 0;
+    l->in_completion = 0;
+    linenoiseFoldClear(l);
+    refreshLine(l);
+}
+
 /* Grow the editing buffer if this state owns a growable buffer. Only the
  * blocking linenoise() API sets buflen_max: the multiplexing API still uses
  * the caller-provided fixed buffer. */

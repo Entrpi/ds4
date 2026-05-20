@@ -1451,7 +1451,14 @@ static void agent_tool_viz_start(agent_stream_renderer *sr) {
          * because it may erase already-rendered backlog. */
         agent_tool_viz_puts(sr, "\r\x1b[2K");
     }
+    v->last_output_newline = true;
+}
+
+static void agent_tool_viz_line_prefix(agent_stream_renderer *sr) {
+    agent_tool_visualizer *v = &sr->viz;
+    if (!v->last_output_newline) agent_tool_viz_puts(sr, "\n");
     agent_tool_viz_puts(sr, "🛠️ ");
+    v->at_line_start = false;
 }
 
 static const char *agent_tool_viz_prefix(const char *name) {
@@ -1470,15 +1477,14 @@ static void agent_tool_viz_tool(agent_stream_renderer *sr, const char *name) {
     snprintf(v->tool_name, sizeof(v->tool_name), "%s", name ? name : "tool");
     v->tool_announced = true;
     v->read_style = !strcmp(v->tool_name, "read");
+    agent_tool_viz_line_prefix(sr);
     if (v->read_style) {
-        if (!v->last_output_newline) agent_tool_viz_puts(sr, "\n");
         renderer_color(sr->renderer, "\x1b[1;37m");
         agent_tool_viz_puts(sr, "Reading ");
         renderer_color(sr->renderer, "\x1b[32m");
         v->read_prefix_rendered = true;
         return;
     }
-    v->at_line_start = false;
     renderer_color(sr->renderer, !strcmp(v->tool_name, "bash") ?
                                 "\x1b[1;36m" : "\x1b[1;37m");
     const char *prefix = agent_tool_viz_prefix(v->tool_name);
@@ -1517,7 +1523,7 @@ static void agent_tool_viz_render_read(agent_stream_renderer *sr) {
     if (!v->read_style || v->read_line_rendered) return;
 
     if (!v->read_prefix_rendered) {
-        if (!v->last_output_newline) agent_tool_viz_puts(sr, "\n");
+        agent_tool_viz_line_prefix(sr);
         renderer_color(sr->renderer, "\x1b[1;37m");
         agent_tool_viz_puts(sr, "Reading ");
         renderer_color(sr->renderer, "\x1b[32m");
@@ -6192,6 +6198,21 @@ static void editor_write_async(agent_editor *ed, const char *text, size_t len,
     }
 }
 
+/* Ctrl+C while idle is an edit-cancel key, not an exit key.  Clear the real
+ * linenoise buffer so stale text cannot be submitted later, then leave a short
+ * visible hint about the explicit EOF exit path. */
+static void editor_cancel_input_with_hint(agent_editor *ed,
+                                          const char *prompt,
+                                          const char *status) {
+    if (!ed->active) return;
+    if (ed->hidden) editor_show(ed);
+    linenoiseEditClear(&ed->edit);
+    const char *msg = stdout_is_tty() ?
+        "\x1b[1;33mpress Ctrl+D to exit\x1b[0m\n" :
+        "press Ctrl+D to exit\n";
+    editor_write_async(ed, msg, strlen(msg), prompt, status, true);
+}
+
 static void runtime_help(void) {
     puts("Commands:");
     puts("  /help        Show this help.");
@@ -6203,7 +6224,8 @@ static void runtime_help(void) {
     puts("  /history [N] Show N recent user turns from the current session.");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
-    puts("  Ctrl+C       Interrupt generation; exit from an idle prompt.");
+    puts("  Ctrl+C       Interrupt generation; clear edited text.");
+    puts("  Ctrl+D       Exit from an empty prompt.");
 }
 
 static void agent_format_ctx_size(int ctx_size, char *buf, size_t len) {
@@ -6380,7 +6402,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         if (agent_sigint) {
             agent_sigint = 0;
             if (worker_is_idle(&worker)) {
-                running = false;
+                editor_cancel_input_with_hint(&editor, prompt, statusline);
             } else {
                 worker_interrupt(&worker);
             }
@@ -6442,7 +6464,11 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                 /* Still editing. */
             } else if (!line) {
                 if (errno == EAGAIN) {
-                    if (!worker_is_idle(&worker)) worker_interrupt(&worker);
+                    if (!worker_is_idle(&worker)) {
+                        worker_interrupt(&worker);
+                    } else {
+                        editor_cancel_input_with_hint(&editor, prompt, statusline);
+                    }
                 } else {
                     running = false;
                 }
