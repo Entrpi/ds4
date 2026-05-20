@@ -10025,6 +10025,23 @@ static bool metal_graph_encode_decode_layer_impl(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
+    /* Step 7 task #32: router probes.  task #32's slot-224 weight-byte
+     * hash showed the matvec reads DIFFERENT experts across MATCH/MISS
+     * runs (kbx_offset = ids[0]*stride).  That points the divergence at
+     * the router, upstream of the matvec.  Probe ffn_norm (router input),
+     * router_logits (matmul output), router_probs, router_selected (the
+     * expert ids -- int32, hashed raw), and router_weights.  Whichever is
+     * the first to differ between MATCH and MISS localises the bug:
+     *   ffn_norm differs       -> divergence is even further upstream
+     *   ffn_norm same, logits differ -> router matmul non-deterministic
+     *   logits same, selected differ -> top-k selection (tie-break?) bug */
+    if (ok && dump_this_layer) {
+        ds4_cuda_dump_hash_at_slot(g->ffn_norm, DS4_N_EMBD, "L0:ffn_norm-router-input", 229);
+        ds4_cuda_dump_hash_at_slot(g->router_logits, DS4_N_EXPERT, "L0:router_logits", 225);
+        ds4_cuda_dump_hash_at_slot(g->router_probs, DS4_N_EXPERT, "L0:router_probs", 226);
+        ds4_cuda_dump_hash_at_slot(g->router_selected, DS4_N_EXPERT_USED, "L0:router_selected", 227);
+        ds4_cuda_dump_hash_at_slot(g->router_weights, DS4_N_EXPERT_USED, "L0:router_weights", 228);
+    }
     if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
