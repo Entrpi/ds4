@@ -135,6 +135,25 @@ static inline int ds4_capture_active(void) {
     return t_ds4_capture_stream != (cudaStream_t)0;
 }
 
+/* Step 7 task #34: stream selector for MMQ wrapper calls.
+ *
+ * Several MMQ wrapper calls (ds4_mmq_q8_0_dense, ds4_mmq_*_moe_pair,
+ * ds4_mmq_*_moe) historically pass a literal 0 (the legacy default
+ * stream) as their stream argument.  That is fine outside capture, but
+ * under an active outer layer-graph capture it lets the launched
+ * kernels ESCAPE the capture: they run on stream 0 instead of the
+ * capture stream, so the captured graph records them without the
+ * correct dependency edges relative to the rest of the layer body.
+ * On replay that produces a stale read -- the Step 7 task #33 root
+ * cause (router_selected bistable when L0 is captured, 8/8 stable when
+ * L0 runs eager).
+ *
+ * Returns the capture stream when a capture is active, else 0 (the
+ * prior default-stream behaviour, byte-for-byte unchanged off-capture). */
+static inline cudaStream_t ds4_mmq_stream_for_call(void) {
+    return ds4_capture_active() ? ds4_current_stream() : (cudaStream_t)0;
+}
+
 /* --------------------------------------------------------------------
  * Device-side decode scalars (Step A.2: full-layer graphs).
  *
@@ -9513,7 +9532,8 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
      * for any odd shapes. */
     if (ds4_cuda_use_mmq() && (in_dim % 256u == 0) && n_tok > 0) {
         int rc = ds4_mmq_q8_0_dense(wptr, (const float *)x->ptr, (float *)out->ptr,
-                                    (int)out_dim, (int)n_tok, (int)in_dim, /*stream=*/0);
+                                    (int)out_dim, (int)n_tok, (int)in_dim,
+                                    /*stream=*/ds4_mmq_stream_for_call());
         if (rc == 0) return 1;
         /* On failure, fall through to the legacy paths below. */
         fprintf(stderr, "ds4: ds4_mmq_q8_0_dense returned %d (label='%s' in=%llu out=%llu n_tok=%llu); falling back\n",
@@ -14788,7 +14808,8 @@ static int routed_moe_launch(
                                        (float *)gate->ptr, (float *)up->ptr,
                                        (int)expert_mid_dim, (int)expert_in_dim,
                                        (int)n_tokens, (int)n_experts_total,
-                                       (int)n_expert_used, /*stream=*/0);
+                                       (int)n_expert_used,
+                                       /*stream=*/ds4_mmq_stream_for_call());
             if (rc != 0) {
                 fprintf(stderr, "ds4: ds4_mmq_q4_K_moe_pair (gate+up) returned %d; falling back\n", rc);
                 goto mmq_moe_fallback;
@@ -14799,7 +14820,8 @@ static int routed_moe_launch(
                                           (float *)gate->ptr, (float *)up->ptr,
                                           (int)expert_mid_dim, (int)expert_in_dim,
                                           (int)n_tokens, (int)n_experts_total,
-                                          (int)n_expert_used, /*stream=*/0);
+                                          (int)n_expert_used,
+                                          /*stream=*/ds4_mmq_stream_for_call());
             if (rc != 0) {
                 fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe_pair (gate+up) returned %d; falling back\n", rc);
                 goto mmq_moe_fallback;
@@ -14823,7 +14845,8 @@ static int routed_moe_launch(
             rc = ds4_mmq_q4_K_moe(down_w, (const float *)mid->ptr, (const int32_t *)selected->ptr,
                                   (float *)down->ptr,
                                   (int)out_dim, (int)expert_mid_dim,
-                                  (int)n_assignments, (int)n_experts_total, /*n_expert_used=*/1, /*stream=*/0);
+                                  (int)n_assignments, (int)n_experts_total, /*n_expert_used=*/1,
+                                  /*stream=*/ds4_mmq_stream_for_call());
             if (rc != 0) {
                 fprintf(stderr, "ds4: ds4_mmq_q4_K_moe (down) returned %d; falling back\n", rc);
                 goto mmq_moe_fallback;
@@ -14832,7 +14855,8 @@ static int routed_moe_launch(
             rc = ds4_mmq_q2_K_moe(down_w, (const float *)mid->ptr, (const int32_t *)selected->ptr,
                                   (float *)down->ptr,
                                   (int)out_dim, (int)expert_mid_dim,
-                                  (int)n_assignments, (int)n_experts_total, /*n_expert_used=*/1, /*stream=*/0);
+                                  (int)n_assignments, (int)n_experts_total, /*n_expert_used=*/1,
+                                  /*stream=*/ds4_mmq_stream_for_call());
             if (rc != 0) {
                 fprintf(stderr, "ds4: ds4_mmq_q2_K_moe (down) returned %d; falling back\n", rc);
                 goto mmq_moe_fallback;
@@ -14866,7 +14890,13 @@ mmq_moe_fallback:
     if (down->bytes >= xq_bytes && gate->bytes >= midq_bytes) {
         cuda_block_q8_K *xq = (cuda_block_q8_K *)down->ptr;
         cuda_block_q8_K *midq = (cuda_block_q8_K *)gate->ptr;
-        const uint32_t profile_moe = getenv("DS4_CUDA_MOE_PROFILE") != NULL;
+        /* Step 7 task #34: never create the profiling events under an
+         * active layer-graph capture.  The cudaEventRecord(..., 0) calls
+         * downstream record onto the legacy default stream; under capture
+         * that either escapes the capture or aborts it.  prof_ev stays
+         * all-NULL so every `if (prof_ev[i])` event-record is a no-op. */
+        const uint32_t profile_moe = (getenv("DS4_CUDA_MOE_PROFILE") != NULL)
+                                     && !ds4_capture_active();
         cudaEvent_t prof_ev[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
         if (profile_moe) {
             for (uint32_t i = 0; i < 7u; i++) {
