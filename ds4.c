@@ -13080,6 +13080,16 @@ static bool metal_graph_encode_token_raw_swa(
         skip_l0_init = 1;
         skip_l0 = (getenv("DS4_CUDA_LAYER_GRAPHS_SKIP_LAYER0") != NULL) ? 1 : 0;
     }
+    /* Step 7 task #38 diagnostic: DS4_CUDA_LAYER_GRAPHS_SKIP_EMIT=1 forces
+     * every ratio-emit layer-step (flags bit 0) to run eager.  If ON
+     * determinism returns with this set, the captured FP8-KV-emit body is
+     * the residual non-determinism source. */
+    static int skip_emit_init = 0;
+    static int skip_emit = 0;
+    if (!skip_emit_init) {
+        skip_emit_init = 1;
+        skip_emit = (getenv("DS4_CUDA_LAYER_GRAPHS_SKIP_EMIT") != NULL) ? 1 : 0;
+    }
 
     /* PC5 metadata that the cache key consumes: decode_top_k is config-
      * stable per session (cheap to recompute each loop iteration but
@@ -13092,9 +13102,9 @@ static bool metal_graph_encode_token_raw_swa(
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         int rc = -1;
-        if (layer_graphs && !(skip_l0 && il == 0u)) {
-            const uint32_t il_ratio = ds4_layer_compress_ratio(il);
-            const bool emit_il      = (il_ratio != 0u) && (((pos + 1u) % il_ratio) == 0u);
+        const uint32_t il_ratio = ds4_layer_compress_ratio(il);
+        const bool emit_il      = (il_ratio != 0u) && (((pos + 1u) % il_ratio) == 0u);
+        if (layer_graphs && !(skip_l0 && il == 0u) && !(skip_emit && emit_il)) {
             const bool compressed   = il_ratio != 0u;
             const bool ratio4       = il_ratio == 4u;
             const bool indexed_act  = compressed && g->layer_n_comp[il] > decode_top_k;
