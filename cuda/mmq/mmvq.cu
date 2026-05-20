@@ -391,86 +391,6 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     return 1;
 }
 
-// ds4 Step 7 task #31: per-warp partial-sum probes inside mul_mat_vec_q.
-//
-// The decisive finding from task #30 is that mul_mat_vec_q for IQ2_XXS
-// at (ncols_dst=1, rows_per_cuda_block=1, nwarps=4) is BISTABLE under
-// outer layer-graph capture: identical inputs (slot 217 q81 hash matches)
-// produce one of exactly two stable outputs at slot 213.  Source
-// inspection ruled out atomics/races in the cross-warp reduction (it's
-// fixed-order with __syncthreads).  To localise the bug, capture the
-// per-thread tmp[0][0] value at three points for block (0,0,0):
-//
-//   pre_shared:  all 4 warps x 32 lanes, immediately after K-loop, before
-//                shared-mem write.  If different across MATCH and MISS
-//                runs at this point, the K-loop / vec_dot_iq2_xxs_q8_1
-//                produces different partials despite identical inputs.
-//   post_shared: warp 0's 32 lanes, after accumulating tmp_shared[0..nwarps-2]
-//                but before warp_reduce_sum.  If pre_shared matches but
-//                post_shared differs, the shared-mem reduction is the bug.
-//   post_shuffle: lane 0 of warp 0, after warp_reduce_sum.  If post_shared
-//                 matches but post_shuffle differs, the warp shuffle is
-//                 the bug.
-//
-// Globals are unconditionally overwritten for block (0,0,0) on each kernel
-// launch.  Host captures the values via cudaGetSymbolAddress + the existing
-// dump_hash_raw_at_slot mechanism, called right after the matvec dispatch
-// in ds4_mmq_moe_vec_impl.  Subsequent matvec invocations (up, down, next
-// layer) overwrite the globals, but the gate-call probe was already
-// captured.
-//
-// Only writes when ncols_dst==1 && rows_per_cuda_block==1 to avoid
-// touching the multi-token / multi-row paths used by MMQ-batch.
-__device__ float g_ds4_mmvq_probe_pre_shared[4 * 32];   // 4 warps x 32 lanes
-__device__ float g_ds4_mmvq_probe_post_shared[32];      // warp 0 lanes
-__device__ float g_ds4_mmvq_probe_post_shuffle[1];      // final value
-
-extern "C" const void *ds4_mmvq_get_probe_pre_shared_ptr(void) {
-    void *p = nullptr;
-    cudaGetSymbolAddress(&p, g_ds4_mmvq_probe_pre_shared);
-    return p;
-}
-extern "C" const void *ds4_mmvq_get_probe_post_shared_ptr(void) {
-    void *p = nullptr;
-    cudaGetSymbolAddress(&p, g_ds4_mmvq_probe_post_shared);
-    return p;
-}
-extern "C" const void *ds4_mmvq_get_probe_post_shuffle_ptr(void) {
-    void *p = nullptr;
-    cudaGetSymbolAddress(&p, g_ds4_mmvq_probe_post_shuffle);
-    return p;
-}
-
-// ds4 Step 7 task #32: input-verification probes.  Task #31 localised the
-// divergence to the K-loop -- each thread's partial sum (slot 220) differs
-// across processes despite identical Q8_1 input (slot 217).  The K-loop's
-// vec_dot_iq2_xxs_q8_1 reads exactly three inputs: the Q8_1 activations
-// (verified), the IQ2_XXS weight blocks, and the iq2xxs_grid lookup table.
-// These two probes hash the latter two at the point of use for block
-// (0,0,0), so we can prove whether the dot product's inputs are
-// byte-identical across MATCH and MISS processes.
-//   grid_hash:   FNV-1a over all 256 entries of iq2xxs_grid (the
-//                static const __device__ table).
-//   weight_hash: FNV-1a over the IQ2_XXS weight blocks block (0,0,0)
-//                actually reads -- blocks_per_row_x contiguous
-//                block_iq2_xxs starting at kbx_offset.
-// If either differs between MATCH and MISS, that input is the bug.  If
-// both match, the dot product has provably identical inputs and the
-// divergence is in kernel execution itself (codegen / hardware / driver).
-__device__ unsigned long long g_ds4_mmvq_probe_grid_hash[1];
-__device__ unsigned long long g_ds4_mmvq_probe_weight_hash[1];
-
-extern "C" const void *ds4_mmvq_get_probe_grid_hash_ptr(void) {
-    void *p = nullptr;
-    cudaGetSymbolAddress(&p, g_ds4_mmvq_probe_grid_hash);
-    return p;
-}
-extern "C" const void *ds4_mmvq_get_probe_weight_hash_ptr(void) {
-    void *p = nullptr;
-    cudaGetSymbolAddress(&p, g_ds4_mmvq_probe_weight_hash);
-    return p;
-}
-
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
@@ -563,34 +483,6 @@ static __global__ void mul_mat_vec_q(
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
 
-    // ds4 Step 7 task #32: hash the dot product's non-Q8_1 inputs for
-    // block (0,0,0).  iq2xxs_grid (the static const __device__ table) and
-    // the IQ2_XXS weight blocks this block reads.  If either differs
-    // across MATCH/MISS processes, that input is the bug; if both match,
-    // the divergence is in kernel execution, not the inputs.
-    if constexpr (type == GGML_TYPE_IQ2_XXS && ncols_dst == 1) {
-        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tid == 0) {
-            unsigned long long gh = 0xcbf29ce484222325ULL;
-#pragma unroll 1
-            for (int gi = 0; gi < 256; ++gi) {
-                gh ^= (unsigned long long) iq2xxs_grid[gi];
-                gh *= 0x100000001b3ULL;
-            }
-            g_ds4_mmvq_probe_grid_hash[0] = gh;
-
-            unsigned long long wh = 0xcbf29ce484222325ULL;
-            const unsigned char * wp =
-                (const unsigned char *) ((const block_iq2_xxs *) vx + kbx_offset);
-            const int wbytes = blocks_per_row_x * (int) sizeof(block_iq2_xxs);
-#pragma unroll 1
-            for (int wb = 0; wb < wbytes; ++wb) {
-                wh ^= (unsigned long long) wp[wb];
-                wh *= 0x100000001b3ULL;
-            }
-            g_ds4_mmvq_probe_weight_hash[0] = wh;
-        }
-    }
-
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
 
@@ -619,15 +511,6 @@ static __global__ void mul_mat_vec_q(
         (void) tmp_shared_gate;
     } else if (!use_gate) {
         (void) tmp_shared_gate;
-    }
-
-    // ds4 Step 7 task #31 PROBE 1: per-thread tmp[0][0] just after K-loop,
-    // before any cross-warp communication.  Only block (0,0,0), only the
-    // ncols_dst=1, rows_per_cuda_block=1 case (IQ2_XXS decode).
-    if constexpr (ncols_dst == 1 && (calc_rows_per_block(ncols_dst, table_id, small_k, nwarps)) == 1) {
-        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-            g_ds4_mmvq_probe_pre_shared[threadIdx.y * warp_size + threadIdx.x] = tmp[0][0];
-        }
     }
 
     if (threadIdx.y > 0) {
@@ -665,21 +548,7 @@ static __global__ void mul_mat_vec_q(
                     }
                 }
             }
-            // ds4 Step 7 task #31 PROBE 2: warp 0's tmp[0][0] after the
-            // cross-warp accumulator loop, BEFORE warp_reduce_sum.
-            if constexpr (ncols_dst == 1 && (calc_rows_per_block(ncols_dst, table_id, small_k, nwarps)) == 1) {
-                if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
-                    g_ds4_mmvq_probe_post_shared[threadIdx.x] = tmp[0][0];
-                }
-            }
             tmp[j][i] = warp_reduce_sum<warp_size>(tmp[j][i]);
-            // ds4 Step 7 task #31 PROBE 3: warp 0 lane 0 final value
-            // AFTER warp_reduce_sum, before the dst write / fusion.
-            if constexpr (ncols_dst == 1 && (calc_rows_per_block(ncols_dst, table_id, small_k, nwarps)) == 1) {
-                if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0) {
-                    g_ds4_mmvq_probe_post_shuffle[0] = tmp[0][0];
-                }
-            }
             if constexpr (has_fusion) {
                 if (use_gate) {
                     tmp_gate[j][i] = warp_reduce_sum<warp_size>(tmp_gate[j][i]);
@@ -926,71 +795,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return;
     }
 
-    // ds4 Step 7 task #30: env-gated alternate route for has_ids &&
-    // ncols_dst==1 (the routed-MoE decode case).  Default routes through
-    // mul_mat_vec_q_switch_fusion below, which on Blackwell sm_120 with
-    // IQ2_XXS uses a multi-warp shared-memory reduction whose result has
-    // shown captured-replay non-determinism (slot 213, ~80% match under
-    // task #29 persistent buffer mitigation; ~20% residual miss).  When
-    // DS4_CUDA_MMVQ_FORCE_MOE_LAUNCH=1, route this case to the dedicated
-    // moe kernel above instead -- it's a single-warp reduction per block
-    // (block_dim.x = warp_size, ncols_dst = 1) and has no cross-warp
-    // shared-mem atomics.  If this closes the 20% residual mismatch, the
-    // bug is in the cross-warp reduction path; if it doesn't, look
-    // elsewhere.
-    if (has_ids && ncols_dst == 1) {
-        static int ds4_force_moe_launch_init = 0;
-        static int ds4_force_moe_launch_en   = 0;
-        if (!ds4_force_moe_launch_init) {
-            ds4_force_moe_launch_init = 1;
-            ds4_force_moe_launch_en = (getenv("DS4_CUDA_MMVQ_FORCE_MOE_LAUNCH") != nullptr) ? 1 : 0;
-        }
-        if (ds4_force_moe_launch_en) {
-            mul_mat_vec_q_moe_launch<type>(
-                vx, vy, ids, dst, ncols_x, nchannels_y_fd, nrows_x,
-                stride_row_x, stride_col_y, stride_col_dst,
-                stride_channel_x, stride_channel_y, stride_channel_dst,
-                ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
-            return;
-        }
-    }
-
     switch (ncols_dst) {
         case 1: {
             constexpr int c_ncols_dst = 1;
 
             bool use_small_k = should_use_small_k(c_ncols_dst);
 
-            // ds4 Step 7 task #30: log launch shape + pointer low bits when
-            // DS4_CUDA_MMVQ_DEBUG_LOG=1.  Fires once per (vx, vy, dst) triple
-            // (best-effort dedup via a tiny static cache) to keep volume
-            // manageable across the per-token decode loop.  Compare logs
-            // between a "good" (matches OFF) and "bad" (mismatch) process
-            // to see if launch dims or pointer alignment correlate with
-            // the attractor state.
-            static int ds4_debug_log_init = 0;
-            static int ds4_debug_log_en   = 0;
-            if (!ds4_debug_log_init) {
-                ds4_debug_log_init = 1;
-                ds4_debug_log_en = (getenv("DS4_CUDA_MMVQ_DEBUG_LOG") != nullptr) ? 1 : 0;
-            }
-
             if (use_small_k) {
                 std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                         nsamples_dst, warp_size, table_id, true);
-                if (ds4_debug_log_en && has_ids) {
-                    fprintf(stderr,
-                            "DS4_MMVQ_LOG type=%d small_k=1 ncols_dst=%d nrows_x=%d nchannels_dst=%d "
-                            "block=(%u,%u,%u) grid=(%u,%u,%u) "
-                            "vx_lo=0x%08lx vy_lo=0x%08lx ids_lo=0x%08lx dst_lo=0x%08lx\n",
-                            (int)type, c_ncols_dst, nrows_x, nchannels_dst,
-                            dims.second.x, dims.second.y, dims.second.z,
-                            dims.first.x, dims.first.y, dims.first.z,
-                            (uintptr_t)vx & 0xfffffffful,
-                            (uintptr_t)vy & 0xfffffffful,
-                            (uintptr_t)ids & 0xfffffffful,
-                            (uintptr_t)dst & 0xfffffffful);
-                }
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst, true>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
@@ -999,19 +812,6 @@ static void mul_mat_vec_q_switch_ncols_dst(
             } else {
                 std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                         nsamples_dst, warp_size, table_id);
-                if (ds4_debug_log_en && has_ids) {
-                    fprintf(stderr,
-                            "DS4_MMVQ_LOG type=%d small_k=0 ncols_dst=%d nrows_x=%d nchannels_dst=%d "
-                            "block=(%u,%u,%u) grid=(%u,%u,%u) "
-                            "vx_lo=0x%08lx vy_lo=0x%08lx ids_lo=0x%08lx dst_lo=0x%08lx\n",
-                            (int)type, c_ncols_dst, nrows_x, nchannels_dst,
-                            dims.second.x, dims.second.y, dims.second.z,
-                            dims.first.x, dims.first.y, dims.first.z,
-                            (uintptr_t)vx & 0xfffffffful,
-                            (uintptr_t)vy & 0xfffffffful,
-                            (uintptr_t)ids & 0xfffffffful,
-                            (uintptr_t)dst & 0xfffffffful);
-                }
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst>(
                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,

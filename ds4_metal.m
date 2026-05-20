@@ -425,64 +425,6 @@ void ds4_cuda_layer_graph_debug_peek(const char *label) {
     (void)label;  /* Step 6 diagnostic; CUDA-only. */
 }
 
-void ds4_cuda_dump_hash_reset(void) {
-    /* Step 7 hash dump; CUDA-only. */
-}
-
-void ds4_cuda_dump_hash_after(const ds4_gpu_tensor *tensor,
-                                uint64_t n_elem,
-                                const char *label) {
-    (void)tensor; (void)n_elem; (void)label;
-}
-
-void ds4_cuda_dump_hash_at_slot(const ds4_gpu_tensor *tensor,
-                                  uint64_t n_elem,
-                                  const char *label,
-                                  uint32_t slot) {
-    (void)tensor; (void)n_elem; (void)label; (void)slot;
-}
-
-void ds4_cuda_dump_hash_flush(uint32_t pos) {
-    (void)pos;
-}
-
-void ds4_cuda_decode_scalars_probe(uint32_t slot0) {
-    (void)slot0;
-}
-
-int ds4_cuda_dump_get_last_moe_branch(void) {
-    return 0;
-}
-
-void ds4_cuda_dump_set_last_moe_branch(int b) {
-    (void)b;
-}
-
-void ds4_cuda_dump_tag_at_slot(uint32_t tag, const char *label, uint32_t slot) {
-    (void)tag; (void)label; (void)slot;
-}
-
-void ds4_cuda_dump_set_current_layer(int il) {
-    (void)il;
-}
-
-int ds4_cuda_dump_get_current_layer(void) {
-    return -1;
-}
-
-void ds4_cuda_dump_probe_slot_set(uint32_t slot) {
-    (void)slot;
-}
-
-uint32_t ds4_cuda_dump_probe_slot_consume(void) {
-    return 0;
-}
-
-void ds4_cuda_dump_hash_raw_at_slot(const void *buf, uint64_t n_floats,
-                                      const char *label, uint32_t slot) {
-    (void)buf; (void)n_floats; (void)label; (void)slot;
-}
-
 static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     int ok = 1;
     for (id<MTLCommandBuffer> pending in g_pending_cbs) {

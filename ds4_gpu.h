@@ -280,52 +280,6 @@ void ds4_cuda_layer_graph_end_or_commit(uint32_t il);
  * Used to bisect capture-mode incompatibilities by call site. */
 void ds4_cuda_layer_graph_debug_peek(const char *label);
 
-/* Step 7 per-kernel hash dump (DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1).
- * Used to bisect the captured-vs-eager output divergence by hashing
- * each shim's primary output buffer and printing the per-token table.
- * - dump_hash_reset: clear the slot table; called once per token.
- * - dump_hash_after: launch FNV-1a kernel on `tensor->ptr` for the next
- *                    slot and record `label` for it.
- * - dump_hash_flush: sync, copy hashes to host, print one line per slot
- *                    used this token: "DS4_HASH pos=N slot=I hexhash label".
- * Metal stubs all three as no-ops. */
-void ds4_cuda_dump_hash_reset(void);
-void ds4_cuda_dump_hash_after(const ds4_gpu_tensor *tensor,
-                                uint64_t n_elem,
-                                const char *label);
-void ds4_cuda_dump_hash_at_slot(const ds4_gpu_tensor *tensor,
-                                  uint64_t n_elem,
-                                  const char *label,
-                                  uint32_t slot);
-void ds4_cuda_dump_hash_flush(uint32_t pos);
-
-/* Step 7 task #39: device-side decode_scalars probe.  Dumps the live
- * g_decode_dev pos0/raw_row/raw_start/n_raw into slots slot0..slot0+3.
- * Recorded into the captured layer graph so replay tokens show what the
- * captured attention/KV kernels read.  Metal stubs as a no-op. */
-void ds4_cuda_decode_scalars_probe(uint32_t slot0);
-
-/* Step 7 narrowing: routed-MoE branch tag + tag-write helper.  Used to
- * record which of the three routed-MoE dispatch paths (1=MMVQ-decode,
- * 2=MMQ-batch, 3=legacy) actually ran for the most recent call, and
- * to record categorical values into a hash dump slot. */
-int  ds4_cuda_dump_get_last_moe_branch(void);
-void ds4_cuda_dump_set_last_moe_branch(int b);
-void ds4_cuda_dump_tag_at_slot(uint32_t tag, const char *label, uint32_t slot);
-
-/* Step 7 deep-narrowing: cross-TU one-shot probe-slot handoff.
- * ds4.c sets the current layer; ds4_cuda.cu's MMVQ-decode branch sets
- * the probe slot (only when current layer == 0); ds4_mmq.cu consumes
- * it after the internal Q8_1 quantize and dumps src1_q8_1 to that slot.
- * The raw helper accepts a raw void* + n_floats for buffers that don't
- * have a ds4_gpu_tensor wrapper. */
-void     ds4_cuda_dump_set_current_layer(int il);
-int      ds4_cuda_dump_get_current_layer(void);
-void     ds4_cuda_dump_probe_slot_set(uint32_t slot);
-uint32_t ds4_cuda_dump_probe_slot_consume(void);
-void     ds4_cuda_dump_hash_raw_at_slot(const void *buf, uint64_t n_floats,
-                                          const char *label, uint32_t slot);
-
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);

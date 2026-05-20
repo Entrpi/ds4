@@ -6786,22 +6786,6 @@ __device__ __forceinline__ static bool router_score_better(float av, uint32_t ai
     return av > bv || (av == bv && ai < bi);
 }
 
-/* Step 7 task #32: router-bias probe.  router_selected (slot 227) diverges
- * across processes while router_logits (225) and router_probs (226) are
- * bit-identical.  The top-k operates on local_score = prob + bias[e], but
- * slot 226 captures only `prob` (= sqrt(softplus(logit)), no bias).  If
- * the bias (ffn_exp_probs_b) is read non-deterministically, the top-k
- * picks different experts while probs stay identical.  This global holds
- * an FNV-1a hash of bias[0..255], written by router_select_warp_topk_kernel
- * and dumped to slot 230 by ds4_gpu_router_select_tensor when on L0. */
-__device__ unsigned long long g_ds4_router_bias_hash[1];
-
-extern "C" const void *ds4_cuda_get_router_bias_hash_ptr(void) {
-    void *p = nullptr;
-    cudaGetSymbolAddress(&p, g_ds4_router_bias_hash);
-    return p;
-}
-
 __global__ static void router_select_warp_topk_kernel(
         int32_t *selected,
         float *weights,
@@ -6839,20 +6823,6 @@ __global__ static void router_select_warp_topk_kernel(
         prob[e] = p;
     }
     __syncwarp();
-
-    /* Step 7 task #32: hash the router bias for token 0.  If this differs
-     * across MATCH/MISS processes, the non-deterministic top-k selection
-     * is caused by a non-deterministic bias read (ffn_exp_probs_b). */
-    if (t == 0u && lane == 0u && has_bias && bias) {
-        unsigned long long h = 0xcbf29ce484222325ULL;
-        for (uint32_t i = 0; i < 256u; ++i) {
-            union { float f; unsigned int u; } x;
-            x.f = bias[i];
-            h ^= (unsigned long long) x.u;
-            h *= 0x100000001b3ULL;
-        }
-        g_ds4_router_bias_hash[0] = h;
-    }
 
     if (hash_mode) {
         if (lane == 0) {
@@ -8796,281 +8766,6 @@ static struct layer_graph_entry *layer_graph_slot(const struct ds4_layer_graph_k
     return &g_layer_graphs[layer_graph_hash(key) % DS4_LAYER_GRAPH_CACHE_SIZE];
 }
 
-/* ------------------------------------------------------------------------ *
- * Step 7 per-kernel hash dump (DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1).
- *
- * Computes an FNV-1a hash of a device buffer's float contents and writes
- * the result into a slot of a device-side hash array.  Gated by env so
- * the standing parity gate isn't slowed down.  After end_or_commit
- * completes, ds4_cuda_dump_hashes_flush() copies the hash array to host
- * and prints "label: hex" per slot used so far this token.
- *
- * Usage: caller routes through ds4_cuda_dump_hash_after(tensor, n_elem,
- * label) AFTER each shim it wants to probe.  Slot indices are assigned
- * monotonically per token; labels are stored host-side in parallel.
- * ds4_cuda_dump_hashes_reset() called at the start of each token; the
- * flush at the end prints the per-token table. */
-#define DS4_CUDA_DUMP_HASH_SLOTS 1024
-__device__ static uint64_t g_dump_hashes_dev[DS4_CUDA_DUMP_HASH_SLOTS];
-static uint64_t g_dump_hashes_host[DS4_CUDA_DUMP_HASH_SLOTS];
-static const char *g_dump_labels[DS4_CUDA_DUMP_HASH_SLOTS];
-static uint32_t   g_dump_next = 0;
-
-__global__ static void ds4_cuda_dump_hash_fnv1a_kernel(
-        const float *buf, uint64_t n_elem, uint32_t slot) {
-    /* Single-thread FNV-1a over the float bit pattern.  Slow (~few us
-     * for 7168 floats) but deterministic and capture-safe. */
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
-    uint64_t h = 0xcbf29ce484222325ULL;
-    for (uint64_t i = 0; i < n_elem; i++) {
-        union { float f; uint32_t u; } x;
-        x.f = buf[i];
-        h ^= (uint64_t)x.u;
-        h *= 0x100000001b3ULL;
-    }
-    g_dump_hashes_dev[slot] = h;
-}
-
-static int ds4_cuda_dump_hash_enabled(void) {
-    static int init = 0, en = 0;
-    if (!init) {
-        init = 1;
-        const char *s = getenv("DS4_CUDA_LAYER_GRAPHS_HASH_DUMP");
-        en = (s && *s && strcmp(s, "0") != 0) ? 1 : 0;
-    }
-    return en;
-}
-
-extern "C" void ds4_cuda_dump_hash_reset(void) {
-    if (!ds4_cuda_dump_hash_enabled()) return;
-    g_dump_next = 0;
-    /* Labels persist across resets: fixed-slot probes (e.g. L0 sub-probes
-     * at slots 200..206) are captured into layer-graph kernels that fire
-     * on replay without the CPU re-calling dump_hash_at_slot.  If we
-     * cleared labels here, flush would skip those slots on replay tokens
-     * (label NULL) even though their device-side hashes were written by
-     * the replay.  Auto-slot probes write their labels each token before
-     * the kernel launch, so they're always current. */
-}
-
-extern "C" void ds4_cuda_dump_hash_after(
-        const struct ds4_gpu_tensor *tensor,
-        uint64_t n_elem,
-        const char *label) {
-    if (!ds4_cuda_dump_hash_enabled() || !tensor) return;
-    if (g_dump_next >= DS4_CUDA_DUMP_HASH_SLOTS) return;
-    const uint32_t slot = g_dump_next++;
-    g_dump_labels[slot] = label;
-    /* Launch on ds4_current_stream() so the hash is recorded into the
-     * captured graph (or runs eagerly when capture is off). */
-    ds4_cuda_dump_hash_fnv1a_kernel<<<1, 1, 0, ds4_current_stream()>>>(
-            (const float *)tensor->ptr, n_elem, slot);
-}
-
-extern "C" void ds4_cuda_dump_hash_at_slot(
-        const struct ds4_gpu_tensor *tensor,
-        uint64_t n_elem,
-        const char *label,
-        uint32_t slot) {
-    /* Fixed-slot variant.  Useful for probes inside captured regions
-     * where the auto-incrementing g_dump_next would collide with eager
-     * post-capture probes (e.g. L0 sub-probes baked into layer 0's
-     * captured graph at slots 0..6, while L0n_out probes also start
-     * auto-numbering from slot 0 on replay tokens).  Reserve a high
-     * range for fixed-slot probes (e.g. 200..299) and let auto-slot
-     * probes occupy the low range.  Does NOT touch g_dump_next so
-     * subsequent auto-slot calls aren't displaced.  Flush iterates all
-     * slots with non-NULL labels to find these. */
-    if (!ds4_cuda_dump_hash_enabled() || !tensor) return;
-    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
-    g_dump_labels[slot] = label;
-    ds4_cuda_dump_hash_fnv1a_kernel<<<1, 1, 0, ds4_current_stream()>>>(
-            (const float *)tensor->ptr, n_elem, slot);
-}
-
-/* Step 7 narrowing: routed-MoE branch tag.  Tracks which of the three
- * routed-MoE dispatch paths actually ran for the most recent
- * routed_moe_launch call.  Set host-side at the entry of each branch
- * (synchronous before kernel launches); read host-side by ds4.c after
- * the routed_moe call to emit a tag at a fixed dump slot.  Values:
- *   0 = no branch (routed_moe_launch bailed early)
- *   1 = MMVQ decode (n_tok<=mmvq_decode_max_tokens vec path)
- *   2 = MMQ batch (mid/large batch mmq tile path)
- *   3 = legacy native kernels (sorted / direct-sum / tile / atomic) */
-static volatile int g_dump_last_moe_branch = 0;
-
-extern "C" int ds4_cuda_dump_get_last_moe_branch(void) {
-    return (int)g_dump_last_moe_branch;
-}
-
-extern "C" void ds4_cuda_dump_set_last_moe_branch(int b) {
-    g_dump_last_moe_branch = b;
-}
-
-/* Tag kernel: writes a constant uint32 (zero-extended to uint64) into
- * a dump slot, bypassing the FNV-1a path.  Used to record categorical
- * values (e.g. branch ids) alongside true hashes. */
-__global__ static void ds4_cuda_dump_tag_kernel(uint32_t tag, uint32_t slot) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
-    g_dump_hashes_dev[slot] = (uint64_t)tag;
-}
-
-extern "C" void ds4_cuda_dump_tag_at_slot(uint32_t tag, const char *label, uint32_t slot) {
-    if (!ds4_cuda_dump_hash_enabled()) return;
-    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
-    g_dump_labels[slot] = label;
-    ds4_cuda_dump_tag_kernel<<<1, 1, 0, ds4_current_stream()>>>(tag, slot);
-}
-
-/* Step 7 task #38: emit-writer row+row-hash probe.  Reads the effective
- * row index from a device uint32 (*row_ptr) and hashes exactly that row
- * of `base` (head_dim floats).  Recorded into the captured emit graph so
- * on replay slot_row/slot_hash reflect what the emit writer kernel beside
- * it actually saw.  Used to bisect which writer in the
- * pool->rms->rope->fp8 chain first produces a wrong comp_cache row. */
-__global__ static void ds4_emit_row_probe_kernel(
-        const float *base, uint32_t head_dim,
-        const uint32_t *row_ptr, uint32_t slot_row, uint32_t slot_hash) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
-    uint32_t row = row_ptr ? *row_ptr : 0xffffffffu;
-    if (slot_row < DS4_CUDA_DUMP_HASH_SLOTS) g_dump_hashes_dev[slot_row] = (uint64_t)row;
-    if (slot_hash < DS4_CUDA_DUMP_HASH_SLOTS && row_ptr) {
-        const float *r = base + (uint64_t)row * head_dim;
-        uint64_t h = 0xcbf29ce484222325ULL;
-        for (uint32_t i = 0; i < head_dim; i++) {
-            union { float f; uint32_t u; } x;
-            x.f = r[i];
-            h ^= (uint64_t)x.u;
-            h *= 0x100000001b3ULL;
-        }
-        g_dump_hashes_dev[slot_hash] = h;
-    }
-}
-
-extern "C" void ds4_cuda_emit_row_probe(
-        const void *base, uint32_t head_dim, const void *row_ptr,
-        const char *label_row, uint32_t slot_row,
-        const char *label_hash, uint32_t slot_hash) {
-    if (!ds4_cuda_dump_hash_enabled() || !base || !row_ptr) return;
-    if (slot_row  < DS4_CUDA_DUMP_HASH_SLOTS) g_dump_labels[slot_row]  = label_row;
-    if (slot_hash < DS4_CUDA_DUMP_HASH_SLOTS) g_dump_labels[slot_hash] = label_hash;
-    ds4_emit_row_probe_kernel<<<1, 1, 0, ds4_current_stream()>>>(
-            (const float *)base, head_dim, (const uint32_t *)row_ptr,
-            slot_row, slot_hash);
-}
-
-/* Step 7 task #39: device-side decode_scalars probe.  Reads the live
- * device mirror (g_decode_dev) of pos0/raw_row/raw_start/n_raw into four
- * consecutive slots.  Recorded into the captured layer graph so on
- * replay the slots reflect what the captured attention/KV kernels see
- * for the raw-KV sliding window -- answers whether raw_start is live on
- * replay across the pos=128 SWA-saturation boundary. */
-__global__ static void ds4_decode_scalars_probe_kernel(
-        const struct ds4_decode_scalars *s, uint32_t slot0) {
-    if (threadIdx.x != 0 || blockIdx.x != 0 || !s) return;
-    if (slot0 + 3u >= DS4_CUDA_DUMP_HASH_SLOTS) return;
-    g_dump_hashes_dev[slot0 + 0] = (uint64_t)s->pos0;
-    g_dump_hashes_dev[slot0 + 1] = (uint64_t)s->raw_row;
-    g_dump_hashes_dev[slot0 + 2] = (uint64_t)s->raw_start;
-    g_dump_hashes_dev[slot0 + 3] = (uint64_t)s->n_raw;
-}
-
-extern "C" void ds4_cuda_decode_scalars_probe(uint32_t slot0) {
-    if (!ds4_cuda_dump_hash_enabled() || g_decode_dev == NULL) return;
-    if (slot0 + 3u >= DS4_CUDA_DUMP_HASH_SLOTS) return;
-    g_dump_labels[slot0 + 0] = "ds.pos0";
-    g_dump_labels[slot0 + 1] = "ds.raw_row";
-    g_dump_labels[slot0 + 2] = "ds.raw_start";
-    g_dump_labels[slot0 + 3] = "ds.n_raw";
-    ds4_decode_scalars_probe_kernel<<<1, 1, 0, ds4_current_stream()>>>(
-            g_decode_dev, slot0);
-}
-
-/* Step 7 deep-narrowing: one-shot probe-slot handoff between TUs.
- *
- * Background: the routed-MoE intra-branch probes (slots 213-216) showed
- * that under MMVQ-decode the FIRST divergent intermediate is routed_gate.
- * That tensor is the output of ds4_mmq_<type>_moe_vec, which lives in
- * cuda/mmq/ds4_mmq.cu (a separate TU).  Inside that function the work is
- *   1. quantize_row_q8_1_cuda(X_f32 -> src1_q8_1)
- *   2. mul_mat_vec_q_switch_type(W, src1_q8_1, ids -> dst)
- * To bisect between (1) and (2) we need to hash src1_q8_1 between them.
- * That buffer is a ggml_cuda_pool_alloc<char>, not a ds4_gpu_tensor, so
- * the existing dump_hash_at_slot doesn't apply directly.
- *
- * Handoff protocol:
- *   - ds4_cuda.cu (MMVQ-decode branch) sets the probe slot to a specific
- *     value (217=gate, 218=up, 219=down) just before each moe_vec call
- *     when the current layer is 0.
- *   - ds4_mmq.cu, after step (1) above, consumes the slot (read + clear)
- *     and if non-zero, hashes src1_q8_1 to that slot via the raw helper.
- *   - The slot is one-shot to avoid stale probes carrying over into
- *     subsequent calls.
- *
- * g_dump_current_layer is set host-side by ds4.c at the top of each
- * layer body, so ds4_cuda.cu can gate the slot-set on layer == 0
- * without needing the layer index threaded through the call signatures. */
-static volatile int      g_dump_current_layer = -1;
-static volatile uint32_t g_dump_probe_slot    = 0;
-
-extern "C" void ds4_cuda_dump_set_current_layer(int il) {
-    g_dump_current_layer = il;
-}
-
-extern "C" int ds4_cuda_dump_get_current_layer(void) {
-    return (int)g_dump_current_layer;
-}
-
-extern "C" void ds4_cuda_dump_probe_slot_set(uint32_t slot) {
-    g_dump_probe_slot = slot;
-}
-
-extern "C" uint32_t ds4_cuda_dump_probe_slot_consume(void) {
-    uint32_t s = g_dump_probe_slot;
-    g_dump_probe_slot = 0;
-    return s;
-}
-
-/* Variant of dump_hash_at_slot that accepts a raw pointer + n_floats
- * instead of a ds4_gpu_tensor.  Used for buffers (e.g. pool-allocated
- * Q8_1 scratch inside ds4_mmq.cu) that don't have a tensor wrapper.
- * Treats the buffer as a sequence of floats; the FNV-1a is over the
- * uint32 bit pattern, so any consistent byte layout will hash
- * deterministically. */
-extern "C" void ds4_cuda_dump_hash_raw_at_slot(const void *buf, uint64_t n_floats,
-                                                const char *label, uint32_t slot) {
-    if (!ds4_cuda_dump_hash_enabled() || !buf) return;
-    if (slot >= DS4_CUDA_DUMP_HASH_SLOTS) return;
-    g_dump_labels[slot] = label;
-    ds4_cuda_dump_hash_fnv1a_kernel<<<1, 1, 0, ds4_current_stream()>>>(
-            (const float *)buf, n_floats, slot);
-}
-
-extern "C" void ds4_cuda_dump_hash_flush(uint32_t pos) {
-    if (!ds4_cuda_dump_hash_enabled()) return;
-    /* Synchronize all pending captures + launches so device hashes are
-     * stable, then copy to host and print every slot with a non-NULL
-     * label (catches both auto-slot probes and fixed-slot probes at
-     * the high range). */
-    cudaDeviceSynchronize();
-    cudaError_t e = cudaMemcpyFromSymbol(g_dump_hashes_host, g_dump_hashes_dev,
-                                          sizeof(g_dump_hashes_host),
-                                          0, cudaMemcpyDeviceToHost);
-    if (e != cudaSuccess) {
-        fprintf(stderr, "ds4: dump_hash_flush memcpy failed: %s\n",
-                cudaGetErrorString(e));
-        return;
-    }
-    for (uint32_t i = 0; i < DS4_CUDA_DUMP_HASH_SLOTS; i++) {
-        if (g_dump_labels[i] == NULL) continue;
-        fprintf(stderr, "DS4_HASH pos=%u slot=%3u %016lx %s\n",
-                pos, i, (unsigned long)g_dump_hashes_host[i],
-                g_dump_labels[i]);
-    }
-}
-
 /* In-flight capture tracking.  begin_or_replay sets these when it returns 0
  * (capturing); end_or_commit reads them to find the slot to close.  Single-
  * threaded GPU work makes file-scope globals safe; if multi-threaded use
@@ -9148,33 +8843,6 @@ extern "C" int ds4_cuda_layer_graph_begin_or_replay(
     if (!s) return -1;
 
     struct layer_graph_entry *slot = layer_graph_slot(key);
-    /* Step 7 task #35/#37: per-call layer cache-decision + scalar probe.
-     * Prints action (replay/warm/capture), slot index, key hash, n_tok,
-     * flags, plus the token-stable decode_scalars for every begin_or_replay
-     * on layers 0..3.  Diffing the per-call sequence across runs localises
-     * which (il, pos) the captured graph first diverges and whether a
-     * scalar or the cache decision flips at that boundary.  Gated on
-     * DS4_CUDA_LGRAPH_PROBE. */
-    if (il <= 3u && getenv("DS4_CUDA_LGRAPH_PROBE") != NULL) {
-        unsigned long long kh = layer_graph_hash(key);
-        const char *act = (slot->valid && memcmp(&slot->key, key, sizeof(*key)) == 0)
-                              ? "REPLAY"
-                              : ((!slot->warmed || memcmp(&slot->key, key, sizeof(*key)) != 0)
-                                     ? "WARM" : "CAPTURE");
-        const struct ds4_decode_scalars *ds = g_decode_host;
-        fprintf(stderr,
-                "DS4_LGRAPH il=%u action=%-7s slotidx=%3u keyhash=%016llx "
-                "n_tok=%u flags=%u | pos0=%u raw_row=%u raw_start=%u n_raw=%u "
-                "n_comp=%u emit_phase=%u comp_row=%u index_row=%u token=%u\n",
-                il, act, (unsigned)(kh % DS4_LAYER_GRAPH_CACHE_SIZE), kh,
-                key->n_tok, key->flags,
-                ds ? ds->pos0 : 0u, ds ? ds->raw_row : 0u,
-                ds ? ds->raw_start : 0u, ds ? ds->n_raw : 0u,
-                ds ? ds->n_comp : 0u, ds ? ds->emit_phase : 0u,
-                ds ? ds->comp_row : 0u, ds ? ds->index_row : 0u,
-                ds ? ds->token : 0u);
-        fflush(stderr);
-    }
     if (slot->valid && memcmp(&slot->key, key, sizeof(*key)) == 0) {
         /* Replay path.  Cross-stream sync brackets mirror the moe_graph
          * pattern: pre-sync stream=0 -> moe_stream so the captured graph
@@ -10640,20 +10308,10 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
     if (!base || g_layer_dev == NULL || n_rot > head_dim ||
         il >= DS4_LAYER_SCALARS_COUNT ||
         base->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
-    /* Step 7 task #38: emit-chain probe -- fp8 stage (slots 272-274). */
-    const int probe_fp8 = (il == 2u);
-    if (probe_fp8) {
-        ds4_cuda_emit_row_probe(base->ptr, head_dim, &g_layer_dev[il].comp_row,
-                                "fp8.row", 272u, "cc.before_fp8", 273u);
-    }
     fp8_kv_quantize_row_kernel<<<1, 64, 0, ds4_current_stream()>>>(
             (float *)base->ptr, head_dim, n_rot,
             g_layer_dev + il);
     int ok_fp8 = cuda_ok(cudaGetLastError(), "fp8_kv_quantize_row launch");
-    if (ok_fp8 && probe_fp8) {
-        ds4_cuda_emit_row_probe(base->ptr, head_dim, &g_layer_dev[il].comp_row,
-                                "fp8.row2", 275u, "cc.after_fp8", 274u);
-    }
     return ok_fp8;
 }
 
@@ -10928,29 +10586,6 @@ extern "C" int ds4_gpu_compressor_update_tensor(
             ? &g_layer_dev[il].index_row
             : &g_layer_dev[il].comp_row;
     }
-    /* Step 7 task #38: emit-path substrate probe.  Hash g_layer_dev[il]
-     * (n_comp, n_index_comp, comp_row, index_row -- 16 B) into slot 240+il.
-     * The dump kernel is recorded into the captured emit graph, so on
-     * replay slot 240+il reflects the comp_row the emit kernels actually
-     * read at replay time.  If it advances per emit -> substrate is live
-     * (bug is a stale consumer); if frozen -> ordering bug.  Gated by
-     * DS4_CUDA_LAYER_GRAPHS_HASH_DUMP (inside dump_hash_raw_at_slot) and
-     * the COMP row-field on layers 0..2. */
-    if (row_ptr_dev != NULL && row_field == DS4_COMPRESSOR_ROW_COMP &&
-        il <= 2u) {
-        ds4_cuda_dump_hash_raw_at_slot((const void *)&g_layer_dev[il], 4u,
-                                        "emit:layer_scalars", 240u + il);
-    }
-    /* Step 7 task #38: per-writer emit-chain probe on L2's attn compressor.
-     * Slots: pool 260-262, rms 264-266, rope 268-270 (fp8 272-274 done in
-     * the fp8 shim).  *.row = effective row each kernel saw; cc.* = the
-     * comp_cache[row] hash before/after each writer. */
-    const int probe_emit = (row_ptr_dev != NULL &&
-                            row_field == DS4_COMPRESSOR_ROW_COMP && il == 2u);
-    if (probe_emit) {
-        ds4_cuda_emit_row_probe(comp_cache->ptr, head_dim, row_ptr_dev,
-                                "pool.row", 260u, "cc.before_pool", 261u);
-    }
     compressor_update_pool_kernel<<<(head_dim + 255) / 256, 256, 0, ds4_current_stream()>>>(
             (float *)comp_cache->ptr,
             (const float *)state_kv->ptr,
@@ -10960,10 +10595,6 @@ extern "C" int ds4_gpu_compressor_update_tensor(
             comp_row,
             row_ptr_dev);
     int ok = cuda_ok(cudaGetLastError(), "compressor update pool launch");
-    if (probe_emit) {
-        ds4_cuda_emit_row_probe(comp_cache->ptr, head_dim, row_ptr_dev,
-                                "rms.row", 264u, "cc.after_pool", 262u);
-    }
     if (ok) {
         if (row_ptr_dev) {
             const char *w = cuda_model_range_ptr(model_map, norm_offset,
@@ -10978,10 +10609,6 @@ extern "C" int ds4_gpu_compressor_update_tensor(
                         row_ptr_dev,
                         rms_eps);
                 ok = cuda_ok(cudaGetLastError(), "compressor rms_norm row launch");
-                if (ok && probe_emit) {
-                    ds4_cuda_emit_row_probe(comp_cache->ptr, head_dim, row_ptr_dev,
-                                            "rope.row", 268u, "cc.after_rms", 266u);
-                }
             }
         } else {
             /* decode2-exact fallback: build a transient view over the
@@ -11018,10 +10645,6 @@ extern "C" int ds4_gpu_compressor_update_tensor(
                     freq_base, freq_scale, ext_factor, attn_factor,
                     beta_fast, beta_slow);
             ok = cuda_ok(cudaGetLastError(), "compressor rope_tail row launch");
-            if (ok && probe_emit) {
-                ds4_cuda_emit_row_probe(comp_cache->ptr, head_dim, row_ptr_dev,
-                                        "rope.row2", 271u, "cc.after_rope", 270u);
-            }
         }
     }
     if (ok && ratio == 4u) {
@@ -12231,21 +11854,6 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
         else hash = (const int32_t *)cuda_model_range_ptr(model_map, hash_offset, hash_bytes, "router_hash");
         if (!hash) ok = 0;
     }
-    /* Step 7 task #35: router-arg probe.  On L0 (hash_mode), router_selected
-     * is a pure lookup hash[tok*6+j] -- it does NOT depend on logits/probs.
-     * So a bistable router_selected with bit-identical router_probs can only
-     * come from a divergent tok / hash pointer / hash_rows / mode.  Print the
-     * exact host-side args at capture/eager time so they can be diffed across
-     * processes.  Gated on DS4_CUDA_ROUTER_ARG_PROBE + L0. */
-    if (ok && g_dump_current_layer == 0 && getenv("DS4_CUDA_ROUTER_ARG_PROBE") != NULL) {
-        fprintf(stderr,
-                "DS4_ROUTER_ARG L0 capture_active=%d tok=%d hash_mode=%d has_bias=%d "
-                "hash_rows=%u hash_ptr=%p bias_ptr=%p selected_ptr=%p logits_ptr=%p\n",
-                ds4_capture_active() ? 1 : 0, (int)tok, hash_mode ? 1 : 0,
-                (has_bias && !hash_mode) ? 1 : 0, hash_rows, (const void *)hash,
-                (const void *)bias, (const void *)selected->ptr, (const void *)logits->ptr);
-        fflush(stderr);
-    }
     if (ok) {
         if (getenv("DS4_CUDA_NO_WARP_ROUTER_SELECT") == NULL &&
             getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
@@ -12263,15 +11871,6 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
                                           has_bias && !hash_mode, hash_mode, g_decode_dev);
         }
         ok = cuda_ok(cudaGetLastError(), "router_select launch");
-        /* Step 7 task #32: on L0, dump the router-bias hash the kernel
-         * just computed (slot 230).  Same gating as the L0 hash probes
-         * in ds4.c -- g_dump_current_layer is set per-layer by ds4.c. */
-        if (ok && g_dump_current_layer == 0) {
-            ds4_cuda_dump_hash_raw_at_slot(ds4_cuda_get_router_bias_hash_ptr(),
-                                            /*n_floats=*/2u,
-                                            "L0:router-bias-hash",
-                                            /*slot=*/230u);
-        }
     }
     return ok;
 }
@@ -14583,9 +14182,6 @@ static int routed_moe_launch(
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
         return 0;
     }
-    /* Step 7 narrowing: reset branch tag at entry so a downstream
-     * ds4_cuda_dump_get_last_moe_branch() reads 0 if every branch bails. */
-    g_dump_last_moe_branch = 0;
     const int q4k_path = (gate_type == 12u && down_type == 12u);
     if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
     /* Q4_K with shapes other than (n_tokens=1, n_expert=6) is supported only
@@ -14685,8 +14281,6 @@ static int routed_moe_launch(
         if (n_assignments > 8u) {
             /* Outside the mmvq vec path's batch envelope; fall through. */
         } else {
-            /* Step 7 narrowing: tag this branch as the one that executed. */
-            g_dump_last_moe_branch = 1;
             /* Step 8: graph cache fast path.  If enabled, check the cache
              * for a captured graph matching the current shape + pointers.
              * On hit: replay (cudaGraphLaunch).  On miss: capture the
@@ -14778,22 +14372,11 @@ static int routed_moe_launch(
             }
 
             int rc = -1;
-            /* Step 7 deep-narrowing: arm the probe slot before each moe_vec
-             * call when we're processing L0.  ds4_mmq.cu's moe_vec_impl
-             * consumes the slot after the internal Q8_1 quantize and dumps
-             * the post-quantize buffer hash there.  Used to bisect between
-             * Q8_1 quantize and MMVQ matvec as the source of capture-replay
-             * divergence at routed_gate (slot 213).
-             *   slot 217 = gate q81-after-quantize
-             *   slot 218 = up   q81-after-quantize
-             *   slot 219 = down q81-after-quantize */
-            const int probe_l0 = (g_dump_current_layer == 0);
             /* 1. Two separate gate/up matmuls through mmvq.  Each call
              *    re-quantizes the activation - acceptable for n_tokens=1
              *    (4KB Q8_1 buffer) and avoids needing a shared-buffer API
              *    in this first iteration. */
             if (q4k_path) {
-                if (probe_l0) g_dump_probe_slot = 217;
                 rc = ds4_mmq_q4_K_moe_vec(gate_w, (const float *)x->ptr,
                                           (const int32_t *)selected->ptr,
                                           (float *)gate->ptr,
@@ -14804,7 +14387,6 @@ static int routed_moe_launch(
                     fprintf(stderr, "ds4: ds4_mmq_q4_K_moe_vec (gate) returned %d; falling back\n", rc);
                     goto mmvq_decode_bail;
                 }
-                if (probe_l0) g_dump_probe_slot = 218;
                 rc = ds4_mmq_q4_K_moe_vec(up_w, (const float *)x->ptr,
                                           (const int32_t *)selected->ptr,
                                           (float *)up->ptr,
@@ -14812,7 +14394,6 @@ static int routed_moe_launch(
                                           (int)n_tokens, (int)n_experts_total,
                                           (int)n_expert_used, moe_stream);
             } else {
-                if (probe_l0) g_dump_probe_slot = 217;
                 rc = ds4_mmq_iq2_xxs_moe_vec(gate_w, (const float *)x->ptr,
                                              (const int32_t *)selected->ptr,
                                              (float *)gate->ptr,
@@ -14823,7 +14404,6 @@ static int routed_moe_launch(
                     fprintf(stderr, "ds4: ds4_mmq_iq2_xxs_moe_vec (gate) returned %d; falling back\n", rc);
                     goto mmvq_decode_bail;
                 }
-                if (probe_l0) g_dump_probe_slot = 218;
                 rc = ds4_mmq_iq2_xxs_moe_vec(up_w, (const float *)x->ptr,
                                              (const int32_t *)selected->ptr,
                                              (float *)up->ptr,
@@ -14853,7 +14433,6 @@ static int routed_moe_launch(
              *    one expert.  Routes through mmvq's multi-token MoE kernel
              *    (mul_mat_vec_q_moe) at ncols_dst = n_assignments. */
             if (q4k_path) {
-                if (probe_l0) g_dump_probe_slot = 219;
                 rc = ds4_mmq_q4_K_moe_vec(down_w, (const float *)mid->ptr,
                                           (const int32_t *)selected->ptr,
                                           (float *)down->ptr,
@@ -14861,7 +14440,6 @@ static int routed_moe_launch(
                                           (int)n_assignments, (int)n_experts_total,
                                           /*n_expert_used=*/1, moe_stream);
             } else {
-                if (probe_l0) g_dump_probe_slot = 219;
                 rc = ds4_mmq_q2_K_moe_vec(down_w, (const float *)mid->ptr,
                                           (const int32_t *)selected->ptr,
                                           (float *)down->ptr,
@@ -14954,8 +14532,6 @@ static int routed_moe_launch(
     }
 
     if (ds4_cuda_use_mmq() && n_tokens >= mmq_moe_min_tokens) {
-        /* Step 7 narrowing: tag this branch as the one that executed. */
-        g_dump_last_moe_branch = 2;
         const uint32_t n_expert_used = n_expert;   /* parameter name is a misnomer; this is top_k */
         const uint32_t n_experts_total = 256u;     /* matches the hardcoded constant at line 11437 */
         const uint64_t n_assignments = (uint64_t)n_tokens * n_expert_used;
@@ -15041,8 +14617,6 @@ static int routed_moe_launch(
         return 1;
     }
 mmq_moe_fallback:
-    /* Step 7 narrowing: tag this branch as the one that executed. */
-    g_dump_last_moe_branch = 3;
     /* The legacy fallback dispatch handles Q4_K only for the V4-Flash decode
      * shape (n_tokens=1, n_expert=6).  Other Q4_K shapes can only succeed
      * through mmq above; reject here rather than crashing the legacy

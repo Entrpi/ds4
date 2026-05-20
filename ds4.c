@@ -9335,22 +9335,12 @@ static bool metal_graph_encode_decode_layer_impl(
             ok = metal_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
     } while (0)
-    /* Step 7 hash-dump probes: only for layer 0.  Use FIXED slots
-     * 200..206 so captured-graph writes don't collide with eager
-     * post-capture L0n_out probes (which auto-number from slot 0). */
-    const bool dump_this_layer = (il == 0);
-    /* Step 7 deep-narrowing: tell ds4_cuda.cu which layer we're on so its
-     * MMVQ-decode branch can arm one-shot probe slots only on L0.
-     * No-op when hash-dump env var is unset. */
-    ds4_cuda_dump_set_current_layer((int)il);
     ds4_cuda_layer_graph_debug_peek("dbg:enter-layer-body");
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->cur_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     ds4_cuda_layer_graph_debug_peek("dbg:after-rms_norm_plain");
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->flat_hc, hc_dim, "L0:flat_hc-after-rms_norm_plain", 200);
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_attn_fn,
                                                  hc_dim, mix_hc, g->flat_hc, 1);
     ds4_cuda_layer_graph_debug_peek("dbg:after-matmul_plain(hc_mix)");
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->hc_mix, mix_hc, "L0:hc_mix-after-matmul_plain", 201);
     const bool fuse_hc_norm =
         !metal_graph_use_reference_hc_decode() &&
         !metal_graph_use_reference_hc_norm_decode();
@@ -9391,13 +9381,11 @@ static bool metal_graph_encode_decode_layer_impl(
         metal_graph_debug_dump_tensor("hc_attn_pre", g->attn_cur, DS4_N_EMBD, il, pos);
     }
     ds4_cuda_layer_graph_debug_peek("dbg:after-hc_split_or_pre");
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->attn_cur, DS4_N_EMBD, "L0:attn_cur-after-hc_split_or_pre", 202);
     if (ok && !fuse_hc_norm) ok = ds4_gpu_rms_norm_weight_tensor(g->attn_norm, g->attn_cur,
                                                                    model->map, model->size,
                                                                    layer->attn_norm->abs_offset,
                                                                    DS4_N_EMBD, DS4_RMS_EPS) != 0;
     ds4_cuda_layer_graph_debug_peek("dbg:after-rms_norm_weight");
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->attn_norm, DS4_N_EMBD, "L0:attn_norm-after-rms_norm_weight", 203);
     DS4_METAL_PROFILE_DECODE_STAGE("attn_norm");
     if (ok) {
         metal_graph_debug_dump_tensor("attn_norm", g->attn_norm, DS4_N_EMBD, il, pos);
@@ -9459,19 +9447,16 @@ static bool metal_graph_encode_decode_layer_impl(
         metal_graph_debug_dump_tensor("KVnorm", g->kv, DS4_N_HEAD_DIM, il, pos);
     }
     ds4_cuda_layer_graph_debug_peek("dbg:before-matmul_q8_0(q_b)");
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->qr_norm, q_rank, "L0:qr_norm-before-matmul_q8_0_q_b", 204);
     if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->q, model->map, model->size,
                                               layer->attn_q_b->abs_offset,
                                               q_rank, q_dim,
                                               g->qr_norm, 1) != 0;
     ds4_cuda_layer_graph_debug_peek("dbg:after-matmul_q8_0(q_b)");
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->q, q_dim, "L0:q-after-matmul_q8_0_q_b", 205);
     if (ok) {
         metal_graph_debug_dump_tensor("Qraw", g->q, q_dim, il, pos);
     }
     if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->q, 1, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS) != 0;
     ds4_cuda_layer_graph_debug_peek("dbg:after-head_rms_norm");
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->q, q_dim, "L0:q-after-head_rms_norm", 206);
     if (ok) {
         metal_graph_debug_dump_tensor("Qnorm", g->q, q_dim, il, pos);
     }
@@ -9630,27 +9615,6 @@ static bool metal_graph_encode_decode_layer_impl(
         }
         if (ok && emit) g->layer_n_comp[il]++;
 
-        /* Step 7 task #38: emit-buffer probe.  Hash the attn compressed-KV
-         * cache (used rows) + the compressor state ring right after the
-         * emit, for layers 0..2.  These dump calls are captured into the
-         * emit layer graph, so on replay the slots reflect what the
-         * captured emit body produced.  Diffing captured vs SKIP_EMIT
-         * isolates which buffer the captured emit corrupts.  No-op unless
-         * DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1. */
-        if (ok && emit && il <= 2u) {
-            const uint32_t coff_p = (ratio == 4u) ? 2u : 1u;
-            /* Constant n_elem (32 rows) so the dump kernel hashes the same
-             * fixed region whether the layer runs captured or eager -- a
-             * growing n_comp count would otherwise be baked at capture and
-             * make captured-vs-eager incomparable. */
-            ds4_cuda_dump_hash_at_slot(g->layer_attn_comp_cache[il],
-                                       (uint64_t)32u * DS4_N_HEAD_DIM,
-                                       "emit:attn_comp_cache", 243u + il);
-            ds4_cuda_dump_hash_at_slot(g->layer_attn_state_kv[il],
-                                       (uint64_t)coff_p * ratio * coff_p * DS4_N_HEAD_DIM,
-                                       "emit:attn_state_ring", 246u + il);
-        }
-
         if (ok && ratio == 4) {
             const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
             if (!layer->indexer_compressor_kv || !layer->indexer_compressor_gate ||
@@ -9726,12 +9690,6 @@ static bool metal_graph_encode_decode_layer_impl(
                         il) != 0;
             }
             if (ok && emit) g->layer_n_index_comp[il]++;
-            /* Step 7 task #38: indexer emit-buffer probe (slots 249..251). */
-            if (ok && emit && il <= 2u) {
-                ds4_cuda_dump_hash_at_slot(g->layer_index_comp_cache[il],
-                                           (uint64_t)32u * DS4_N_INDEXER_HEAD_DIM,
-                                           "emit:index_comp_cache", 249u + il);
-            }
             const uint32_t decode_top_k = metal_graph_decode_indexer_top_k(g);
             if (ok && g->layer_n_comp[il] > decode_top_k) {
                 const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
@@ -9838,10 +9796,6 @@ static bool metal_graph_encode_decode_layer_impl(
     }
     DS4_METAL_PROFILE_DECODE_STAGE("compressor_indexer");
 
-    /* Step 7 task #39: dump the device decode_scalars (raw window state)
-     * from inside layer 5's captured body -- on replay slots 280-283 show
-     * whether raw_start/n_raw are live across the pos=128 SWA boundary. */
-    if (ok && il == 5u) ds4_cuda_decode_scalars_probe(280u);
     if (ok) {
         const uint32_t raw_start = metal_graph_raw_start_for_span(g, pos, n_raw);
         /* Step 4a + 4c A1: n_raw and raw_start are token-stable (same
@@ -9905,8 +9859,6 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_out", g->heads, q_dim, il, pos);
     }
-    /* Step 7 probe: attention output (heads) before inverse RoPE. */
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->heads, q_dim, "L0:heads-after-attention", 207);
     /* Step 3 pilot: heads inverse-rope migrated to device-scalars shim. */
     if (ok) ok = ds4_gpu_rope_tail_scalars_tensor(g->heads,
                                             1, DS4_N_HEAD, DS4_N_HEAD_DIM,
@@ -9983,8 +9935,6 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
     }
-    /* Step 7 probe: after attention output projection + HC expand add. */
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->after_attn_hc, hc_dim, "L0:after_attn_hc", 208);
     if (stop_at == METAL_GRAPH_DECODE_LAYER_AFTER_ATTN) return ok;
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
@@ -10056,23 +10006,6 @@ static bool metal_graph_encode_decode_layer_impl(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
-    /* Step 7 task #32: router probes.  task #32's slot-224 weight-byte
-     * hash showed the matvec reads DIFFERENT experts across MATCH/MISS
-     * runs (kbx_offset = ids[0]*stride).  That points the divergence at
-     * the router, upstream of the matvec.  Probe ffn_norm (router input),
-     * router_logits (matmul output), router_probs, router_selected (the
-     * expert ids -- int32, hashed raw), and router_weights.  Whichever is
-     * the first to differ between MATCH and MISS localises the bug:
-     *   ffn_norm differs       -> divergence is even further upstream
-     *   ffn_norm same, logits differ -> router matmul non-deterministic
-     *   logits same, selected differ -> top-k selection (tie-break?) bug */
-    if (ok && dump_this_layer) {
-        ds4_cuda_dump_hash_at_slot(g->ffn_norm, DS4_N_EMBD, "L0:ffn_norm-router-input", 229);
-        ds4_cuda_dump_hash_at_slot(g->router_logits, DS4_N_EXPERT, "L0:router_logits", 225);
-        ds4_cuda_dump_hash_at_slot(g->router_probs, DS4_N_EXPERT, "L0:router_probs", 226);
-        ds4_cuda_dump_hash_at_slot(g->router_selected, DS4_N_EXPERT_USED, "L0:router_selected", 227);
-        ds4_cuda_dump_hash_at_slot(g->router_weights, DS4_N_EXPERT_USED, "L0:router_weights", 228);
-    }
     if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
@@ -10109,33 +10042,6 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
     }
-    /* Step 7 narrowing probes (post-analyst-correction).  routed_out is
-     * the first divergent tensor at pos=25, but the default decode path
-     * uses MMVQ -> moe_sum_kernel, not the legacy atomicAdd down kernels.
-     * Probe each intermediate to localise the divergence to a specific
-     * sub-kernel:
-     *   212: branch tag (1=MMVQ-decode, 2=MMQ-batch, 3=legacy)
-     *   213: routed_gate (after gate matmul, pre-SwiGLU)
-     *   214: routed_up   (after up matmul, pre-SwiGLU)
-     *   215: routed_mid  (after SwiGLU+clamp+router_weight)
-     *   216: routed_down (after down matmul, pre-sum across experts)
-     *   209: routed_out  (after moe_sum_kernel; final per-token output) */
-    if (ok && dump_this_layer) {
-        int branch = ds4_cuda_dump_get_last_moe_branch();
-        ds4_cuda_dump_tag_at_slot((uint32_t)branch, "L0:MoE-branch", 212);
-        ds4_cuda_dump_hash_at_slot(g->routed_gate,
-            (uint64_t)DS4_N_EXPERT_USED * down_in_dim, "L0:routed_gate", 213);
-        ds4_cuda_dump_hash_at_slot(g->routed_up,
-            (uint64_t)DS4_N_EXPERT_USED * down_in_dim, "L0:routed_up", 214);
-        ds4_cuda_dump_hash_at_slot(g->routed_mid,
-            (uint64_t)DS4_N_EXPERT_USED * down_in_dim, "L0:routed_mid", 215);
-        ds4_cuda_dump_hash_at_slot(g->routed_down,
-            (uint64_t)DS4_N_EXPERT_USED * routed_out_dim, "L0:routed_down-pre-sum", 216);
-    }
-    /* Step 7 probe: MoE output AFTER moe_sum_kernel (cross-expert sum).  If
-     * routed_down (slot 216) matches across runs but routed_out (slot 209)
-     * differs, the divergence is in moe_sum_kernel's reduction ordering. */
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->routed_out, DS4_N_EMBD, "L0:routed_out", 209);
     const bool fuse_shared_gate_up =
         !g->quality &&
         getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
@@ -10191,8 +10097,6 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_shexp", g->shared_out, DS4_N_EMBD, il, pos);
     }
-    /* Step 7 probe: shared FFN output. */
-    if (ok && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->shared_out, DS4_N_EMBD, "L0:shared_out", 210);
     if (ok && keep_ffn_out) {
         ok = metal_graph_ensure_ffn_out(g) &&
              ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
@@ -10200,8 +10104,6 @@ static bool metal_graph_encode_decode_layer_impl(
     if (ok && keep_ffn_out) {
         metal_graph_debug_dump_tensor("ffn_out", g->ffn_out, DS4_N_EMBD, il, pos);
     }
-    /* Step 7 probe: after shared+routed add. */
-    if (ok && keep_ffn_out && dump_this_layer) ds4_cuda_dump_hash_at_slot(g->ffn_out, DS4_N_EMBD, "L0:ffn_out", 211);
     if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_ffn(g, g->ffn_out, il, 1);
     }
@@ -11972,12 +11874,6 @@ static bool metal_graph_encode_output_head_norm(
     if (ok) {
         metal_graph_debug_dump_tensor("result_norm", g->output_norm, DS4_N_EMBD, DS4_N_LAYER, 0);
     }
-    /* Step 7 hash probes: dump output-head intermediates to find where
-     * the captured path diverges from eager. */
-    if (ok) ds4_cuda_dump_hash_after(g->output_pre, DS4_N_HC, "OH:output_pre");
-    if (ok) ds4_cuda_dump_hash_after(g->output_weights, DS4_N_HC, "OH:output_weights");
-    if (ok) ds4_cuda_dump_hash_after(g->output_embd, DS4_N_EMBD, "OH:output_embd");
-    if (ok) ds4_cuda_dump_hash_after(g->output_norm, DS4_N_EMBD, "OH:output_norm");
     return ok;
 }
 
@@ -12009,9 +11905,6 @@ static bool metal_graph_encode_output_head_impl(
     }
     if (ok && !top2_only) {
         metal_graph_debug_dump_tensor("result_output", g->logits, vocab_dim, DS4_N_LAYER, 0);
-        /* Step 7: final logits hash - if this differs, divergence is in
-         * the output head or earlier; if not, it's in the sampler. */
-        ds4_cuda_dump_hash_after(g->logits, vocab_dim, "OH:logits");
     }
     return ok;
 }
@@ -13099,43 +12992,16 @@ static bool metal_graph_encode_token_raw_swa(
     const bool layer_graphs = ds4_cuda_layer_graphs_enabled() != 0;
     if (layer_graphs) allow_split_flush = false;
 
-    /* Step 7 task #33 diagnostic: DS4_CUDA_LAYER_GRAPHS_SKIP_LAYER0=1
-     * forces layer 0 to run eager (no capture) while layers 1..42 still
-     * use layer graphs.  Used to test whether capturing the L0 body is
-     * what makes router_selected (slot 227) bistable: if L0 becomes
-     * 8/8 stable with this flag, the divergence is introduced by the
-     * capture of that layer body, not by the router kernel's own math. */
-    static int skip_l0_init = 0;
-    static int skip_l0 = 0;
-    if (!skip_l0_init) {
-        skip_l0_init = 1;
-        skip_l0 = (getenv("DS4_CUDA_LAYER_GRAPHS_SKIP_LAYER0") != NULL) ? 1 : 0;
-    }
-    /* Step 7 task #38 diagnostic: DS4_CUDA_LAYER_GRAPHS_SKIP_EMIT=1 forces
-     * every ratio-emit layer-step (flags bit 0) to run eager.  If ON
-     * determinism returns with this set, the captured FP8-KV-emit body is
-     * the residual non-determinism source. */
-    static int skip_emit_init = 0;
-    static int skip_emit = 0;
-    if (!skip_emit_init) {
-        skip_emit_init = 1;
-        skip_emit = (getenv("DS4_CUDA_LAYER_GRAPHS_SKIP_EMIT") != NULL) ? 1 : 0;
-    }
-
     /* PC5 metadata that the cache key consumes: decode_top_k is config-
      * stable per session (cheap to recompute each loop iteration but
      * hoisted here for clarity). */
     const uint32_t decode_top_k = metal_graph_decode_indexer_top_k(g);
 
-    /* Step 7 hash dump: clear per-token slot table before the loop;
-     * flush after.  No-op unless DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1. */
-    ds4_cuda_dump_hash_reset();
-
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         int rc = -1;
         const uint32_t il_ratio = ds4_layer_compress_ratio(il);
         const bool emit_il      = (il_ratio != 0u) && (((pos + 1u) % il_ratio) == 0u);
-        if (layer_graphs && !(skip_l0 && il == 0u) && !(skip_emit && emit_il)) {
+        if (layer_graphs) {
             const bool compressed   = il_ratio != 0u;
             const bool ratio4       = il_ratio == 4u;
             const bool indexed_act  = compressed && g->layer_n_comp[il] > decode_top_k;
@@ -13219,20 +13085,6 @@ static bool metal_graph_encode_token_raw_swa(
         ds4_gpu_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;
-        /* Step 7 hash dump: hash the layer's output (now in g->cur_hc
-         * after the swap).  Per-layer labels are static strings; build
-         * a small lookup so labels match across runs. */
-        if (ok) {
-            static const char *layer_labels[DS4_N_LAYER] = {
-                "L00_out","L01_out","L02_out","L03_out","L04_out","L05_out","L06_out","L07_out",
-                "L08_out","L09_out","L10_out","L11_out","L12_out","L13_out","L14_out","L15_out",
-                "L16_out","L17_out","L18_out","L19_out","L20_out","L21_out","L22_out","L23_out",
-                "L24_out","L25_out","L26_out","L27_out","L28_out","L29_out","L30_out","L31_out",
-                "L32_out","L33_out","L34_out","L35_out","L36_out","L37_out","L38_out","L39_out",
-                "L40_out","L41_out","L42_out",
-            };
-            ds4_cuda_dump_hash_after(g->cur_hc, (uint64_t)DS4_N_HC * DS4_N_EMBD, layer_labels[il]);
-        }
         if (ok && allow_split_flush && split_after_layers != 0 && il + 1u == split_after_layers) {
             ok = ds4_gpu_flush_commands() != 0;
         }
@@ -13241,25 +13093,6 @@ static bool metal_graph_encode_token_raw_swa(
     if (ok && need_logits) {
         ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
     }
-    /* Step 7 hash dump: hash the first 30 rows of raw_cache for a few
-     * layers to identify if KV cache writes differ between captured +
-     * eager paths (covers prefill rows + early decode rows). */
-    if (ok) {
-        static const char *kv_labels[] = {
-            "KV:L00_raw","KV:L05_raw","KV:L10_raw","KV:L20_raw",
-            "KV:L30_raw","KV:L42_raw",
-        };
-        static const uint32_t kv_layers[] = { 0, 5, 10, 20, 30, 42 };
-        const uint64_t rows_to_hash = 30;
-        const uint64_t hash_elems = rows_to_hash * DS4_N_HEAD_DIM;
-        for (uint32_t k = 0; k < (uint32_t)(sizeof(kv_layers)/sizeof(kv_layers[0])); k++) {
-            const uint32_t il = kv_layers[k];
-            ds4_cuda_dump_hash_after(g->layer_raw_cache[il], hash_elems, kv_labels[k]);
-        }
-    }
-    /* Step 7 hash dump: print this token's hash table to stderr.  No-op
-     * unless DS4_CUDA_LAYER_GRAPHS_HASH_DUMP=1. */
-    ds4_cuda_dump_hash_flush(pos);
     return ok;
 }
 

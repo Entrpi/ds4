@@ -747,32 +747,6 @@ extern "C" int ds4_mmq_q4_K_moe_pair(
 
 #include "mmvq.cuh"
 
-/* Step 7 deep-narrowing: cross-TU probe slot handoff from ds4_cuda.cu.
- * Declared here at file scope (not inside the anonymous namespace below)
- * so the C linkage is preserved and the linker can resolve them against
- * the definitions in ds4_cuda.cu. */
-extern "C" uint32_t ds4_cuda_dump_probe_slot_consume(void);
-extern "C" void     ds4_cuda_dump_hash_raw_at_slot(const void *buf,
-                                                     uint64_t n_floats,
-                                                     const char *label,
-                                                     uint32_t slot);
-
-/* Step 7 task #31: per-warp partial-sum probe pointers from mmvq.cu.
- * Each returns a device pointer to a global buffer the kernel writes to
- * for block (0,0,0).  Captured by moe_vec_impl AFTER the matvec dispatch,
- * via the existing dump_hash_raw_at_slot mechanism, into slots 220/221/222. */
-extern "C" const void *ds4_mmvq_get_probe_pre_shared_ptr(void);
-extern "C" const void *ds4_mmvq_get_probe_post_shared_ptr(void);
-extern "C" const void *ds4_mmvq_get_probe_post_shuffle_ptr(void);
-
-/* Step 7 task #32: input-verification probe pointers from mmvq.cu.
- * grid_hash = FNV-1a of the iq2xxs_grid table; weight_hash = FNV-1a of
- * the IQ2_XXS weight blocks block (0,0,0) reads.  Each is a device uint64;
- * dumped to slots 223/224 as a 2-float raw hash (a deterministic detector
- * of whether the underlying uint64 differs across MATCH/MISS runs). */
-extern "C" const void *ds4_mmvq_get_probe_grid_hash_ptr(void);
-extern "C" const void *ds4_mmvq_get_probe_weight_hash_ptr(void);
-
 namespace {
 
 template <ggml_type type>
@@ -848,22 +822,6 @@ int ds4_mmq_moe_vec_impl(
         src1_q8_1_ptr = src1_q8_1_pool.get();
     }
 
-    // Step 7 task #30 (falsification): zero the Q8_1 buffer before quantize
-    // so any out-of-range read inside the matvec sees a known byte pattern.
-    // Slots 217/218 already prove the hashed Q8_1 bytes match across runs,
-    // but the matvec may stride past the used region into padding.  If this
-    // memset improves match rate, we have an out-of-range/padding read in
-    // the matvec.  Env-gated so the parity gate isn't slowed down.
-    static int memset_q81_init = 0;
-    static int memset_q81_en = 0;
-    if (!memset_q81_init) {
-        memset_q81_init = 1;
-        memset_q81_en = (getenv("DS4_CUDA_MMQ_Q81_MEMSET") != nullptr) ? 1 : 0;
-    }
-    if (memset_q81_en) {
-        cudaMemsetAsync(src1_q8_1_ptr, 0, nbytes_q8_1, stream);
-    }
-
     // s11 = stride between rows of an src1 channel in source-float units.
     //       Logical src1 [K, ne11=1, ne12=n_tokens, ne13=1] - K innermost.
     // s12 = stride between channels = K * ne11 = K.
@@ -880,30 +838,6 @@ int ds4_mmq_moe_vec_impl(
         fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
                 tag, cudaGetErrorString(err));
         return -2;
-    }
-
-    // Step 7 deep-narrowing: consume the one-shot probe slot from
-    // ds4_cuda.cu's MMVQ-decode branch and hash the post-quantize Q8_1
-    // buffer to it.  No-op when slot is 0 (no probe armed) or when the
-    // hash dump env var is unset.  Hashes raw bytes as floats: identical
-    // byte content => identical hash, so divergence in the Q8_1 quantize
-    // shows up as a slot-value mismatch between OFF and ON runs.
-    // (Extern decls live at file scope above so C linkage is preserved.)
-    //
-    // Task #31: save the consumed slot so we can also dump the per-warp
-    // partial-sum probes (slots 220/221/222) AFTER the matvec dispatch.
-    // Only fires for the gate call at L0 (probe_slot == 217 by convention
-    // in ds4_cuda.cu's MMVQ-decode branch).
-    uint32_t saved_probe_slot = 0;
-    {
-        uint32_t probe_slot = ds4_cuda_dump_probe_slot_consume();
-        saved_probe_slot = probe_slot;
-        if (probe_slot) {
-            uint64_t n_floats = nbytes_q8_1 / sizeof(float);
-            ds4_cuda_dump_hash_raw_at_slot(src1_q8_1_ptr, n_floats,
-                                            "MoE:q81-after-quantize",
-                                            probe_slot);
-        }
     }
 
     // 2. mmvq stride setup. Mirror upstream's ggml_cuda_mul_mat_vec_q
@@ -956,38 +890,6 @@ int ds4_mmq_moe_vec_impl(
         fprintf(stderr, "%s: mul_mat_vec_q_switch_type launch failed: %s\n",
                 tag, cudaGetErrorString(err));
         return -3;
-    }
-
-    // Step 7 task #31: dump per-warp partial-sum probes from block (0,0,0)
-    // of the matvec we just dispatched.  Only fires for the gate call at
-    // L0 (saved_probe_slot == 217), and only for the IQ2_XXS / Q4_K decode
-    // shape where the kernel writes to the probe globals.  Subsequent
-    // moe_vec_impl calls (up, down, next layer) will overwrite the device
-    // globals, but the hash kernels we launch HERE on the same stream are
-    // ordered before those overwrites, so they capture the gate values.
-    if (saved_probe_slot == 217u) {
-        ds4_cuda_dump_hash_raw_at_slot(ds4_mmvq_get_probe_pre_shared_ptr(),
-                                        /*n_floats=*/4u * 32u,
-                                        "MoE:warp-pre-shared",
-                                        /*slot=*/220u);
-        ds4_cuda_dump_hash_raw_at_slot(ds4_mmvq_get_probe_post_shared_ptr(),
-                                        /*n_floats=*/32u,
-                                        "MoE:warp0-post-shared",
-                                        /*slot=*/221u);
-        ds4_cuda_dump_hash_raw_at_slot(ds4_mmvq_get_probe_post_shuffle_ptr(),
-                                        /*n_floats=*/1u,
-                                        "MoE:warp0-post-shuffle",
-                                        /*slot=*/222u);
-        // Task #32: hash the dot product's other two inputs (8-byte
-        // device uint64 each -> 2 floats).
-        ds4_cuda_dump_hash_raw_at_slot(ds4_mmvq_get_probe_grid_hash_ptr(),
-                                        /*n_floats=*/2u,
-                                        "MoE:iq2xxs-grid-hash",
-                                        /*slot=*/223u);
-        ds4_cuda_dump_hash_raw_at_slot(ds4_mmvq_get_probe_weight_hash_ptr(),
-                                        /*n_floats=*/2u,
-                                        "MoE:gate-weight-hash",
-                                        /*slot=*/224u);
     }
 
     return 0;
