@@ -8924,6 +8924,43 @@ extern "C" void ds4_cuda_dump_tag_at_slot(uint32_t tag, const char *label, uint3
     ds4_cuda_dump_tag_kernel<<<1, 1, 0, ds4_current_stream()>>>(tag, slot);
 }
 
+/* Step 7 task #38: emit-writer row+row-hash probe.  Reads the effective
+ * row index from a device uint32 (*row_ptr) and hashes exactly that row
+ * of `base` (head_dim floats).  Recorded into the captured emit graph so
+ * on replay slot_row/slot_hash reflect what the emit writer kernel beside
+ * it actually saw.  Used to bisect which writer in the
+ * pool->rms->rope->fp8 chain first produces a wrong comp_cache row. */
+__global__ static void ds4_emit_row_probe_kernel(
+        const float *base, uint32_t head_dim,
+        const uint32_t *row_ptr, uint32_t slot_row, uint32_t slot_hash) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    uint32_t row = row_ptr ? *row_ptr : 0xffffffffu;
+    if (slot_row < DS4_CUDA_DUMP_HASH_SLOTS) g_dump_hashes_dev[slot_row] = (uint64_t)row;
+    if (slot_hash < DS4_CUDA_DUMP_HASH_SLOTS && row_ptr) {
+        const float *r = base + (uint64_t)row * head_dim;
+        uint64_t h = 0xcbf29ce484222325ULL;
+        for (uint32_t i = 0; i < head_dim; i++) {
+            union { float f; uint32_t u; } x;
+            x.f = r[i];
+            h ^= (uint64_t)x.u;
+            h *= 0x100000001b3ULL;
+        }
+        g_dump_hashes_dev[slot_hash] = h;
+    }
+}
+
+extern "C" void ds4_cuda_emit_row_probe(
+        const void *base, uint32_t head_dim, const void *row_ptr,
+        const char *label_row, uint32_t slot_row,
+        const char *label_hash, uint32_t slot_hash) {
+    if (!ds4_cuda_dump_hash_enabled() || !base || !row_ptr) return;
+    if (slot_row  < DS4_CUDA_DUMP_HASH_SLOTS) g_dump_labels[slot_row]  = label_row;
+    if (slot_hash < DS4_CUDA_DUMP_HASH_SLOTS) g_dump_labels[slot_hash] = label_hash;
+    ds4_emit_row_probe_kernel<<<1, 1, 0, ds4_current_stream()>>>(
+            (const float *)base, head_dim, (const uint32_t *)row_ptr,
+            slot_row, slot_hash);
+}
+
 /* Step 7 deep-narrowing: one-shot probe-slot handoff between TUs.
  *
  * Background: the routed-MoE intra-branch probes (slots 213-216) showed
@@ -10576,10 +10613,21 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_row_tensor(
     if (!base || g_layer_dev == NULL || n_rot > head_dim ||
         il >= DS4_LAYER_SCALARS_COUNT ||
         base->bytes < (uint64_t)head_dim * sizeof(float)) return 0;
+    /* Step 7 task #38: emit-chain probe -- fp8 stage (slots 272-274). */
+    const int probe_fp8 = (il == 2u);
+    if (probe_fp8) {
+        ds4_cuda_emit_row_probe(base->ptr, head_dim, &g_layer_dev[il].comp_row,
+                                "fp8.row", 272u, "cc.before_fp8", 273u);
+    }
     fp8_kv_quantize_row_kernel<<<1, 64, 0, ds4_current_stream()>>>(
             (float *)base->ptr, head_dim, n_rot,
             g_layer_dev + il);
-    return cuda_ok(cudaGetLastError(), "fp8_kv_quantize_row launch");
+    int ok_fp8 = cuda_ok(cudaGetLastError(), "fp8_kv_quantize_row launch");
+    if (ok_fp8 && probe_fp8) {
+        ds4_cuda_emit_row_probe(base->ptr, head_dim, &g_layer_dev[il].comp_row,
+                                "fp8.row2", 275u, "cc.after_fp8", 274u);
+    }
+    return ok_fp8;
 }
 
 extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
@@ -10866,6 +10914,16 @@ extern "C" int ds4_gpu_compressor_update_tensor(
         ds4_cuda_dump_hash_raw_at_slot((const void *)&g_layer_dev[il], 4u,
                                         "emit:layer_scalars", 240u + il);
     }
+    /* Step 7 task #38: per-writer emit-chain probe on L2's attn compressor.
+     * Slots: pool 260-262, rms 264-266, rope 268-270 (fp8 272-274 done in
+     * the fp8 shim).  *.row = effective row each kernel saw; cc.* = the
+     * comp_cache[row] hash before/after each writer. */
+    const int probe_emit = (row_ptr_dev != NULL &&
+                            row_field == DS4_COMPRESSOR_ROW_COMP && il == 2u);
+    if (probe_emit) {
+        ds4_cuda_emit_row_probe(comp_cache->ptr, head_dim, row_ptr_dev,
+                                "pool.row", 260u, "cc.before_pool", 261u);
+    }
     compressor_update_pool_kernel<<<(head_dim + 255) / 256, 256, 0, ds4_current_stream()>>>(
             (float *)comp_cache->ptr,
             (const float *)state_kv->ptr,
@@ -10875,6 +10933,10 @@ extern "C" int ds4_gpu_compressor_update_tensor(
             comp_row,
             row_ptr_dev);
     int ok = cuda_ok(cudaGetLastError(), "compressor update pool launch");
+    if (probe_emit) {
+        ds4_cuda_emit_row_probe(comp_cache->ptr, head_dim, row_ptr_dev,
+                                "rms.row", 264u, "cc.after_pool", 262u);
+    }
     if (ok) {
         if (row_ptr_dev) {
             const char *w = cuda_model_range_ptr(model_map, norm_offset,
@@ -10889,6 +10951,10 @@ extern "C" int ds4_gpu_compressor_update_tensor(
                         row_ptr_dev,
                         rms_eps);
                 ok = cuda_ok(cudaGetLastError(), "compressor rms_norm row launch");
+                if (ok && probe_emit) {
+                    ds4_cuda_emit_row_probe(comp_cache->ptr, head_dim, row_ptr_dev,
+                                            "rope.row", 268u, "cc.after_rms", 266u);
+                }
             }
         } else {
             /* decode2-exact fallback: build a transient view over the
@@ -10925,6 +10991,10 @@ extern "C" int ds4_gpu_compressor_update_tensor(
                     freq_base, freq_scale, ext_factor, attn_factor,
                     beta_fast, beta_slow);
             ok = cuda_ok(cudaGetLastError(), "compressor rope_tail row launch");
+            if (ok && probe_emit) {
+                ds4_cuda_emit_row_probe(comp_cache->ptr, head_dim, row_ptr_dev,
+                                        "rope.row2", 271u, "cc.after_rope", 270u);
+            }
         }
     }
     if (ok && ratio == 4u) {
