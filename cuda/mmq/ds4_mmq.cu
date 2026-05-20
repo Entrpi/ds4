@@ -832,6 +832,22 @@ int ds4_mmq_moe_vec_impl(
         src1_q8_1_ptr = src1_q8_1_pool.get();
     }
 
+    // Step 7 task #30 (falsification): zero the Q8_1 buffer before quantize
+    // so any out-of-range read inside the matvec sees a known byte pattern.
+    // Slots 217/218 already prove the hashed Q8_1 bytes match across runs,
+    // but the matvec may stride past the used region into padding.  If this
+    // memset improves match rate, we have an out-of-range/padding read in
+    // the matvec.  Env-gated so the parity gate isn't slowed down.
+    static int memset_q81_init = 0;
+    static int memset_q81_en = 0;
+    if (!memset_q81_init) {
+        memset_q81_init = 1;
+        memset_q81_en = (getenv("DS4_CUDA_MMQ_Q81_MEMSET") != nullptr) ? 1 : 0;
+    }
+    if (memset_q81_en) {
+        cudaMemsetAsync(src1_q8_1_ptr, 0, nbytes_q8_1, stream);
+    }
+
     // s11 = stride between rows of an src1 channel in source-float units.
     //       Logical src1 [K, ne11=1, ne12=n_tokens, ne13=1] - K innermost.
     // s12 = stride between channels = K * ne11 = K.
