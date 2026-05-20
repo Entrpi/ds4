@@ -13182,6 +13182,22 @@ static bool metal_graph_encode_token_raw_swa(
             if (rc == 0) ds4_cuda_layer_graph_end_or_commit(il);
         }
 
+        /* Step 7 task #38 FIX: the compressed-row counters layer_n_comp[il]
+         * / layer_n_index_comp[il] are advanced by the per-layer body
+         * (metal_graph_encode_decode_layer_impl: `g->layer_n_comp[il]++`).
+         * When the layer is served by a replayed cudaGraph (rc==1) that
+         * body is skipped, so the counters froze -- the per-token prologue
+         * then re-published a stale comp_row into the layer-scalars
+         * substrate and every replayed FP8-KV emit overwrote the SAME
+         * compressed-KV row.  Advance the counters here for the replay
+         * path so the next token's substrate sees the correct pre-emit
+         * row.  eager / capture / warm paths (rc!=1) still increment
+         * inside the body, unchanged. */
+        if (rc == 1 && ok && emit_il) {
+            g->layer_n_comp[il]++;
+            if (il_ratio == 4u) g->layer_n_index_comp[il]++;
+        }
+
         ds4_gpu_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;
