@@ -10000,55 +10000,6 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     const char *w1 = cuda_model_range_ptr(model_map, weight1_offset, weight1_bytes, "q8_0_pair1");
     if (!w0 || !w1) return 0;
 
-    /* Opp B: mmvq n_tok=1 pair lift.  At n_tok=1 the legacy
-     * matmul_q8_0_pair_preq_warp8 kernel pays the tile overhead mmvq
-     * avoids (one CUDA block per output row, no column-tile waste).
-     * Route the two matmuls through ds4_mmq_q8_0_dense_vec -- the same
-     * mmvq dense path Step 6 already uses for the attention projections
-     * (attn_q_b, attn_output, shared_down) -- when the shape qualifies.
-     * Each call re-quantizes x to Q8_1 internally (a few-KB buffer at
-     * n_tok=1), so the legacy quantize_q8_0_f32 prequant below is simply
-     * skipped on this path.
-     *
-     * n_tok=1 ONLY.  The n_tok>=2 batch path (used by the MTP exact
-     * decode2 verifier) deliberately stays on the legacy paired kernel:
-     * the proof-budget work bans paired Q8 gate-up there because batched
-     * scalar order does not match sequential decode1.  This branch is
-     * gated on n_tok==1u so it never runs for n_tok>=2.
-     *
-     * No inner graph cache: under the default per-layer layer-graph
-     * capture both dense_vec launches run on ds4_current_stream() and
-     * fold into the outer captured graph.  When layer graphs are off
-     * they run eager -- still getting the mmvq kernel-shape win, which
-     * is the residual this lift targets (Opp A already absorbed the
-     * launch-overhead share). */
-    if (ds4_cuda_use_mmq() && n_tok == 1u && (in_dim % 256u == 0u) &&
-        getenv("DS4_CUDA_NO_MMVQ_DECODE") == NULL) {
-        cudaStream_t s = ds4_capture_active()
-                             ? ds4_current_stream()
-                             : (ds4_cuda_moe_graphs_enabled() ? ds4_cuda_moe_stream()
-                                                              : (cudaStream_t)0);
-        int rc0 = ds4_mmq_q8_0_dense_vec(w0, (const float *)x->ptr, (float *)out0->ptr,
-                                         (int)out0_dim, (int)n_tok, (int)in_dim, s);
-        if (rc0 == 0) {
-            int rc1 = ds4_mmq_q8_0_dense_vec(w1, (const float *)x->ptr, (float *)out1->ptr,
-                                             (int)out1_dim, (int)n_tok, (int)in_dim, s);
-            if (rc1 == 0) {
-                return 1;
-            }
-            fprintf(stderr, "ds4: ds4_mmq_q8_0_dense_vec (pair w1) returned %d "
-                            "(in=%llu out=%llu); falling back to legacy pair\n",
-                    rc1, (unsigned long long)in_dim, (unsigned long long)out1_dim);
-        } else {
-            fprintf(stderr, "ds4: ds4_mmq_q8_0_dense_vec (pair w0) returned %d "
-                            "(in=%llu out=%llu); falling back to legacy pair\n",
-                    rc0, (unsigned long long)in_dim, (unsigned long long)out0_dim);
-        }
-        /* Fall through to the legacy prequant + warp8 path below, which
-         * recomputes both outputs (out0 may be overwritten -- correct,
-         * and this failure path is not hot). */
-    }
-
     const uint64_t xq_bytes = n_tok * blocks * 32u;
     const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
     const uint64_t tmp_bytes = scale_offset + n_tok * blocks * sizeof(float);
