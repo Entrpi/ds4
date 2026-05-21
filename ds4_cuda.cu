@@ -8736,23 +8736,26 @@ struct layer_graph_entry {
 
 static struct layer_graph_entry g_layer_graphs[DS4_LAYER_GRAPH_CACHE_SIZE];
 
-/* Env-var enable.  Default OFF for Step 5; Step 8 flips to ON after Step 7
- * proves bit-identical determinism + perf uplift.  Recognized values for
- * enable: 1, on, ON, yes, YES, true, TRUE.  Anything else is disable.
+/* Env-var gate.  Default ON since Step 8: Step 7 proved per-layer
+ * decode-body capture bit-identical to eager through n=256 on sm_120
+ * (PRO 6000) and sm_121 (GB10), with a measured decode-throughput
+ * uplift and no prefill change.  Set DS4_CUDA_LAYER_GRAPHS=0 (also
+ * off/OFF/no/NO/false/FALSE) to fall back to the eager decode path.
+ * Any other value, including 1/on/yes/true, keeps the default ON.
  * extern "C" so ds4.c can gate the R4 split-flush + key build (Step 6). */
 extern "C" int ds4_cuda_layer_graphs_enabled(void) {
     static int init = 0;
-    static int enabled = 0;
+    static int enabled = 1;
     if (!init) {
         init = 1;
         const char *s = getenv("DS4_CUDA_LAYER_GRAPHS");
         if (s && *s &&
-            (strcmp(s, "1") == 0 ||
-             strcmp(s, "on") == 0 || strcmp(s, "ON") == 0 ||
-             strcmp(s, "yes") == 0 || strcmp(s, "YES") == 0 ||
-             strcmp(s, "true") == 0 || strcmp(s, "TRUE") == 0)) {
-            enabled = 1;
-            fprintf(stderr, "ds4: DS4_CUDA_LAYER_GRAPHS=%s - per-layer graph capture enabled\n", s);
+            (strcmp(s, "0") == 0 ||
+             strcmp(s, "off") == 0 || strcmp(s, "OFF") == 0 ||
+             strcmp(s, "no") == 0 || strcmp(s, "NO") == 0 ||
+             strcmp(s, "false") == 0 || strcmp(s, "FALSE") == 0)) {
+            enabled = 0;
+            fprintf(stderr, "ds4: DS4_CUDA_LAYER_GRAPHS=%s - per-layer graph capture disabled (eager decode)\n", s);
         }
     }
     return enabled;

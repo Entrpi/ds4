@@ -12981,10 +12981,11 @@ static bool metal_graph_encode_token_raw_swa(
         if (end != split_env && v <= DS4_N_LAYER) split_after_layers = (uint32_t)v;
     }
 
-    /* Step 6: per-layer cudaGraph capture/replay gate.  When
-     * DS4_CUDA_LAYER_GRAPHS=1 (and we're on a CUDA build), each layer body
-     * is captured into its own cudaGraphExec_t and replayed on subsequent
-     * tokens with matching keys.  R4: the mid-loop split-flush MUST be
+    /* Step 6: per-layer cudaGraph capture/replay gate.  On a CUDA build
+     * this is on by default (Step 8); each layer body is captured into its
+     * own cudaGraphExec_t and replayed on subsequent tokens with matching
+     * keys.  DS4_CUDA_LAYER_GRAPHS=0 falls back to eager decode.
+     * R4: the mid-loop split-flush MUST be
      * disabled here -- on CUDA `ds4_gpu_flush_commands()` is
      * `cudaDeviceSynchronize()` which would break the pipeline of replays.
      * Metal stub returns 0 from layer_graphs_enabled so behavior is

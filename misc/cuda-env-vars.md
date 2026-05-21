@@ -61,6 +61,17 @@ The bandwidth figure is informational; we don't tier on it.
   `cudaEventRecord` / `cudaStreamWaitEvent` so g_moe_stream and stream=0
   stay correctly ordered across the boundary.
 
+- `DS4_CUDA_LAYER_GRAPHS=0` (default on). Opt-out of per-layer
+  decode-body CUDA Graph capture+replay. On by default since the Step 7
+  determinism + perf gates passed: each transformer layer's decode body
+  is captured into its own `cudaGraphExec_t`, keyed on layer index /
+  token-flags / double-buffer parity, and replayed on subsequent
+  matching tokens. Per-token state rides device-resident scalar
+  substrates so it never enters the graph key. Verified bit-identical
+  to eager decode through n=256 on sm_120 (PRO 6000) and sm_121 (GB10);
+  decode-only, prefill is untouched. Set to 0 (also `off`/`no`/`false`)
+  to fall back to the eager per-layer decode path.
+
 - `DS4_CUDA_MTP_VERIFIER_USE_MMQ` (default 0). Bisection switch. Normally
   `ds4.c` brackets every MTP verifier call with
   `ds4_gpu_set_mtp_verifier(1/0)` and the CUDA backend routes Q8_0

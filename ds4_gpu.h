@@ -220,8 +220,8 @@ void  ds4_gpu_decode_layer_scalars_set(
  * cached executable on subsequent tokens.  CUDA-only; Metal stubs all of
  * these as no-ops (begin returns -1, end is a no-op, enabled returns 0).
  *
- * Opt-in via the DS4_CUDA_LAYER_GRAPHS env var; default OFF for Step 5/6/7,
- * default ON at Step 8 after determinism + perf gates pass.
+ * On by default since Step 8 (determinism + perf gates passed on sm_120
+ * and sm_121).  Set DS4_CUDA_LAYER_GRAPHS=0 to fall back to eager decode.
  *
  * Per-token scalars do NOT enter the key -- they ride on the token-stable
  * and per-layer scalar substrates (see ds4_gpu_decode_scalars_*) which
@@ -261,9 +261,10 @@ struct ds4_layer_graph_key {
     void    *index_state_score;
 };
 
-/* Returns 1 iff DS4_CUDA_LAYER_GRAPHS is set to an enable value.  Metal
- * stub returns 0.  Callers use this to gate the per-token build_key cost
- * and the R4 split-flush override. */
+/* Returns 1 unless DS4_CUDA_LAYER_GRAPHS is set to a disable value
+ * (0/off/no/false); default ON since Step 8.  Metal stub returns 0.
+ * Callers use this to gate the per-token build_key cost and the R4
+ * split-flush override. */
 int  ds4_cuda_layer_graphs_enabled(void);
 
 /* begin_or_replay return values:
