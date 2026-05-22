@@ -6,12 +6,14 @@
 # and compares the generated token-id dumps.  PASS = all OFF runs equal,
 # all ON runs equal, and OFF == ON (the parity gate).
 #
-# It compares the --dump-logprobs JSON, NOT the console output: greedy
-# argmax masks FP-tiny logit drift (a console of decoded text can look
-# identical while logits diverged), and the console also carries
-# mode-dependent perf lines (capture vs eager run at different tok/s), so
-# a console MD5 would both hide real divergences and fake false ones.
-# The --dump-logprobs dump is the authoritative per-token signal.
+# It compares the SELECTED token-id sequence from the --dump-logprobs
+# JSON -- not the console, and not the whole JSON file.  The console
+# carries mode-dependent perf lines (capture vs eager run at different
+# tok/s), so a console MD5 fakes false FAILs.  The JSON also carries
+# per-token logit/logprob floats (%.9g): those drift by FP-tiny
+# reduction-order noise that is NOT a decode divergence, so a whole-file
+# MD5 fakes false FAILs too.  The greedy argmax token-id sequence is the
+# authoritative per-token decode signal.
 #
 # Step 7 closed this gate: captured decode is bit-identical to eager
 # through n=256 on sm_120 (PRO 6000) and sm_121 (GB10).  This script is
@@ -62,9 +64,19 @@ run_one() {
     sleep 1
     env $mode_env $DS4 --cuda --temp 0 -n "$NTOK" -p "$PROMPT" \
         --dump-logprobs "$lp" --logprobs-top-k 1 > "$con" 2>&1
-    # MD5 the token-id / logprob dump -- the authoritative per-token
-    # signal (see the header for why the console is not compared).
-    md5sum < "$lp" | awk '{print $1}'
+    # MD5 the SELECTED token-id sequence only (see the header for why
+    # neither the console nor the whole JSON file is compared).
+    local ids
+    ids=$(grep -oE '"selected":\{"id":-?[0-9]+' "$lp" 2>/dev/null \
+          | grep -oE -- '-?[0-9]+$' | tr '\n' ',')
+    if [ -z "$ids" ]; then
+        # No tokens dumped (ds4 crashed / wrote no JSON). Emit a
+        # run-unique marker so empty runs can never collude into a
+        # false PASS.
+        echo "EMPTY-${mode_label}-${i}"
+    else
+        printf '%s' "$ids" | md5sum | awk '{print $1}'
+    fi
 }
 
 echo "==== DS4_CUDA_LAYER_GRAPHS=0 (baseline), n=$NTOK ===="
