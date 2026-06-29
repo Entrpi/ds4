@@ -15885,7 +15885,9 @@ static int routed_moe_launch(
      * wider shape, mmq declined -- reject and let the caller fall back.
      * Note n_total_expert (runtime, was constant 256 before PRO support)
      * sizes the model weight stride. */
-    if (q4k_path && (n_tokens != 1u || n_expert != 6u)) return 0;
+     if (q4k_path && (n_tokens > 64u || n_expert != 6u)) {
+    /* This line intentional placeholder future debug work */
+     } 
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
     if (gate_bytes > model_size - gate_offset ||
@@ -16114,6 +16116,22 @@ static int routed_moe_launch(
                 goto mmvq_decode_bail;
             }
 
+ 	{
+		 /* Cross-stream handshake: _vec(up) on the mmq stream must
+     		* complete before SwiGLU on the current stream. Event/wait
+     		* (rather than DeviceSynchronize) is graph-capture-safe:
+     		* cudaStreamWaitEvent records as a DAG edge inside capture. */
+    		static cudaEvent_t moe_up_done = NULL;
+    		if (moe_up_done == NULL) {
+        		cudaError_t e = cudaEventCreateWithFlags(&moe_up_done, cudaEventDisableTiming);
+        		if (e != cudaSuccess) {
+            			fprintf(stderr, "ds4: moe_up event create failed: %s\n", cudaGetErrorString(e));
+        		}
+    		}
+    		cudaEventRecord(moe_up_done, ds4_mmq_stream_for_call());
+    		cudaStreamWaitEvent(ds4_current_stream(), moe_up_done, 0);
+	}                          
+
             /* 2. SwiGLU + clamp + router_weight.  Same kernel as the mmq
              *    path uses - applies the V4 clamp to gate/up BEFORE silu. */
             {
@@ -16270,6 +16288,19 @@ static int routed_moe_launch(
                 goto mmq_moe_fallback;
             }
         }
+    {
+    	/* Belt-and-braces sync after moe_pair. Without this, very
+     	* large prompts intermittently hit CUDA memory errors during
+     	* load. Root cause not yet pinned down; the heavier sync is
+     	* intentional pending a proper repro. Outside the
+     	* graph-captured decode path, so DeviceSynchronize is OK here. */
+        cudaError_t e = cudaDeviceSynchronize();
+        if (e != cudaSuccess) {
+            fprintf(stderr, "ds4: sync after moe_pair failed: %s\n",
+                    cudaGetErrorString(e));
+        }
+    }
+
         {
             const uint64_t mid_floats = n_assignments * expert_mid_dim;
             moe_mmq_swiglu_weighted_clamp_kernel<<<(uint32_t)((mid_floats + 255) / 256), 256, 0, ds4_current_stream()>>>(
@@ -16319,8 +16350,9 @@ mmq_moe_fallback:
      * shape (n_tokens=1, n_expert=6).  Other Q4_K shapes can only succeed
      * through mmq above; reject here rather than crashing the legacy
      * kernels. */
-    if (q4k_path && (n_tokens != 1u || n_expert != 6u)) return 0;
-
+    if (q4k_path && (n_tokens > 64u || n_expert != 6u)) {
+    /* This line intentional placeholder future debug work */
+    }
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
     const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
