@@ -11372,19 +11372,47 @@ static bool enqueue(server *s, job *j) {
     return true;
 }
 
+/* ZOMBIE REAP (2026-07-20): a client that disconnects while its request is still
+ * QUEUED was invisible until the first write — the job kept its admission slot
+ * through minutes of queueing and then a full prefill emitted into a dead socket.
+ * Observed live (GB10 fleet): 4 such leaked in-flight requests halved cont-batch
+ * admission capacity, every new first-turn request queued 110-224s behind them and
+ * its client also gave up — a self-feeding clog with requests_failed=0 the whole
+ * time.  Detect the peer's orderly-shutdown FIN with a zero-byte MSG_PEEK before
+ * spending ANY engine work: recv()==0 -> peer closed; EAGAIN or pending bytes ->
+ * alive (the probe never consumes, so a slow-but-connected client is never
+ * false-positived). */
+static void job_finish(job *j);   /* defined below; needed by the reap sites */
+
+static bool client_disconnected(int fd) {
+    char b;
+    ssize_t r = recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    return r == 0;
+}
+
 static job *dequeue(server *s) {
-    pthread_mutex_lock(&s->mu);
-    while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
-    if (!s->head) {
+    for (;;) {
+        pthread_mutex_lock(&s->mu);
+        while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
+        if (!s->head) {
+            pthread_mutex_unlock(&s->mu);
+            return NULL;
+        }
+        job *j = s->head;
+        s->head = j->next;
+        if (!s->head) s->tail = NULL;
         pthread_mutex_unlock(&s->mu);
-        return NULL;
+        j->next = NULL;
+        if (client_disconnected(j->fd)) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: reaped queued request: client disconnected before admission "
+                       "(prompt=%d tokens never prefilled)", j->req.prompt.len);
+            j->outcome = JOB_OUT_FAILED;
+            job_finish(j);
+            continue;
+        }
+        return j;
     }
-    job *j = s->head;
-    s->head = j->next;
-    if (!s->head) s->tail = NULL;
-    pthread_mutex_unlock(&s->mu);
-    j->next = NULL;
-    return j;
 }
 
 /* ---- W3: request-coalescing ------------------------------------------------
@@ -11532,6 +11560,14 @@ static int coalesce_gather(server *s, job **out, int cap, int wait_ms, int max_t
             s->head = g->next;
             if (!s->head) s->tail = NULL;
             g->next = NULL;
+            if (client_disconnected(g->fd)) {   /* zombie reap — same gate as dequeue() */
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: reaped queued request: client disconnected before batch gather "
+                           "(prompt=%d tokens never prefilled)", g->req.prompt.len);
+                g->outcome = JOB_OUT_FAILED;
+                job_finish(g);
+                continue;
+            }
             tok_total += job_tok_footprint(s, g);
             out[n++] = g;
             continue;
@@ -12060,12 +12096,24 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
          * admits (return 0) so it stays at the head and is served next -- the
          * same FIFO discipline coalesce_gather uses, so nothing is starved. */
         pthread_mutex_lock(&s->mu);
-        if (s->head && job_is_batchable(&s->head->req) &&
-            s->head->req.prompt.len > 0 && s->head->req.prompt.len <= cs->seq_cap) {
-            j = s->head;
-            s->head = j->next;
-            if (!s->head) s->tail = NULL;
-            j->next = NULL;
+        for (;;) {
+            if (s->head && job_is_batchable(&s->head->req) &&
+                s->head->req.prompt.len > 0 && s->head->req.prompt.len <= cs->seq_cap) {
+                j = s->head;
+                s->head = j->next;
+                if (!s->head) s->tail = NULL;
+                j->next = NULL;
+                if (client_disconnected(j->fd)) {   /* zombie reap — same gate as dequeue() */
+                    server_log(DS4_LOG_WARNING,
+                               "ds4-server: reaped queued request: client disconnected before cont admit "
+                               "(prompt=%d tokens never prefilled)", j->req.prompt.len);
+                    j->outcome = JOB_OUT_FAILED;
+                    job_finish(j);
+                    j = NULL;
+                    continue;                       /* zombie freed a spot — try the next head */
+                }
+            }
+            break;
         }
         pthread_mutex_unlock(&s->mu);
         if (!j) return 0;
