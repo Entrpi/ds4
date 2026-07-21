@@ -11768,28 +11768,63 @@ static void warm_rec_invalidate(server *s, int bank) {
     warm_records_gauge_refresh(s);
 }
 
+/* Append the committed generation (tokens[0..n-2]) to b as detokenized text. */
+static void cont_append_committed_text(server *s, buf *b, const int *tokens, int n) {
+    for (int k = 0; k < n - 1; k++) {
+        size_t pl = 0;
+        char *piece = ds4_token_text(s->engine, tokens[k], &pl);
+        if (piece) { buf_append(b, piece, pl); free(piece); }
+    }
+}
+
 /* Retire job j's bank at on_done: rebuild the record a follow-up request
  * extending this conversation will byte-prefix-match.  The engine never
  * forwards the final sample, so the committed generation is tokens[0..n-2]
- * uniformly (EOS/budget/abort, and mode-2's per-step commits).  Thinking rows
- * retire INVALID -- the next rendering omits reasoning, so a raw text key
- * would be wrong.  Tool turns stay matchable because the next renderer
- * replays the remembered raw_dsml verbatim.  Stop-finish rows build records
- * that simply never match (committed post-stop tokens) -- harmless. */
-static void cont_warm_retire(server *s, job *j, const int *tokens, int n) {
+ * uniformly (EOS/budget/abort, and mode-2's per-step commits).  Tool turns
+ * stay matchable because the next renderer replays the remembered raw_dsml
+ * verbatim.  Stop-finish rows build records that simply never match
+ * (committed post-stop tokens) -- harmless.
+ *
+ * Thinking rows need a key the NEXT rendering will actually reproduce, and
+ * prompt_preserves_reasoning already says which one that is:
+ *
+ *   - preserved (the history carries tool context, so render_chat_prompt_text
+ *     replays the reasoning): the raw key is what comes back, retire normally.
+ *   - otherwise: key on the VISIBLE transcript, as the session path already
+ *     does (build_toolless_thinking_visible_text).  The payload stays the
+ *     bank's committed frontier, which cont_warm_pick pairs with a tokenized
+ *     suffix, so hidden reasoning stays in KV and is never re-prefilled.
+ *
+ * Same gates as should_remember_thinking_checkpoint(): chat only, tool-less,
+ * a clean finish, and a closed thinking block.  Anything else retires without
+ * a record, as before. */
+static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
+                             int finish) {
     if (!s->warm || j->cont_bank < 0 || j->cont_bank >= s->batch_ctx_max_seq) return;
     const int bank = j->cont_bank;
     warm_rec_invalidate(s, bank);
     s->warm[bank].last_use = ++s->warm_clock;
     if (!tokens || n <= 0) return;
     if (!j->req.prompt_text || !j->req.prompt_text[0]) return;
-    if (ds4_think_mode_enabled(j->req.think_mode)) return;
+
     buf tb = {0};
-    buf_puts(&tb, j->req.prompt_text);
-    for (int k = 0; k < n - 1; k++) {
-        size_t pl = 0;
-        char *piece = ds4_token_text(s->engine, tokens[k], &pl);
-        if (piece) { buf_append(&tb, piece, pl); free(piece); }
+    if (!ds4_think_mode_enabled(j->req.think_mode) ||
+        j->req.prompt_preserves_reasoning)
+    {
+        buf_puts(&tb, j->req.prompt_text);
+        cont_append_committed_text(s, &tb, tokens, n);
+    } else {
+        if (j->req.kind != REQ_CHAT || j->req.has_tools || !finish) return;
+        buf gen = {0};
+        cont_append_committed_text(s, &gen, tokens, n);
+        const char *close = gen.ptr ? strstr(gen.ptr, "</think>") : NULL;
+        char *visible = close ? build_toolless_thinking_visible_text(
+                                    &j->req, close + strlen("</think>"))
+                              : NULL;
+        buf_free(&gen);
+        if (!visible) return;          /* not keyable -- retire without a record */
+        buf_puts(&tb, visible);
+        free(visible);
     }
     s->warm[bank].text = tb.ptr;
     s->warm[bank].len = tb.len;
@@ -12522,7 +12557,7 @@ static void cont_on_done(void *ud, void *user, const int *tokens, int n, int fin
     job *j = user;
     /* A2a: retire the bank this job occupied (rebuild its warm record) and drop
      * the warm effective prompt -- the engine is done reading it. */
-    cont_warm_retire(cs->s, j, tokens, n);
+    cont_warm_retire(cs->s, j, tokens, n, finish);
     ds4_tokens_free(&j->warm_prompt);
     memset(&j->warm_prompt, 0, sizeof(j->warm_prompt));
     /* v0.2.x observability: merge the engine's per-sequence stats (valid only
