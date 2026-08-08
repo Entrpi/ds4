@@ -15802,10 +15802,15 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
 }
 
 static void append_model_json(buf *b, const server *s, const char *id) {
+    /* Advertise the CONFIGURED -c (serial_boot_ctx), not the live session
+     * ctx: v0.5.2 right-sizing swaps the serial session smaller under
+     * gen_mu, and client threads must not read it. Reporting the shrunk
+     * value breaks clients (e.g. Hermes Agent) that enforce a minimum
+     * context window from /v1/models. */
     append_model_json_values(b,
                              id,
                              ds4_engine_model_name(s->engine),
-                             ds4_session_ctx(s->session),
+                             s->serial_boot_ctx,
                              s->default_tokens);
 }
 
