@@ -80,6 +80,19 @@ numbers, but is not required for a working, speedup‑positive drafter.
 The drafter arms on the continuous path. `DS4_DSPARK_QUENCH=0` disables the
 per‑sequence yield guard (useful for measuring raw acceptance).
 
+## Known issue: M5 Max serving decode collapse (unresolved)
+
+On an Apple M5 Max (128 GB, macOS 26.5/25F71), `ds4-server` from this fork at
+v0.5.6.1 decodes at ~1 tok/s on the continuous Metal path, while upstream
+`antirez/ds4` (`b030961`) on the same machine, same GGUF (the 0731 ship quant),
+same session reaches 38–40 tok/s. Prefill is unaffected. It reproduces with
+`--no-spec`, so the drafter is not the cause — with the drafter armed, the yield
+guard quenches immediately (accept 0.0%), which is a symptom of the slow verify
+steps. `DS4_METAL_NO_RESIDENCY=1` and context sizes 32k–49k make no difference.
+The same build serves normally on CUDA/GB10. See the PR description for full
+measurements. Until this is root-caused, upstream is the faster Metal server on
+at least this hardware.
+
 ## Credits
 
 This work stands on:
