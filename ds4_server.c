@@ -5200,9 +5200,32 @@ static void append_openai_usage_json(buf *b, const request *r,
 static void append_timings_json(buf *b, const request *r) {
     const req_timings *t = r ? &r->timings : NULL;
     if (!t || !t->valid) return;
+    /* llama.cpp-compatible fields (llama-swap webui reads these): prompt_n =
+     * total prompt tokens, predicted_n = generated tokens, cache_n = cached
+     * prompt tokens, prompt_ms/predicted_ms already ms-converted (never raw
+     * seconds), and per-second fields derived from those ms values as
+     * tokens / (ms / 1e3).  Zero-duration inputs emit 0.0 with no
+     * division-by-zero.  predicted_n counts every accepted token because
+     * decode_tokens = acc.completion, and sem_accum_feed increments
+     * a->completion once per accepted token (drafted or sampled), so the
+     * reported throughput is draft-inclusive. */
+    const double prompt_n = (double)(t->prefill_tokens + t->prefill_cached);
+    const double predicted_n = (double)t->decode_tokens;
+    const double cache_n = (double)t->prefill_cached;
+    const double prompt_per_second =
+        t->prefill_ms > 0.0 ? prompt_n / (t->prefill_ms / 1e3) : 0.0;
+    const double predicted_per_second =
+        t->decode_ms > 0.0 ? predicted_n / (t->decode_ms / 1e3) : 0.0;
+
     buf_printf(b, ",\"timings\":{\"ttft_ms\":%.1f,\"prefill_tokens\":%d,"
-                  "\"prefill_cached_tokens\":%d",
-               t->ttft_ms, t->prefill_tokens, t->prefill_cached);
+                  "\"prefill_cached_tokens\":%d"
+                  ",\"prompt_n\":%.0f,\"predicted_n\":%.0f,\"cache_n\":%.0f"
+                  ",\"prompt_ms\":%.1f,\"predicted_ms\":%.1f"
+                  ",\"prompt_per_second\":%.2f,\"predicted_per_second\":%.2f",
+               t->ttft_ms, t->prefill_tokens, t->prefill_cached,
+               prompt_n, predicted_n, cache_n,
+               t->prefill_ms, t->decode_ms,
+               prompt_per_second, predicted_per_second);
     if (t->prefill_tokens > 0 && t->prefill_ms > 0.0)
         buf_printf(b, ",\"prefill_tok_s\":%.1f",
                    (double)t->prefill_tokens / (t->prefill_ms / 1e3));
@@ -18897,6 +18920,13 @@ static void test_timings_block_renders_next_to_usage(void) {
     TEST_ASSERT(strstr(out, "\"timings\":{\"ttft_ms\":812.5") != NULL);
     TEST_ASSERT(strstr(out, "\"prefill_tokens\":1000") != NULL);
     TEST_ASSERT(strstr(out, "\"prefill_cached_tokens\":24") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_n\":1024") != NULL);          /* 1000 + 24 */
+    TEST_ASSERT(strstr(out, "\"predicted_n\":101") != NULL);
+    TEST_ASSERT(strstr(out, "\"cache_n\":24") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_ms\":500.0") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_ms\":2000.0") != NULL);
+    TEST_ASSERT(strstr(out, "\"prompt_per_second\":2048.00") != NULL); /* 1024/(500ms) */
+    TEST_ASSERT(strstr(out, "\"predicted_per_second\":50.50") != NULL); /* 101/(2000ms) */
     TEST_ASSERT(strstr(out, "\"prefill_tok_s\":2000.0") != NULL);
     TEST_ASSERT(strstr(out, "\"decode_tok_s\":50.0") != NULL);
     TEST_ASSERT(strstr(out, "\"spec_accept_rate\":0.800") != NULL);
@@ -18916,6 +18946,19 @@ static void test_timings_block_renders_next_to_usage(void) {
     out = read_socket_text(sv[1]);
     TEST_ASSERT(strstr(out, "\"timings\":{") != NULL);
     TEST_ASSERT(strstr(out, "spec_accept_rate") == NULL);
+    free(out);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* Zero-duration timings: per-second fields emit 0.0, no div-by-zero. */
+    r.timings.prefill_ms = 0.0;
+    r.timings.decode_ms = 0.0;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(sse_done(sv[0], &r, "chatcmpl_timings3", 1024, 101));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"prompt_per_second\":0.00") != NULL);
+    TEST_ASSERT(strstr(out, "\"predicted_per_second\":0.00") != NULL);
     free(out);
     close(sv[0]);
     close(sv[1]);
