@@ -1245,9 +1245,20 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+/* Per-call speculative-decode accounting for the serial path.  `drafted` is
+ * the number of MTP draft tokens proposed (including the first proposed
+ * draft), and `accepted` is the number of those drafts that were verified and
+ * committed (the unconditionally committed first_token is NOT counted).
+ * Mirrors the batch path's ds4_cont_seq_stats.spec_drafts/spec_hits. */
+typedef struct {
+    int drafted;
+    int accepted;
+} ds4_spec_stats;
+
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
+                                        ds4_spec_stats *stats,
                                         char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
