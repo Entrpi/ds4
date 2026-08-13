@@ -675,7 +675,7 @@ int main(int argc, char **argv) {
                                                                eos,
                                                                toks,
                                                                (int)(sizeof(toks) / sizeof(toks[0])),
-                                                               err,
+                                                               NULL, err,
                                                                sizeof(err));
                 if (ntok < 0) {
                     fprintf(stderr, "ds4-bench: speculative decode at frontier %d failed: %s\n", frontier, err);

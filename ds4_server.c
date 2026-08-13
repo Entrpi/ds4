@@ -5232,9 +5232,15 @@ static void append_timings_json(buf *b, const request *r) {
     if (t->decode_tokens > 1 && t->decode_ms > 0.0)
         buf_printf(b, ",\"decode_tok_s\":%.1f",
                    (double)(t->decode_tokens - 1) / (t->decode_ms / 1e3));
-    if (t->spec_drafts > 0)
-        buf_printf(b, ",\"spec_accept_rate\":%.3f",
+    if (t->spec_drafts > 0) {
+        /* llama-swap's ActivityTable "Drafted" column reads draft_n /
+         * draft_n_accepted (llama.cpp-server keys); spec_accept_rate is an
+         * extra derived convenience field. */
+        buf_printf(b, ",\"draft_n\":%lld,\"draft_n_accepted\":%lld"
+                      ",\"spec_accept_rate\":%.3f",
+                   t->spec_drafts, t->spec_hits,
                    (double)t->spec_hits / (double)t->spec_drafts);
+    }
     if (t->decode_steps > 0)
         buf_printf(b, ",\"tok_per_step\":%.2f",
                    (double)t->decode_tokens / (double)t->decode_steps);
@@ -12363,6 +12369,8 @@ static void generate_job(server *s, job *j) {
      * decode_again tool-recovery rerun; timings reflect the full request). */
     double t_first_tok = 0.0;
     int serial_decode_steps = 0;
+    int serial_spec_drafts = 0;
+    int serial_spec_hits = 0;
 decode_again:
     ;
     /* Inc 7a: ALL per-token semantic state lives in the shared accumulator;
@@ -12427,14 +12435,24 @@ decode_again:
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
+            ds4_spec_stats stats = {0};
             ntok = ds4_session_eval_speculative_argmax(s->session,
                                                        token,
                                                        max_tokens - acc.completion,
                                                        ds4_token_eos(s->engine),
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
-                                                       err,
+                                                       &stats, err,
                                                        sizeof(err));
+            serial_spec_drafts += stats.drafted;
+            serial_spec_hits += stats.accepted;
+            /* v0.2.x observability: feed the global speculation counters so the
+             * /v1/stats "Drafted"/"Hits" board (and Prometheus totals) reflect the
+             * serial path too -- mirrors ds4.c:36599. */
+            if (stats.drafted) ds4_metric_add(&ds4_metrics_get()->spec_drafts,
+                                              (uint64_t)stats.drafted);
+            if (stats.accepted) ds4_metric_add(&ds4_metrics_get()->spec_hits,
+                                               (uint64_t)stats.accepted);
             if (ntok < 0) {
                 finish = "error";
                 break;
@@ -12934,6 +12952,8 @@ decode_again:
         t->prefill_cached = cached;
         t->decode_tokens = acc.completion;
         t->decode_steps = serial_decode_steps;
+        t->spec_drafts = serial_spec_drafts;
+        t->spec_hits = serial_spec_hits;
     }
 
     {
