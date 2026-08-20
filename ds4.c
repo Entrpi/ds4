@@ -40235,14 +40235,18 @@ static bool ds4_mtp_exact_policy_use_seq(ds4_session *s) {
     return use_seq;
 }
 
+static void ds4_spec_stats_apply(ds4_spec_stats *st, int drafted,
+                                 int accepted_drafts) {
+    if (!st) return;
+    st->drafted = drafted;
+    st->accepted = accepted_drafts > 0 ? accepted_drafts : 0;
+}
+
 static void ds4_mtp_accept_gate_record(ds4_session *s,
                                        int accepted_drafts,
                                        int proposed_drafts,
                                        ds4_spec_stats *stats) {
-    if (stats) {
-        stats->drafted = proposed_drafts;
-        stats->accepted = accepted_drafts;
-    }
+    ds4_spec_stats_apply(stats, proposed_drafts, accepted_drafts);
     if (!s || proposed_drafts <= 0) return;
     if (accepted_drafts < 0) accepted_drafts = 0;
     if (accepted_drafts > proposed_drafts) accepted_drafts = proposed_drafts;
@@ -40483,7 +40487,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (preserve_target_frontier && draft_cap > 1) {
         have_draft_frontier = spec_frontier_snapshot(&draft_frontier, s);
         if (!have_draft_frontier) {
-            if (stats) { stats->drafted = draft_n; stats->accepted = n_accept - 1; }
+            ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
             return n_accept;
         }
     }
@@ -40512,7 +40516,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 s->graph.mtp_n_raw = mtp_n_raw_after_draft;
                 spec_frontier_free(&draft_frontier);
             }
-            if (stats) { stats->drafted = draft_n; stats->accepted = n_accept - 1; }
+            ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
             return n_accept;
         }
         if (mtp_fast_top2) mtp_last_top2 = mtp_top2;
@@ -40528,7 +40532,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             spec_frontier_free(&draft_frontier);
             snprintf(err, errlen, "MTP draft frontier restore failed");
             s->checkpoint_valid = false;
-            if (stats) { stats->drafted = draft_n; stats->accepted = n_accept - 1; }
+            ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
             return -1;
         }
         s->graph.mtp_n_raw = mtp_n_raw_after_draft;
@@ -40565,7 +40569,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 free(row_logits);
                 snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
                 s->checkpoint_valid = false;
-                if (stats) { stats->drafted = draft_n; stats->accepted = n_accept - 1; }
+                ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
                 return -1;
             }
             memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
@@ -40653,7 +40657,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (!ok) {
             snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
             s->checkpoint_valid = false;
-            if (stats) { stats->drafted = draft_n; stats->accepted = n_accept - 1; }
+            ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
             return -1;
         }
         s->checkpoint_valid = true;
@@ -41430,7 +41434,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             free(shadow_exact_logits0);
             free(shadow_exact_logits1);
             free(row_tops);
-            if (stats) { stats->drafted = draft_n; stats->accepted = n_accept - 1; }
+            ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
             return -1;
         }
         spec_frontier_free(&frontier);
@@ -41479,7 +41483,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (!_ver_raw_ok) {
             snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
             s->checkpoint_valid = false;
-            if (stats) { stats->drafted = draft_n; stats->accepted = n_accept - 1; }
+            ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
             return -1;
         }
         token_vec_push(&s->checkpoint, drafts[i]);
@@ -41496,7 +41500,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         {
             snprintf(err, errlen, "%s logits readback failed", ds4_backend_name(e->backend));
             s->checkpoint_valid = false;
-            if (stats) { stats->drafted = draft_n; stats->accepted = n_accept - 1; }
+            ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
             return -1;
         }
         logits_on_host = true;
