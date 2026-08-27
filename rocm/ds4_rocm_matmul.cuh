@@ -1,3 +1,60 @@
+template <uint32_t BM, uint32_t BN>
+__global__ static void matmul_f16_smallm_wmma_kernel(
+        float *out, const half *w, const half *x,
+        uint32_t m, uint32_t n, uint32_t k) {
+    static_assert(BM % 16u == 0u && BN % 16u == 0u, "16x16 WMMA tiles");
+    constexpr uint32_t WM = BM / 16u;
+    constexpr uint32_t WN = BN / 16u;
+    constexpr uint32_t WAVES = WM * WN;
+    static_assert(WAVES <= 32u, "at most 1024 wave32 threads");
+
+    __shared__ half sa[BM * 16u];
+    __shared__ half sb[16u * BN];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t wm = wave % WM;
+    const uint32_t wn = wave / WM;
+    const uint32_t m0 = blockIdx.x * BM;
+    const uint32_t n0 = blockIdx.y * BN;
+
+    using fa_t = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, half,
+                                   rocwmma::row_major>;
+    using fb_t = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, half,
+                                   rocwmma::col_major>;
+    using fc_t = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float>;
+    fa_t a;
+    fb_t b;
+    fc_t c;
+    rocwmma::fill_fragment(c, 0.0f);
+
+    for (uint32_t k0 = 0; k0 < k; k0 += 16u) {
+        for (uint32_t p = tid; p < BM * 8u; p += WAVES * 32u) {
+            const uint32_t j = p * 2u;
+            const uint32_t kk = j & 15u;
+            const uint32_t row = j >> 4u;
+            *reinterpret_cast<uint32_t *>(sa + j) =
+                    *reinterpret_cast<const uint32_t *>(
+                            w + (k0 + kk) + (uint64_t)(m0 + row) * k);
+        }
+        for (uint32_t p = tid; p < 8u * BN; p += WAVES * 32u) {
+            const uint32_t j = p * 2u;
+            const uint32_t kk = j & 15u;
+            const uint32_t col = j >> 4u;
+            *reinterpret_cast<uint32_t *>(sb + j) =
+                    *reinterpret_cast<const uint32_t *>(
+                            x + (k0 + kk) + (uint64_t)(n0 + col) * k);
+        }
+        __syncthreads();
+        rocwmma::load_matrix_sync(a, sa + wm * 16u * 16u, 16u);
+        rocwmma::load_matrix_sync(b, sb + wn * 16u * 16u, 16u);
+        rocwmma::mma_sync(c, a, b, c);
+        __syncthreads();
+    }
+    rocwmma::store_matrix_sync(
+            out + (m0 + wm * 16u) + (uint64_t)(n0 + wn * 16u) * m,
+            c, m, rocwmma::mem_col_major);
+}
+
 __global__ static void matmul_f16_tinym24_wmma_kernel(
         float *out, const half *w, const half *x) {
     constexpr uint32_t M=24u, N=2048u, K=16384u, BM=32u, BN=64u, WAVES=8u;
@@ -865,6 +922,24 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
             tinym_env[0] != '\0' && tinym_env[0] != '0') {
             matmul_f16_tinym24_wmma_kernel<<<32u, 256u>>>((float *)out->ptr, w, xh);
             return cuda_ok(cudaGetLastError(), "f16 tinym24 wmma launch");
+        }
+        const char *smallm_env = getenv("DS4_ROCM_F16_SMALLM_WMMA");
+        if (in_dim == 4096u && n_tok == 2048u && smallm_env &&
+            smallm_env[0] != '\0' && smallm_env[0] != '0') {
+            if (out_dim == 64u || out_dim == 512u || out_dim == 1024u) {
+                const dim3 grid((uint32_t)out_dim / 64u, (uint32_t)n_tok / 64u, 1u);
+                matmul_f16_smallm_wmma_kernel<64u, 64u><<<grid, 512u>>>(
+                        (float *)out->ptr, w, xh,
+                        (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim);
+                return cuda_ok(cudaGetLastError(), "f16 smallm wmma launch");
+            }
+            if (out_dim == 256u) {
+                const dim3 grid((uint32_t)out_dim / 128u, (uint32_t)n_tok / 64u, 1u);
+                matmul_f16_smallm_wmma_kernel<128u, 64u><<<grid, 1024u>>>(
+                        (float *)out->ptr, w, xh,
+                        (uint32_t)out_dim, (uint32_t)n_tok, (uint32_t)in_dim);
+                return cuda_ok(cudaGetLastError(), "f16 smallm wmma launch");
+            }
         }
         const float alpha = 1.0f;
         const float beta = 0.0f;

@@ -9,10 +9,23 @@
 
 namespace {
 
-constexpr int M = 1024;
-constexpr int N = 2048;
-constexpr int K = 4096;
-constexpr int BATCH = 8;
+#ifndef LAB_M
+#define LAB_M 1024
+#endif
+#ifndef LAB_N
+#define LAB_N 2048
+#endif
+#ifndef LAB_K
+#define LAB_K 4096
+#endif
+#ifndef LAB_BATCH
+#define LAB_BATCH 8
+#endif
+
+constexpr int M = LAB_M;
+constexpr int N = LAB_N;
+constexpr int K = LAB_K;
+constexpr int BATCH = LAB_BATCH;
 
 #define HIP_OK(expr) do { \
     hipError_t e_ = (expr); \
@@ -100,6 +113,9 @@ __global__ void f16_gemm_tn_wmma_batched(float *c, const half *a, const half *b)
 
 template <int BLOCK_M, int BLOCK_N>
 float time_custom(float *c, const half *a, const half *b, int reps) {
+    if constexpr (M % BLOCK_M != 0 || N % BLOCK_N != 0 || M < BLOCK_M) {
+        return NAN;
+    }
     constexpr int waves = (BLOCK_M / 16) * (BLOCK_N / 16);
     const dim3 grid(M / BLOCK_M, N / BLOCK_N, BATCH);
     const dim3 block(waves * 32, 1, 1);
@@ -171,6 +187,17 @@ void compare(const float *ref_dev, const float *got_dev) {
                 max_abs, std::sqrt(se / count), bad, count);
 }
 
+template <int BLOCK_M, int BLOCK_N>
+void check_variant(const char *name, float *got, const float *ref,
+                   const half *a, const half *b, int reps, float *timing) {
+    *timing = time_custom<BLOCK_M, BLOCK_N>(got, a, b, reps);
+    if (std::isfinite(*timing)) {
+        compare(ref, got);
+    } else {
+        std::printf("correctness %s skipped for M=%d N=%d\n", name, M, N);
+    }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -193,23 +220,33 @@ int main(int argc, char **argv) {
     hipblasHandle_t handle = nullptr;
     BLAS_OK(hipblasCreate(&handle));
     const float blas_ms = time_hipblas(handle, ref, a, b, reps);
-    const float m64n64 = time_custom<64, 64>(got, a, b, reps);
-    compare(ref, got);
-    const float m128n32 = time_custom<128, 32>(got, a, b, reps);
-    compare(ref, got);
-    const float m64n32 = time_custom<64, 32>(got, a, b, reps);
-    compare(ref, got);
-    const float m128n64 = time_custom<128, 64>(got, a, b, reps);
-    compare(ref, got);
-    const float m32n128 = time_custom<32, 128>(got, a, b, reps);
-    compare(ref, got);
+    float m16n64, m16n128, m32n64, m32n128, m64n32, m64n64,
+          m64n128, m128n32, m128n64, m256n16, m256n32;
+    check_variant<16, 64>("m16n64", got, ref, a, b, reps, &m16n64);
+    check_variant<16, 128>("m16n128", got, ref, a, b, reps, &m16n128);
+    check_variant<32, 64>("m32n64", got, ref, a, b, reps, &m32n64);
+    check_variant<32, 128>("m32n128", got, ref, a, b, reps, &m32n128);
+    check_variant<64, 32>("m64n32", got, ref, a, b, reps, &m64n32);
+    check_variant<64, 64>("m64n64", got, ref, a, b, reps, &m64n64);
+    check_variant<64, 128>("m64n128", got, ref, a, b, reps, &m64n128);
+    check_variant<128, 32>("m128n32", got, ref, a, b, reps, &m128n32);
+    check_variant<128, 64>("m128n64", got, ref, a, b, reps, &m128n64);
+    check_variant<256, 16>("m256n16", got, ref, a, b, reps, &m256n16);
+    check_variant<256, 32>("m256n32", got, ref, a, b, reps, &m256n32);
 
+    std::printf("shape M=%d N=%d K=%d batch=%d\n", M, N, K, BATCH);
     std::printf("hipblas %.3f ms\n", blas_ms);
-    std::printf("wmma m64n64 %.3f ms\n", m64n64);
-    std::printf("wmma m128n32 %.3f ms\n", m128n32);
-    std::printf("wmma m64n32 %.3f ms\n", m64n32);
-    std::printf("wmma m128n64 %.3f ms\n", m128n64);
+    std::printf("wmma m16n64 %.3f ms\n", m16n64);
+    std::printf("wmma m16n128 %.3f ms\n", m16n128);
+    std::printf("wmma m32n64 %.3f ms\n", m32n64);
     std::printf("wmma m32n128 %.3f ms\n", m32n128);
+    std::printf("wmma m64n32 %.3f ms\n", m64n32);
+    std::printf("wmma m64n64 %.3f ms\n", m64n64);
+    std::printf("wmma m64n128 %.3f ms\n", m64n128);
+    std::printf("wmma m128n32 %.3f ms\n", m128n32);
+    std::printf("wmma m128n64 %.3f ms\n", m128n64);
+    std::printf("wmma m256n16 %.3f ms\n", m256n16);
+    std::printf("wmma m256n32 %.3f ms\n", m256n32);
 
     BLAS_OK(hipblasDestroy(handle));
     HIP_OK(hipFree(got));
