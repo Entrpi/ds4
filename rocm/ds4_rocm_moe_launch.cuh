@@ -309,7 +309,7 @@ static int routed_moe_q2_float_down_launch(
                 const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
                                 (hot_max + mt * bm - 1u) / (mt * bm), hot_count);
                 const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(half) +
-                                        (2u * mt * bm * bn) * sizeof(float);
+                                        (mt * bm * bn) * sizeof(float);
                 if (use_f16_down && hot_mid_f16 && mid_h_hot) {
                     moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true,true><<<grid, block, shmem_n2>>>(
                             NULL, down_h, down_w, NULL, mid_h_hot,
@@ -337,7 +337,7 @@ static int routed_moe_q2_float_down_launch(
                 const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
                                 (hot_max + mt * bm - 1u) / (mt * bm), hot_count);
                 const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(half) +
-                                        (2u * mt * bm * bn) * sizeof(float);
+                                        (mt * bm * bn) * sizeof(float);
                 if (use_f16_down && hot_mid_f16 && mid_h_hot) {
                     moe_down_q2K_hotlist_wmma_n2_kernel<16,16,16,16,true,true><<<grid, block, shmem_n2>>>(
                             NULL, down_h, down_w, NULL, mid_h_hot,
@@ -365,7 +365,7 @@ static int routed_moe_q2_float_down_launch(
                 const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
                                 (hot_max + mt * bm - 1u) / (mt * bm), hot_count);
                 const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(half) +
-                                        (2u * mt * bm * bn) * sizeof(float);
+                                        (mt * bm * bn) * sizeof(float);
                 if (use_f16_down && hot_mid_f16 && mid_h_hot) {
                     moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16,true,true><<<grid, block, shmem_n2>>>(
                             NULL, down_h, down_w, NULL, mid_h_hot,

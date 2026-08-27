@@ -5165,8 +5165,7 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
     half *shA = reinterpret_cast<half *>(raw_sh);
     half *shB0 = shA + MTILES * BM * BK;
     half *shB1 = shB0 + BK * BN;
-    float *shC0 = reinterpret_cast<float *>(shB1 + BK * BN);
-    float *shC1 = shC0 + MTILES * BM * BN;
+    float *shC = reinterpret_cast<float *>(shB1 + BK * BN);
     const uint32_t hot_idx = (uint32_t)blockIdx.z;
     if (hot_idx >= hot_count) return;
     const uint32_t expert = hot_experts[hot_idx];
@@ -5239,8 +5238,7 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
     }
 
     if (wave < MTILES) {
-        rocwmma::store_matrix_sync(shC0 + wave * BM * BN, acc0, BN, rocwmma::mem_row_major);
-        rocwmma::store_matrix_sync(shC1 + wave * BM * BN, acc1, BN, rocwmma::mem_row_major);
+        rocwmma::store_matrix_sync(shC + wave * BM * BN, acc0, BN, rocwmma::mem_row_major);
     }
     __syncthreads();
     for (uint32_t j = tid; j < MTILES * BM * BN; j += blockDim.x) {
@@ -5251,29 +5249,46 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         const uint32_t pair = shPair[mt * BM + mm];
         if (pair != UINT32_MAX) {
             const uint32_t row0 = n0 + nn;
-            const uint32_t row1 = n0 + BN + nn;
             const uint32_t tok = pair / n_expert;
             const uint32_t slot = pair - tok * n_expert;
             if (row0 < out_dim) {
                 if (OUT_F16) {
                     uint64_t dst = (uint64_t)pair * out_dim + row0;
                     if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row0;
-                    down_out_h[dst] = __float2half(shC0[j]);
+                    down_out_h[dst] = __float2half(shC[j]);
                 } else {
                     uint64_t dst = (uint64_t)pair * out_dim + row0;
                     if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row0;
-                    down_out[dst] = shC0[j];
+                    down_out[dst] = shC[j];
                 }
             }
+        }
+    }
+    __syncthreads();
+
+    if (wave < MTILES) {
+        rocwmma::store_matrix_sync(shC + wave * BM * BN, acc1, BN, rocwmma::mem_row_major);
+    }
+    __syncthreads();
+    for (uint32_t j = tid; j < MTILES * BM * BN; j += blockDim.x) {
+        const uint32_t mt = j / (BM * BN);
+        const uint32_t rem = j - mt * BM * BN;
+        const uint32_t mm = rem / BN;
+        const uint32_t nn = rem - mm * BN;
+        const uint32_t pair = shPair[mt * BM + mm];
+        if (pair != UINT32_MAX) {
+            const uint32_t row1 = n0 + BN + nn;
+            const uint32_t tok = pair / n_expert;
+            const uint32_t slot = pair - tok * n_expert;
             if (row1 < out_dim) {
                 if (OUT_F16) {
                     uint64_t dst = (uint64_t)pair * out_dim + row1;
                     if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row1;
-                    down_out_h[dst] = __float2half(shC1[j]);
+                    down_out_h[dst] = __float2half(shC[j]);
                 } else {
                     uint64_t dst = (uint64_t)pair * out_dim + row1;
                     if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row1;
-                    down_out[dst] = shC1[j];
+                    down_out[dst] = shC[j];
                 }
             }
         }
