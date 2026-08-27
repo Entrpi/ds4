@@ -11,10 +11,10 @@
 
 ## Current result
 
-The validated experimental stack reaches 226.81 tokens/s at the warm 4K
-frontier (227.05 tokens/s in the four-frontier correctness run), versus 187.26
+The validated experimental stack reaches 227.32 tokens/s at the warm 4K
+frontier (226.81 tokens/s before the IQ2 sign-mask change), versus 187.26
 tokens/s for clean DS4 and 190.66 tokens/s for the accepted Q2_K down-only
-change. This is a 21.1% improvement over clean DS4. The remaining gap to 300
+change. This is a 21.4% improvement over clean DS4. The remaining gap to 300
 tokens/s is 24.4% of the target throughput, requiring about 24% less interval
 time from the current stack.
 
@@ -37,6 +37,7 @@ The implementation is split into reviewable commits:
 | `5474132` | Use 128-row/eight-wave Q8 WMMA tiles for smaller outputs and a 256-row/16-wave tile for the 32K-row projection. |
 | `66294c6` | Add 32-head rocWMMA indexed and raw-ring attention paths. |
 | `aac604b` | Link the MMQ objects into the ROCm regression target. |
+| `fe74d50` | Replace hot SoA IQ2 sign-mask recomputation with the existing cache-hot 1 KiB lookup table. |
 
 ## Correctness and build checks
 
@@ -46,6 +47,12 @@ top-1 matches, max absolute error is 0, and RMSE is 0 at every frontier. The
 attention/MMQ stack itself preserves top-1 at all four frontiers versus the
 saved down-only reference; its worst observed full-logit difference is max-abs
 5.14 and RMSE 0.871.
+
+The IQ2 sign-mask change is also bit-identical to the saved 226.81 stack at all
+four frontiers: same top-1, max absolute error 0, and RMSE 0. Its production
+SoA gate/up microkernel falls from the saved 35.128 ms to 32.451 ms at 2K
+(-7.6%) and reaches 65.532 ms at 4K. The end-to-end warm gain is smaller,
+226.81 to 227.32 tokens/s.
 
 `git diff --check` passes. After `aac604b`, the ROCm regression build compiles
 and links `ds4`, `ds4-server`, `ds4-bench`, `ds4-eval`, `ds4-agent`, and the test
@@ -59,6 +66,7 @@ Correctness artifacts on `fw2`:
 ```text
 ~/ds4/correctness/mmq-y64-attn-wmma32-warm-20260827/
 ~/ds4/correctness/q8-wmma16w-large-20260827/
+~/ds4/correctness/mmq-sign-table-20260827/
 ```
 
 ## Profile evidence
