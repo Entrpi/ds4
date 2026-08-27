@@ -11,12 +11,12 @@
 
 ## Current result
 
-The validated experimental stack reaches 248.56 tokens/s at the warm 4K
-frontier (247.49 tokens/s in the initial performance run), versus 227.32 before
-the attention-output-B specialization, 187.26 for clean DS4, and 190.66 for the
-accepted Q2_K down-only change. This is a 32.7% improvement over clean DS4. The
-remaining gap to 300 tokens/s requires about 17.1% less interval time from the
-current stack.
+The validated experimental stack reaches 256.31 and 256.12 tokens/s in two
+warm 4K runs, versus 248.56 before vectorized indexed-attention KV staging,
+227.32 before the attention-output-B specialization, 187.26 for clean DS4, and
+190.66 for the accepted Q2_K down-only change. This is a 36.8% improvement over
+clean DS4. The remaining gap to 300 tokens/s requires about 14.6% less interval
+time from the current stack.
 
 Required experimental switches:
 
@@ -26,6 +26,7 @@ DS4_CUDA_MMQ_X_MAX=64
 DS4_ROCM_ATTN_WMMA32_INDEXED=1
 DS4_ROCM_ATTN_WMMA32_RING=1
 DS4_ROCM_ATTN_OUTPUT_B_WMMA=1
+DS4_ROCM_ATTN_F32_VEC2=1
 ```
 
 The implementation is split into reviewable commits:
@@ -40,6 +41,7 @@ The implementation is split into reviewable commits:
 | `aac604b` | Link the MMQ objects into the ROCm regression target. |
 | `fe74d50` | Replace hot SoA IQ2 sign-mask recomputation with the existing cache-hot 1 KiB lookup table. |
 | `55f4072` | Replace the 4096xN-by-8192 attention-output-B hipBLAS GEMM with a shape-exact 64x64 wave32 rocWMMA kernel and add its standalone harness. |
+| `8ae33fd` | Vectorize indexed-attention F32-to-F16 KV tile staging with aligned `float2` loads and packed `half2` LDS stores. |
 
 ## Correctness and build checks
 
@@ -61,6 +63,12 @@ at the 512, 1024, 2048, and 4096 frontiers. Its worst full-logit difference is
 max-abs 4.276 and RMSE 0.712, inside the previously accepted attention/MMQ
 envelope of 5.14/0.871. The standalone harness compares all 8,388,608 outputs:
 max-abs is 4.66e-8, RMSE is 4.15e-9, and no element differs by more than 0.05.
+
+The indexed-attention F32 vector-staging path is byte-identical to the validated
+248.56 stack across every full-vocabulary logit at 512, 1024, 2048, and 4096
+tokens: same top-1, max-abs 0, RMSE 0, and zero differing elements. It introduces
+no new allocation or cache lifetime; conversion remains bounded by each owned
+LDS tile.
 
 `git diff --check` passes. After `aac604b`, the ROCm regression build compiles
 and links `ds4`, `ds4-server`, `ds4-bench`, `ds4-eval`, `ds4-agent`, and the test
@@ -173,3 +181,9 @@ or convert only bounded tiles. IQ2 requires a structural mapping/live-range
 rewrite, not another tile or wave-count parameter sweep. Every surviving kernel
 must pass standalone output comparison and the saved four-frontier logit gate
 before admission.
+
+E037 safely captures the tile-staging part of that opportunity and raises the
+validated warm lead to 256.12-256.31 tokens/s. The remaining gap to 300 is about
+14.6% of interval time. Attention work should now target WMMA or online-softmax
+scheduling; the next major independent pools remain IQ2 gate/up and Q2_K hot
+down.
