@@ -92,9 +92,9 @@ Correctness artifacts on `fw2`:
   target: the kernel contains 384 `v_lshlrev_b16`, 256 `v_sub_nc_i16`, and 256
   `v_and_b16` instructions, with about a 69.5% L2 hit rate.
 - The warm 4K interval starts at dispatch 4243. Its largest remaining kernel
-  groups are IQ2 MMQ gate/up (1.719 s), a 42-call 16K-by-64 hipBLAS projection
-  (1.087 s), indexed attention (1.054 s), Q2_K hot down (1.002 s), and the
-  remaining hipBLAS projection shapes (0.733 s).
+  groups after the attention-output-B replacement are IQ2 MMQ gate/up
+  (1.573 s), indexed attention (1.044 s), Q2_K hot down (0.994 s), and a
+  230-call 64x32 hipBLAS group (0.778 s).
 - The 64x64 F16 WMMA attention-output-B kernel cuts the warm 42-call pool from
   1.087 s (25.89 ms/call) to 0.499 s (11.88 ms/call), a 54.1% reduction. It
   uses 56 VGPRs, 128 SGPRs, 4 KiB LDS, and no scratch. The standalone shape
@@ -124,13 +124,25 @@ Correctness artifacts on `fw2`:
 - A 64-head/1024-thread indexed-attention tile reaches 247.16 tokens/s with the
   E029 lead enabled, below the validated 248.56 result. Halving KV staging does
   not offset the larger block's occupancy cost; keep the 32-head tile.
+- The x64/y64 IQ2 output mapping cannot be retuned to 8 or 16 waves by changing
+  the wave-count parameter: both variants fail the structural assertion
+  `nwarps * tile_C::I == mmq_y`. A mapping rewrite is required, and the prior
+  split-column design already spilled at 256 VGPRs.
+- The exact attention-output-A shape is strided-batched F16 GEMM
+  `T,N m=1024,n=2048,k=4096,batch=8`. A standalone 64x64 rocWMMA kernel is
+  correct across all 16,777,216 outputs (max-abs 2.29e-5, RMSE 2.56e-6) and
+  takes 12.055 ms, but the live hipBLAS pool averages only 6.836 ms/call. It is
+  therefore not integrated; `gfx1151_f16_batched_gemm_lab.cu` preserves the
+  exact-shape harness.
+- Packed-half2 Q2_K dequantization reaches 203.03/247.62 tokens/s at 2K/4K,
+  below the validated lead, so it is rejected and the source is restored.
 
 ## Next campaign
 
-Regenerate the warm ranking around the 248.56 lead before selecting the next
-kernel pool. Q2_K work should change dequantization or data movement without
-adding live output accumulators; the n4 result rules out wider output reuse at
-the current tile. IQ2 remains a structural target through shorter unpack live
-ranges or a newer llama.cpp-style organization. Every surviving kernel must
-pass standalone output comparison and the saved four-frontier logit gate before
+The refreshed lead profile prioritizes IQ2 gate/up (1.573 s), indexed attention
+(1.044 s), and Q2_K hot down (0.994 s). Q2_K work must reuse scale metadata or
+change data staging rather than widen output ownership or merely substitute
+packed-half arithmetic. IQ2 requires a structural mapping/live-range rewrite,
+not another tile or wave-count parameter sweep. Every surviving kernel must pass
+standalone output comparison and the saved four-frontier logit gate before
 admission.
