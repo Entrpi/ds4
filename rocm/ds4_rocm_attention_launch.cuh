@@ -367,9 +367,8 @@ static int attention_decode_batch_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     const int fast_window_attention = !g_quality_mode;
-    const char *wmma_ring_env = getenv("DS4_ROCM_ATTN_WMMA32_RING");
-    const bool use_wmma_ring = wmma_ring_env && wmma_ring_env[0] != '\0' &&
-                               wmma_ring_env[0] != '0';
+    const bool use_wmma_ring =
+            ds4_rocm_gfx1151_flag("DS4_ROCM_ATTN_WMMA32_RING");
     if (use_wmma_ring && !use_comp_mask && n_tokens > 1u &&
         head_dim == 512u && fast_window_attention) {
         dim3 grid(n_tokens, (n_head + 31u) / 32u, 1);
@@ -571,14 +570,12 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         top_k <= DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         if (!g_quality_mode && n_head <= 64u) {
-            const char *wmma32_env = getenv("DS4_ROCM_ATTN_WMMA32_INDEXED");
-            const bool use_wmma32 = wmma32_env && wmma32_env[0] != '\0' &&
-                                    wmma32_env[0] != '0';
+            const bool use_wmma32 =
+                    ds4_rocm_gfx1151_flag("DS4_ROCM_ATTN_WMMA32_INDEXED");
             if (use_wmma32) {
                 dim3 grid(n_tokens, (n_head + 31u) / 32u, 1);
-                const char *vec2_env = getenv("DS4_ROCM_ATTN_F32_VEC2");
-                const bool use_vec2 = vec2_env && vec2_env[0] != '\0' &&
-                                      vec2_env[0] != '0';
+                const bool use_vec2 =
+                        ds4_rocm_gfx1151_flag("DS4_ROCM_ATTN_F32_VEC2");
                 if (use_vec2) {
                     attention_mixed_heads16_wmma_kernel<1, 32, true><<<grid, 512>>>((float *)heads->ptr,
                                                                             sinks,
@@ -1334,7 +1331,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                     const auto b_op = out_b_f16_t ? CUBLAS_OP_N : CUBLAS_OP_T;
                     const int b_lda = out_b_f16_t ? (int)out_dim : (int)low_dim;
                     const int use_b_wmma =
-                        getenv("DS4_ROCM_ATTN_OUTPUT_B_WMMA") != NULL &&
+                        ds4_rocm_gfx1151_flag("DS4_ROCM_ATTN_OUTPUT_B_WMMA") &&
                         out_b_f16_t != NULL &&
                         out_dim == 4096u && low_dim == 8192u &&
                         (n_tokens & 63u) == 0u;

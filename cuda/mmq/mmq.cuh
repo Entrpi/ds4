@@ -109,13 +109,14 @@ struct tile_x_sizes {
 };
 
 static int get_mmq_x_max_host(const int cc) {
-    int base = (turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
+    const int hardware_max = (turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
         GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA ?
 #ifdef GGML_CUDA_FORCE_MMQ
             128                     : 64;
 #else
             MMQ_DP4A_MAX_BATCH_SIZE : 64;
 #endif // GGML_CUDA_FORCE_MMQ
+    int base = cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 ? 64 : hardware_max;
     // ds4: optional Step-4 experiment hook. DS4_CUDA_MMQ_X_MAX=N clips the
     // tile-width selector to N when sweeping for an sm_120-specific
     // optimum.  Value rounded down to a multiple of 8 (the iteration step
@@ -133,7 +134,7 @@ static int get_mmq_x_max_host(const int cc) {
             }
         }
     }
-    if (g_override > 0 && g_override < base) base = g_override;
+    if (g_override > 0) base = std::min(g_override, hardware_max);
     return base;
 }
 

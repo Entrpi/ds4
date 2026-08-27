@@ -52,6 +52,11 @@ static bool ds4_mmq_nvtx_requested() {
     return enabled != 0;
 }
 
+static bool ds4_mmq_gfx1151_flag(const char *name, int cc) {
+    const char *env = getenv(name);
+    return env ? env[0] != '0' : cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
+}
+
 static uint64_t ds4_mmq_nvtx_payload(uint32_t first, uint32_t second) {
     return ((uint64_t)first << 32) | second;
 }
@@ -1542,7 +1547,7 @@ int ds4_mmq_moe_pair_impl(
      * compact expert-tile launch replaces the rectangular grid entirely. */
     const bool tight_iq2_ncols =
         type == GGML_TYPE_IQ2_XXS &&
-        getenv("DS4_ROCM_MMQ_TIGHT_NCOLS") != nullptr;
+        ds4_mmq_gfx1151_flag("DS4_ROCM_MMQ_TIGHT_NCOLS", cc);
     const int64_t routed_ncols_max = (fused_down || tight_iq2_ncols)
         ? (int64_t)n_tokens
         : ne_get_rows;
@@ -1772,7 +1777,7 @@ int ds4_mmq_moe_pair_impl(
     const bool compact_iq2 =
 #if defined(GGML_USE_HIP)
         type == GGML_TYPE_IQ2_XXS &&
-        getenv("DS4_ROCM_MMQ_COMPACT_TILES") != nullptr &&
+        ds4_mmq_gfx1151_flag("DS4_ROCM_MMQ_COMPACT_TILES", cc) &&
         n_experts < (1 << 16);
 #else
         false;

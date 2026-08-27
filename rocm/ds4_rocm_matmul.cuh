@@ -284,9 +284,8 @@ static int cuda_matmul_q8_0_tensor_f16_gemm(
     if (!xh) return 0;
     f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(xh, (const float *)x->ptr, xh_count);
     if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
-    const char *tinym_env = getenv("DS4_ROCM_F16_TINYM_WMMA");
-    if (in_dim == 16384u && out_dim == 24u && n_tok == 2048u && tinym_env &&
-        tinym_env[0] != '\0' && tinym_env[0] != '0') {
+    if (in_dim == 16384u && out_dim == 24u && n_tok == 2048u &&
+        ds4_rocm_gfx1151_flag("DS4_ROCM_F16_TINYM_WMMA")) {
         matmul_f16_tinym24_wmma_kernel<<<32u, 256u>>>((float *)out->ptr, w_f16, xh);
         return cuda_ok(cudaGetLastError(), "q8 f16 tinym24 wmma launch");
     }
@@ -917,15 +916,13 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         if (!xh) return 0;
         f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
-        const char *tinym_env = getenv("DS4_ROCM_F16_TINYM_WMMA");
-        if (in_dim == 16384u && out_dim == 24u && n_tok == 2048u && tinym_env &&
-            tinym_env[0] != '\0' && tinym_env[0] != '0') {
+        if (in_dim == 16384u && out_dim == 24u && n_tok == 2048u &&
+            ds4_rocm_gfx1151_flag("DS4_ROCM_F16_TINYM_WMMA")) {
             matmul_f16_tinym24_wmma_kernel<<<32u, 256u>>>((float *)out->ptr, w, xh);
             return cuda_ok(cudaGetLastError(), "f16 tinym24 wmma launch");
         }
-        const char *smallm_env = getenv("DS4_ROCM_F16_SMALLM_WMMA");
-        if (in_dim == 4096u && n_tok == 2048u && smallm_env &&
-            smallm_env[0] != '\0' && smallm_env[0] != '0') {
+        if (in_dim == 4096u && n_tok == 2048u &&
+            ds4_rocm_gfx1151_flag("DS4_ROCM_F16_SMALLM_WMMA")) {
             if (out_dim == 64u || out_dim == 512u || out_dim == 1024u) {
                 const dim3 grid((uint32_t)out_dim / 64u, (uint32_t)n_tok / 64u, 1u);
                 matmul_f16_smallm_wmma_kernel<64u, 64u><<<grid, 512u>>>(
@@ -941,9 +938,8 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
                 return cuda_ok(cudaGetLastError(), "f16 smallm wmma launch");
             }
         }
-        const char *largem_env = getenv("DS4_ROCM_F16_LARGEM_WMMA");
-        if (n_tok == 2048u && largem_env && largem_env[0] != '\0' &&
-            largem_env[0] != '0' && in_dim == 1024u && out_dim == 8192u) {
+        if (n_tok == 2048u && in_dim == 1024u && out_dim == 8192u &&
+            ds4_rocm_gfx1151_flag("DS4_ROCM_F16_LARGEM_WMMA")) {
             const dim3 grid((uint32_t)out_dim / 64u, (uint32_t)n_tok / 64u, 1u);
             matmul_f16_smallm_wmma_kernel<64u, 64u><<<grid, 512u>>>(
                     (float *)out->ptr, w, xh, (uint32_t)out_dim,
