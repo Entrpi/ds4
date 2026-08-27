@@ -11,15 +11,16 @@
 
 ## Current result
 
-The validated experimental stack reaches 278.42 tokens/s in a warm 4K run
-after compacting the IQ2 MoE expert-tile launch, versus 277.29 with only the
+The validated experimental stack reaches 282.60 tokens/s in a warm 4K run
+after specializing the native-F16 8192x2048x1024 projection, versus 278.42
+after compacting the IQ2 MoE expert-tile launch and 277.29 with only the
 tightened launch bound, 264.62 and 269.02 before that change, 263.45-263.65
 before the small-M F16 specialization,
 256.12-256.31 before the tiny-M F16 specialization, 248.56 before vectorized
 indexed-attention KV staging, 227.32 before the attention-output-B
 specialization, 187.26 for clean DS4, and 190.66 for the accepted Q2_K
-down-only change. The best repeat is 43.7% faster than clean DS4. The remaining
-gap to 300 tokens/s is 7.8% in throughput, or about 7.2% less interval time
+down-only change. The best repeat is 50.9% faster than clean DS4. The remaining
+gap to 300 tokens/s is 6.2% in throughput, or about 5.8% less interval time
 from the current stack.
 
 Required experimental switches:
@@ -33,6 +34,7 @@ DS4_ROCM_ATTN_OUTPUT_B_WMMA=1
 DS4_ROCM_ATTN_F32_VEC2=1
 DS4_ROCM_F16_TINYM_WMMA=1
 DS4_ROCM_F16_SMALLM_WMMA=1
+DS4_ROCM_F16_LARGEM_WMMA=1
 DS4_ROCM_MMQ_TIGHT_NCOLS=1
 DS4_ROCM_MMQ_COMPACT_TILES=1
 ```
@@ -54,6 +56,7 @@ The implementation is split into reviewable commits:
 | `73c7091` | Replace the `64/256/512/1024 x 2048 x 4096` F16 hipBLAS GEMMs with shape-selected rocWMMA tiles and extend the exact-shape harness. |
 | `0643952` | Bound IQ2 gate/up expert buckets by `n_tokens`, eliminating the known top-k factor from the rectangular launch. |
 | `7345686` | Build a device-side list of live IQ2 `(expert, column-tile)` pairs and reuse it for gate and up. |
+| `467e396` | Route the native-F16 8192x2048x1024 projection through the proven 64x64 rocWMMA kernel. |
 
 ## Correctness and build checks
 
@@ -106,6 +109,11 @@ It preserves the x64/y64 MMQ tile body and changes only how live ragged expert
 tiles are scheduled. The exact validation artifacts are under
 `~/ds4/correctness/e046-compact-tiles-20260827/`.
 
+The large-M F16 specialization is byte-identical to E046 at 512, 1024, and
+2048 tokens. At 4096 tokens it preserves top-1 with max-abs 0.769 and RMSE
+0.181, inside the accepted 5.14/0.871 envelope. Its exact validation artifacts
+are under `~/ds4/correctness/e050-f16-largem-exact-20260827/`.
+
 `git diff --check` passes. After `aac604b`, the ROCm regression build compiles
 and links `ds4`, `ds4-server`, `ds4-bench`, `ds4-eval`, `ds4-agent`, and the test
 binaries with the MMQ objects. Q4_K and MXFP4 dot tests pass 4/4, and the answer
@@ -120,6 +128,7 @@ Correctness artifacts on `fw2`:
 ~/ds4/correctness/q8-wmma16w-large-20260827/
 ~/ds4/correctness/mmq-sign-table-20260827/
 ~/ds4/correctness/attn-b-f16-wmma-20260827/
+~/ds4/correctness/e050-f16-largem-exact-20260827/
 ```
 
 ## Profile evidence
@@ -153,6 +162,10 @@ Correctness artifacts on `fw2`:
 - The small-M F16 specialization replaces 184 warm hipBLAS calls with 184
   rocWMMA launches. Its profiled pool is 180.0 ms and total warm GPU work falls
   from 7.517 s to 7.304 s; the profiled frontier reaches 267.70 tokens/s.
+- The large-M F16 specialization cuts the exact 42-call
+  `M=8192,N=2048,K=1024` pool from 303.839 to 124.543 ms (-59.0%), saving
+  179.296 ms across the 2K/4K run. The unprofiled warm frontier reaches 282.60
+  tokens/s.
 - The warm 4K interval starts at dispatch 4243. Its largest remaining kernel
   groups after the attention-output-B replacement are IQ2 MMQ gate/up
   (1.573 s), indexed attention (1.044 s), Q2_K hot down (0.994 s), and a
@@ -203,6 +216,12 @@ Correctness artifacts on `fw2`:
 - Caching a full 32-key-by-512 KV tile in LDS improves the short frontier to
   209.57 tokens/s but lowers warm 4K to 245.21 because it doubles online
   softmax/rescale blocks.
+- The large-M F16 tile sweep confirms 64x64 as the integrated winner at 282.60
+  tokens/s; 128x64, 128x32, 32x128, and 64x128 reach 281.46, 281.04, 282.07,
+  and 281.03 respectively. Only the 64x64 selector is retained.
+- Reusing the same WMMA core for attention QB's 4096x2048x2048 projection with
+  an F16 epilogue lowers the combined E050 stack to 279.04 tokens/s. The E051
+  implementation and switch are removed; hipBLAS remains selected for QB.
 
 ## Experimental 255 tokens/s lead
 
@@ -225,8 +244,8 @@ not reproduce the full-cache mirror.
 
 ## Next campaign
 
-The refreshed lead profile prioritizes IQ2 gate/up (1.573 s), indexed attention
-(1.044 s), and Q2_K hot down (0.994 s). Q2_K work must reuse scale metadata or
+The refreshed lead profile prioritizes IQ2 gate/up, indexed attention, and
+Q2_K hot down. Q2_K work must reuse scale metadata or
 change data staging rather than widen output ownership or merely substitute
 packed-half arithmetic. The indexed-attention experiment proves that F16 KV
 plus vector staging can contribute another ~2.8% end-to-end, but the unsafe
@@ -248,8 +267,8 @@ Q8 staging alone does not repay the y32 scheduling and dual-weight decode cost.
 The next IQ2 design should reduce duplicated decode instructions or accumulator
 live state while retaining the validated compact x64/y64 launch topology.
 
-E037 safely captures the tile-staging part of that opportunity and raises the
-validated warm lead to 256.12-256.31 tokens/s. The remaining gap to 300 is about
-14.6% of interval time. Attention work should now target WMMA or online-softmax
-scheduling; the next major independent pools remain IQ2 gate/up and Q2_K hot
-down.
+E050 removes 59.0% from the remaining 8192x2048x1024 F16 projection pool and
+raises the validated warm lead to 282.60 tokens/s. The remaining gap to 300 is
+about 5.8% of interval time. Attention work should now target WMMA or
+online-softmax scheduling; the next major independent pools remain IQ2 gate/up
+and Q2_K hot down.
