@@ -11,16 +11,18 @@
 
 ## Current result
 
-The validated experimental stack reaches 282.60 tokens/s in a warm 4K run
-after specializing the native-F16 8192x2048x1024 projection, versus 278.42
+The validated experimental stack reaches 290.79 tokens/s in a repeated warm
+4K run after increasing the wave32 rocWMMA attention key tile from 64 to 80.
+The two measurements are 290.53 and 290.79 tokens/s, versus 282.60 after
+specializing the native-F16 8192x2048x1024 projection and 278.42
 after compacting the IQ2 MoE expert-tile launch and 277.29 with only the
 tightened launch bound, 264.62 and 269.02 before that change, 263.45-263.65
 before the small-M F16 specialization,
 256.12-256.31 before the tiny-M F16 specialization, 248.56 before vectorized
 indexed-attention KV staging, 227.32 before the attention-output-B
 specialization, 187.26 for clean DS4, and 190.66 for the accepted Q2_K
-down-only change. The best repeat is 50.9% faster than clean DS4. The remaining
-gap to 300 tokens/s is 6.2% in throughput, or about 5.8% less interval time
+down-only change. The best repeat is 55.3% faster than clean DS4. The remaining
+gap to 300 tokens/s is 3.2% in throughput, or about 3.1% less interval time
 from the current stack.
 
 Required experimental switches:
@@ -57,6 +59,7 @@ The implementation is split into reviewable commits:
 | `0643952` | Bound IQ2 gate/up expert buckets by `n_tokens`, eliminating the known top-k factor from the rectangular launch. |
 | `7345686` | Build a device-side list of live IQ2 `(expert, column-tile)` pairs and reuse it for gate and up. |
 | `467e396` | Route the native-F16 8192x2048x1024 projection through the proven 64x64 rocWMMA kernel. |
+| `027dbc2` | Increase the shared wave32 rocWMMA attention key tile from 64 to 80 and generalize its key-tile loops. |
 
 ## Correctness and build checks
 
@@ -72,6 +75,12 @@ four frontiers: same top-1, max absolute error 0, and RMSE 0. Its production
 SoA gate/up microkernel falls from the saved 35.128 ms to 32.451 ms at 2K
 (-7.6%) and reaches 65.532 ms at 4K. The end-to-end warm gain is smaller,
 226.81 to 227.32 tokens/s.
+
+The 80-key attention tile preserves top-1 at all 512/1024/2048/4096
+frontiers versus E050. It is byte-identical at 512; max-abs/RMSE are
+4.446/0.770 at 1024, 1.235/0.239 at 2048, and 0.923/0.218 at 4096, all inside
+the accepted 5.14/0.871 envelope. The active 32-head kernels compile as wave32
+with 104 VGPR, 30-31 SGPR, 33,676 bytes LDS, zero scratch, and zero spills.
 
 The attention-output-B WMMA candidate preserves top-1 versus the 227.32 stack
 at the 512, 1024, 2048, and 4096 frontiers. Its worst full-logit difference is
@@ -268,7 +277,8 @@ The next IQ2 design should reduce duplicated decode instructions or accumulator
 live state while retaining the validated compact x64/y64 launch topology.
 
 E050 removes 59.0% from the remaining 8192x2048x1024 F16 projection pool and
-raises the validated warm lead to 282.60 tokens/s. The remaining gap to 300 is
-about 5.8% of interval time. Attention work should now target WMMA or
-online-softmax scheduling; the next major independent pools remain IQ2 gate/up
-and Q2_K hot down.
+raises the validated warm lead to 282.60 tokens/s. E057 then cuts attention's
+online-softmax block count by 20% with an 80-key tile and raises the repeated
+lead to 290.79 tokens/s. The remaining gap to 300 is about 3.1% of interval
+time. Sweep the one-workgroup 96/112-key region before closing this attention
+family; the next independent pools remain IQ2 gate/up and Q2_K hot down.
