@@ -148,8 +148,8 @@ Correctness artifacts on `fw2`:
   takes 31.677/31.657 ms versus 30.942/30.950 ms for E046's two launches
   combined (+2.4%/+2.3%). A first-layer differential probe verifies all
   6,291,456 outputs per leg bit-for-bit, and the clean 512/1024/2048/4096
-  engine frontiers are byte-identical to E046. Preserve the experiment behind
-  `DS4_ROCM_MMQ_PAIRED_Y32=1`, but do not use it as the performance lead.
+  engine frontiers are byte-identical to E046. The rejected implementation and
+  runtime switch are removed; only this measurement is retained.
 - The small-M F16 specialization replaces 184 warm hipBLAS calls with 184
   rocWMMA launches. Its profiled pool is 180.0 ms and total warm GPU work falls
   from 7.517 s to 7.304 s; the profiled frontier reaches 267.70 tokens/s.

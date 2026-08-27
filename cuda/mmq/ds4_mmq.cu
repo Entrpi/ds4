@@ -1267,6 +1267,7 @@ static __global__ void ds4_mmq_iq2_compact_tiles(
     const int col_low = expert_bounds[expert];
     const int col_high = expert_bounds[expert + 1];
     const int col_diff = col_high - col_low;
+
     extern __shared__ int ids_dst_shared[];
 #pragma unroll
     for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
@@ -1325,226 +1326,6 @@ static int ds4_mmq_launch_iq2_compact(
     }
     (void)ctx;
     return cudaGetLastError() == cudaSuccess ? 0 : -2;
-}
-
-static __device__ __forceinline__ void ds4_mmq_iq2_pair_vec_dot_y32(
-        const int * __restrict__ x,
-        const int * __restrict__ y,
-        float * __restrict__ sum,
-        int k00,
-        int local_warp) {
-    constexpr int mmq_x = 64;
-    constexpr data_layout input_layout = get_input_data_layout();
-    typedef tile<16,  8, int, input_layout>        tile_A;
-    typedef tile<16,  8, int, input_layout>        tile_B;
-    typedef tile<16, 16, int, DATA_LAYOUT_J_MAJOR> tile_C;
-    constexpr int rows_per_warp = 16;
-    constexpr int ntx = 1;
-
-    const int *x_qs = x;
-    const float *x_df = (const float *)(x_qs + 2*MMQ_TILE_NE_K);
-    const int *y_qs = y + 4;
-    const float *y_df = (const float *)y;
-    const int i0 = local_warp*rows_per_warp;
-
-    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
-        const int k0 = k00 + k01;
-        tile_A A[ntx];
-        load_ldmatrix(A[0], x_qs + i0*MMQ_MMA_TILE_X_K_Q8_0 + k0,
-                      MMQ_MMA_TILE_X_K_Q8_0);
-
-#pragma unroll
-        for (int j0 = 0; j0 < mmq_x; j0 += tile_C::J) {
-            tile_B B;
-            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
-            const int j = j0 + tile_C::get_j(0);
-            const float dB = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
-            tile_C C;
-            mma(C, A[0], B);
-#pragma unroll
-            for (int l = 0; l < tile_C::ne; ++l) {
-                const int i = i0 + tile_C::get_i(l);
-                const float dA = x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + k0/QI8_0];
-                sum[(j0/tile_C::J)*tile_C::ne + l] += C.x[l]*dA*dB;
-            }
-        }
-    }
-}
-
-template <bool need_check>
-static __device__ __forceinline__ void ds4_mmq_iq2_pair_write_back(
-        const float * __restrict__ sum,
-        const int * __restrict__ ids_dst,
-        float * __restrict__ dst,
-        int stride,
-        int i_max,
-        int j_max) {
-    typedef tile<16, 16, int, DATA_LAYOUT_J_MAJOR> tile_C;
-    constexpr int mmq_x = 64;
-    constexpr int local_warps = 2;
-    const int local_warp = (int)threadIdx.y & (local_warps - 1);
-    const int i0 = local_warp * tile_C::I;
-
-#pragma unroll
-    for (int j0 = 0; j0 < mmq_x; j0 += tile_C::J) {
-#pragma unroll
-        for (int l = 0; l < tile_C::ne; ++l) {
-            const int j = j0 + tile_C::get_j(l);
-            if (j > j_max) continue;
-            const int i = i0 + tile_C::get_i(l);
-            if (need_check && i > i_max) continue;
-            dst[ids_dst[j]*stride + i] = sum[(j0/tile_C::J)*tile_C::ne + l];
-        }
-    }
-}
-
-template <bool need_check>
-__launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
-static __global__ void ds4_mmq_iq2_compact_pair_y32(
-        const char * __restrict__ xa,
-        const char * __restrict__ xb,
-        const int * __restrict__ y,
-        const int32_t * __restrict__ ids_dst,
-        const int32_t * __restrict__ expert_bounds,
-        const int * __restrict__ work,
-        const int * __restrict__ n_items_ptr,
-        float * __restrict__ out_a,
-        float * __restrict__ out_b,
-        int nrows_x,
-        int stride_row_x,
-        int ncols_y,
-        int stride_col_dst,
-        int stride_channel_x) {
-    constexpr int mmq_x = 64;
-    constexpr int leg_y = 32;
-    constexpr int physical_warps = 4;
-    constexpr int local_warps = 2;
-    constexpr int warp_size = 32;
-    constexpr int tile_x_stride = MMQ_MMA_TILE_X_K_Q8_0;
-    constexpr int qk = ggml_cuda_type_traits<GGML_TYPE_IQ2_XXS>::qk;
-    constexpr int blocks_per_iter = get_iter_k(GGML_TYPE_IQ2_XXS) / qk;
-    const int work_idx = (int)blockIdx.y;
-    if (work_idx >= *n_items_ptr) return;
-    const int packed = work[work_idx];
-    const int expert = packed >> 16;
-    const int jt = packed & 0xffff;
-    const int it = (int)blockIdx.x;
-
-    const int col_low = expert_bounds[expert];
-    const int col_high = expert_bounds[expert + 1];
-    const int col_diff = col_high - col_low;
-    const int q8_words = sizeof(block_q8_1_mmq) / sizeof(int);
-    const int *y_expert_tile = y + (col_low + jt*mmq_x)*q8_words;
-
-    extern __shared__ int shared[];
-    int *ids_shared = shared;
-    int *tile_y = ids_shared + mmq_x;
-    int *tile_a = tile_y + GGML_PAD(
-        mmq_x*MMQ_TILE_Y_K, physical_warps*warp_size);
-    int *tile_b = tile_a + leg_y*tile_x_stride;
-
-#pragma unroll
-    for (int j0 = 0; j0 < mmq_x; j0 += physical_warps*warp_size) {
-        const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
-        if (j >= mmq_x) break;
-        const int j_col = jt*mmq_x + j;
-        ids_shared[j] = j_col < col_diff ? ids_dst[col_low + j_col] : 0;
-    }
-    __syncthreads();
-
-    const int offset_x = expert*stride_channel_x + it*leg_y*stride_row_x;
-    const int tile_x_max_i = nrows_x - it*leg_y - 1;
-    const int tile_y_max_j = col_diff - jt*mmq_x - 1;
-    float sum[mmq_x*leg_y/(local_warps*warp_size)] = {0.0f};
-
-    for (int kb0 = 0; kb0 < stride_row_x; kb0 += blocks_per_iter) {
-        load_tiles_iq2_xxs<leg_y, need_check>(
-            xa, tile_a, offset_x + kb0, tile_x_max_i, stride_row_x);
-        load_tiles_iq2_xxs<leg_y, need_check>(
-            xb, tile_b, offset_x + kb0, tile_x_max_i, stride_row_x);
-
-        const int *by0 = y_expert_tile + ncols_y *
-            (kb0*qk/(4*QK8_1)) * (int)(sizeof(block_q8_1_mmq)/sizeof(int));
-#pragma unroll
-        for (int l0 = 0; l0 < mmq_x*MMQ_TILE_Y_K;
-             l0 += physical_warps*warp_size) {
-            const int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-            tile_y[l] = by0[l];
-        }
-        __syncthreads();
-
-        if ((int)threadIdx.y < local_warps) {
-            ds4_mmq_iq2_pair_vec_dot_y32(
-                tile_a, tile_y, sum, 0, (int)threadIdx.y);
-        } else {
-            ds4_mmq_iq2_pair_vec_dot_y32(
-                tile_b, tile_y, sum, 0, (int)threadIdx.y - local_warps);
-        }
-        __syncthreads();
-
-        by0 += ncols_y * (int)(sizeof(block_q8_1_mmq)/sizeof(int));
-#pragma unroll
-        for (int l0 = 0; l0 < mmq_x*MMQ_TILE_Y_K;
-             l0 += physical_warps*warp_size) {
-            const int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-            tile_y[l] = by0[l];
-        }
-        __syncthreads();
-
-        if ((int)threadIdx.y < local_warps) {
-            ds4_mmq_iq2_pair_vec_dot_y32(
-                tile_a, tile_y, sum, MMQ_TILE_NE_K, (int)threadIdx.y);
-        } else {
-            ds4_mmq_iq2_pair_vec_dot_y32(
-                tile_b, tile_y, sum, MMQ_TILE_NE_K,
-                (int)threadIdx.y - local_warps);
-        }
-        __syncthreads();
-    }
-
-    if ((int)threadIdx.y < local_warps) {
-        ds4_mmq_iq2_pair_write_back<need_check>(
-            sum, ids_shared, out_a + it*leg_y, stride_col_dst,
-            tile_x_max_i, tile_y_max_j);
-    } else {
-        ds4_mmq_iq2_pair_write_back<need_check>(
-            sum, ids_shared, out_b + it*leg_y, stride_col_dst,
-            tile_x_max_i, tile_y_max_j);
-    }
-}
-
-static int ds4_mmq_launch_iq2_compact_pair_y32(
-        const mmq_args &args,
-        const char *xb,
-        float *out_b,
-        const int *work,
-        const int *n_items,
-        int capacity,
-        cudaStream_t stream) {
-    const int tile_x_stride = MMQ_MMA_TILE_X_K_Q8_0;
-    const int nthreads = 4*32;
-    const size_t ids_bytes = 64*sizeof(int);
-    const size_t y_bytes = GGML_PAD(
-        64*sizeof(block_q8_1_mmq), nthreads*sizeof(int));
-    const size_t x_bytes = 2u*32u*(size_t)tile_x_stride*sizeof(int);
-    const int nbytes_shared = (int)(ids_bytes + y_bytes + x_bytes);
-    CUDA_SET_SHARED_MEMORY_LIMIT((ds4_mmq_iq2_compact_pair_y32<false>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((ds4_mmq_iq2_compact_pair_y32<true>), nbytes_shared);
-    const dim3 block(32, 4, 1);
-    const dim3 grid((args.nrows_x + 31) / 32, capacity, 1);
-
-    if (args.nrows_x % 32 == 0) {
-        ds4_mmq_iq2_compact_pair_y32<false><<<grid, block, nbytes_shared, stream>>>(
-            args.x, xb, args.y, args.ids_dst, args.expert_bounds, work,
-            n_items, args.dst, out_b, args.nrows_x, args.stride_row_x,
-            args.ncols_y, args.nrows_dst, args.stride_channel_x);
-    } else {
-        ds4_mmq_iq2_compact_pair_y32<true><<<grid, block, nbytes_shared, stream>>>(
-            args.x, xb, args.y, args.ids_dst, args.expert_bounds, work,
-            n_items, args.dst, out_b, args.nrows_x, args.stride_row_x,
-            args.ncols_y, args.nrows_dst, args.stride_channel_x);
-    }
-    return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 #endif
 
@@ -2046,29 +1827,6 @@ int ds4_mmq_moe_pair_impl(
         /*soa_blocks=*/soa_blocks,
     };
 
-    bool paired_iq2_done = false;
-#if defined(GGML_USE_HIP)
-    const bool paired_iq2 =
-        compact_iq2 && xa_soa == nullptr && xb_soa == nullptr &&
-        getenv("DS4_ROCM_MMQ_PAIRED_Y32") != nullptr;
-    if (paired_iq2) {
-        ds4_mmq_nvtx_scope stage(
-                "ds4/prefill/moe/iq2_gate_up_pair_y32",
-                ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
-                nvtx_prefill);
-        const int pair_rc = ds4_mmq_launch_iq2_compact_pair_y32(
-            args, (const char *)W_b, out_b, compact_work, compact_n_items,
-            compact_capacity, stream);
-        if (pair_rc != 0) {
-            fprintf(stderr, "%s: compact IQ2 paired-y32 launch failed: %d\n",
-                    tag, pair_rc);
-            return -4;
-        }
-        paired_iq2_done = true;
-    }
-#endif
-
-    if (!paired_iq2_done) {
     {
         ds4_mmq_nvtx_scope stage(
                 "ds4/prefill/moe/iq2_gate",
@@ -2123,7 +1881,6 @@ int ds4_mmq_moe_pair_impl(
             fprintf(stderr, "%s: mul_mat_q_case (pair b) launch failed: %s\n", tag, cudaGetErrorString(err));
             return -5;
         }
-    }
     }
     }
     }
