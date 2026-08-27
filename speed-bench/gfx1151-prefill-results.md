@@ -101,13 +101,20 @@ Correctness artifacts on `fw2`:
   two-output-tile kernel (+6.9%), and lowers the unprofiled warm result to
   225.95 tokens/s. The first 227.28 tokens/s run did not exercise this variant:
   its selector was in an inactive all-Q2 launcher, and the trace confirmed n2.
+- rocBLAS logging maps the dominant attention-output-B GEMM to
+  F16xF16-to-F32 `m=4096, n=2048, k=8192`, about 25.9 ms/call for 42 warm
+  calls. Replacing it with DS4's existing direct-Q8 WMMA path lowers the warm
+  result to 219.90 tokens/s, so that path is not a viable substitute. An
+  earlier 227.22/227.63 result was invalid because the all-hipBLAS early return
+  still selected the original B GEMM; its trace caught the inactive selector.
 
 ## Next campaign
 
-The next work should isolate the 1.087-second dense hipBLAS projection and its
-exact matrix shapes, then compare shape-specific rocWMMA/MMQ replacements. Q2_K
-work should change dequantization or data movement without adding live output
-accumulators; the n4 result rules out wider output reuse at the current tile.
-IQ2 remains a structural target through shorter unpack live ranges or a newer
-llama.cpp-style organization. Every surviving kernel must pass standalone
-output comparison and the saved four-frontier logit gate before admission.
+The next work should build a standalone, shape-exact F16 rocWMMA harness for the
+`4096x2048x8192` attention-output-B GEMM and require it to beat rocBLAS's
+25.9 ms before engine integration. Q2_K work should change dequantization or
+data movement without adding live output accumulators; the n4 result rules out
+wider output reuse at the current tile. IQ2 remains a structural target through
+shorter unpack live ranges or a newer llama.cpp-style organization. Every
+surviving kernel must pass standalone output comparison and the saved
+four-frontier logit gate before admission.
