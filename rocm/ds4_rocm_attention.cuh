@@ -1328,7 +1328,7 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
     }
 }
 
-template <int MODE, uint32_t HEADS>
+template <int MODE, uint32_t HEADS, bool F32_VEC2 = false>
 __global__ static void attention_mixed_heads16_wmma_kernel(
         float *heads,
         const float *sinks,
@@ -1496,26 +1496,54 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
                     ? __float2half(q[((uint64_t)t * n_head + head) * 512u + d0 + d])
                     : __float2half(0.0f);
             }
-            for (uint32_t idx = tid; idx < KEYS * TILE; idx += blockDim.x) {
-                const uint32_t kl = idx / TILE;
-                const uint32_t d = idx - kl * TILE;
-                const uint32_t score_idx = kb + kl;
-                float v = 0.0f;
-                if (score_idx < n_score) {
-                    if (score_idx < raw_count) {
-                        const uint32_t row = MODE != 0
-                            ? indexed_raw_rows[score_idx]
-                            : raw_first + score_idx;
-                        v = raw_kv[(uint64_t)row * 512u + d0 + d];
-                    } else {
-                        const uint32_t comp_local = score_idx - raw_count;
-                        const uint32_t row = MODE == 1
-                            ? indexed_comp_rows[comp_local]
-                            : comp_local;
-                        v = comp_kv[(uint64_t)row * 512u + d0 + d];
+            if constexpr (F32_VEC2) {
+                for (uint32_t idx = tid; idx < KEYS * (TILE / 2u); idx += blockDim.x) {
+                    const uint32_t kl = idx / (TILE / 2u);
+                    const uint32_t d = (idx - kl * (TILE / 2u)) * 2u;
+                    const uint32_t score_idx = kb + kl;
+                    half2 v = __floats2half2_rn(0.0f, 0.0f);
+                    if (score_idx < n_score) {
+                        float2 f;
+                        if (score_idx < raw_count) {
+                            const uint32_t row = MODE != 0
+                                ? indexed_raw_rows[score_idx]
+                                : raw_first + score_idx;
+                            f = *reinterpret_cast<const float2 *>(
+                                    raw_kv + (uint64_t)row * 512u + d0 + d);
+                        } else {
+                            const uint32_t comp_local = score_idx - raw_count;
+                            const uint32_t row = MODE == 1
+                                ? indexed_comp_rows[comp_local]
+                                : comp_local;
+                            f = *reinterpret_cast<const float2 *>(
+                                    comp_kv + (uint64_t)row * 512u + d0 + d);
+                        }
+                        v = __floats2half2_rn(f.x, f.y);
                     }
+                    *reinterpret_cast<half2 *>(sh_kv + kl * STRIDE + d) = v;
                 }
-                sh_kv[kl * STRIDE + d] = __float2half(v);
+            } else {
+                for (uint32_t idx = tid; idx < KEYS * TILE; idx += blockDim.x) {
+                    const uint32_t kl = idx / TILE;
+                    const uint32_t d = idx - kl * TILE;
+                    const uint32_t score_idx = kb + kl;
+                    float v = 0.0f;
+                    if (score_idx < n_score) {
+                        if (score_idx < raw_count) {
+                            const uint32_t row = MODE != 0
+                                ? indexed_raw_rows[score_idx]
+                                : raw_first + score_idx;
+                            v = raw_kv[(uint64_t)row * 512u + d0 + d];
+                        } else {
+                            const uint32_t comp_local = score_idx - raw_count;
+                            const uint32_t row = MODE == 1
+                                ? indexed_comp_rows[comp_local]
+                                : comp_local;
+                            v = comp_kv[(uint64_t)row * 512u + d0 + d];
+                        }
+                    }
+                    sh_kv[kl * STRIDE + d] = __float2half(v);
+                }
             }
             __syncthreads();
             if (wave < HEAD_TILES * 4u) {
@@ -1587,26 +1615,54 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
         }
 
         for (uint32_t dim0 = 0; dim0 < 512u; dim0 += DIMS) {
-            for (uint32_t idx = tid; idx < KEYS * DIMS; idx += blockDim.x) {
-                const uint32_t kl = idx / DIMS;
-                const uint32_t d = idx - kl * DIMS;
-                const uint32_t score_idx = kb + kl;
-                float v = 0.0f;
-                if (score_idx < n_score) {
-                    if (score_idx < raw_count) {
-                        const uint32_t row = MODE != 0
-                            ? indexed_raw_rows[score_idx]
-                            : raw_first + score_idx;
-                        v = raw_kv[(uint64_t)row * 512u + dim0 + d];
-                    } else {
-                        const uint32_t comp_local = score_idx - raw_count;
-                        const uint32_t row = MODE == 1
-                            ? indexed_comp_rows[comp_local]
-                            : comp_local;
-                        v = comp_kv[(uint64_t)row * 512u + dim0 + d];
+            if constexpr (F32_VEC2) {
+                for (uint32_t idx = tid; idx < KEYS * (DIMS / 2u); idx += blockDim.x) {
+                    const uint32_t kl = idx / (DIMS / 2u);
+                    const uint32_t d = (idx - kl * (DIMS / 2u)) * 2u;
+                    const uint32_t score_idx = kb + kl;
+                    half2 v = __floats2half2_rn(0.0f, 0.0f);
+                    if (score_idx < n_score) {
+                        float2 f;
+                        if (score_idx < raw_count) {
+                            const uint32_t row = MODE != 0
+                                ? indexed_raw_rows[score_idx]
+                                : raw_first + score_idx;
+                            f = *reinterpret_cast<const float2 *>(
+                                    raw_kv + (uint64_t)row * 512u + dim0 + d);
+                        } else {
+                            const uint32_t comp_local = score_idx - raw_count;
+                            const uint32_t row = MODE == 1
+                                ? indexed_comp_rows[comp_local]
+                                : comp_local;
+                            f = *reinterpret_cast<const float2 *>(
+                                    comp_kv + (uint64_t)row * 512u + dim0 + d);
+                        }
+                        v = __floats2half2_rn(f.x, f.y);
                     }
+                    *reinterpret_cast<half2 *>(sh_kv + kl * STRIDE + d) = v;
                 }
-                sh_kv[kl * STRIDE + d] = __float2half(v);
+            } else {
+                for (uint32_t idx = tid; idx < KEYS * DIMS; idx += blockDim.x) {
+                    const uint32_t kl = idx / DIMS;
+                    const uint32_t d = idx - kl * DIMS;
+                    const uint32_t score_idx = kb + kl;
+                    float v = 0.0f;
+                    if (score_idx < n_score) {
+                        if (score_idx < raw_count) {
+                            const uint32_t row = MODE != 0
+                                ? indexed_raw_rows[score_idx]
+                                : raw_first + score_idx;
+                            v = raw_kv[(uint64_t)row * 512u + dim0 + d];
+                        } else {
+                            const uint32_t comp_local = score_idx - raw_count;
+                            const uint32_t row = MODE == 1
+                                ? indexed_comp_rows[comp_local]
+                                : comp_local;
+                            v = comp_kv[(uint64_t)row * 512u + dim0 + d];
+                        }
+                    }
+                    sh_kv[kl * STRIDE + d] = __float2half(v);
+                }
             }
             __syncthreads();
 

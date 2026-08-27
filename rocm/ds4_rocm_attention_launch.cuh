@@ -576,6 +576,29 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                     wmma32_env[0] != '0';
             if (use_wmma32) {
                 dim3 grid(n_tokens, (n_head + 31u) / 32u, 1);
+                const char *vec2_env = getenv("DS4_ROCM_ATTN_F32_VEC2");
+                const bool use_vec2 = vec2_env && vec2_env[0] != '\0' &&
+                                      vec2_env[0] != '0';
+                if (use_vec2) {
+                    attention_mixed_heads16_wmma_kernel<1, 32, true><<<grid, 512>>>((float *)heads->ptr,
+                                                                            sinks,
+                                                                            (const float *)q->ptr,
+                                                                            (const float *)raw_kv->ptr,
+                                                                            (const float *)comp_kv->ptr,
+                                                                            topk_ptr,
+                                                                            n_tokens,
+                                                                            pos0,
+                                                                            n_raw,
+                                                                            raw_cap,
+                                                                            raw_start,
+                                                                            n_comp,
+                                                                            top_k,
+                                                                            window,
+                                                                            ratio,
+                                                                            n_head,
+                                                                            head_dim);
+                    return cuda_ok(cudaGetLastError(), "attention indexed wmma32 f32 vec2 launch");
+                }
                 attention_mixed_heads16_wmma_kernel<1, 32><<<grid, 512>>>((float *)heads->ptr,
                                                                             sinks,
                                                                             (const float *)q->ptr,
