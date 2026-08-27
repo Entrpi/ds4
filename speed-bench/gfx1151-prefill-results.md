@@ -280,5 +280,6 @@ E050 removes 59.0% from the remaining 8192x2048x1024 F16 projection pool and
 raises the validated warm lead to 282.60 tokens/s. E057 then cuts attention's
 online-softmax block count by 20% with an 80-key tile and raises the repeated
 lead to 290.79 tokens/s. The remaining gap to 300 is about 3.1% of interval
-time. Sweep the one-workgroup 96/112-key region before closing this attention
-family; the next independent pools remain IQ2 gate/up and Q2_K hot down.
+time. A 96-key follow-up reaches 287.55 tokens/s and the saved 128-key result is
+269.37, so the key-count curve peaks at 80 and 112 is not run. The next
+independent pools remain IQ2 gate/up and Q2_K hot down.
