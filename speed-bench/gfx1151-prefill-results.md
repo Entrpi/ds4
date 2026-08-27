@@ -143,12 +143,13 @@ Correctness artifacts on `fw2`:
   candidate from E045's 198.17/277.29 to 207.22/278.42 tok/s. The larger
   short-context gain and small warm gain show that empty-CTA overhead is now
   largely removed; the warm path is dominated by useful IQ2 tile computation.
-- Fusing raw-layout IQ2 gate/up into one x64/y32 CTA raises full 2K prefill to
-  221.21 tok/s (+6.75% over E046) while the warm 2K increment at 4K is flat at
-  277.73 versus 278.42 tok/s. A first-layer differential probe verifies all
+- Fusing raw-layout IQ2 gate/up into one x64/y32 CTA reaches 221.21/277.73
+  tok/s at 2K/4K, but tracing rejects the apparent cold gain: the fused pair
+  takes 31.677/31.657 ms versus 30.942/30.950 ms for E046's two launches
+  combined (+2.4%/+2.3%). A first-layer differential probe verifies all
   6,291,456 outputs per leg bit-for-bit, and the clean 512/1024/2048/4096
-  engine frontiers are byte-identical to E046. Keep the experiment behind
-  `DS4_ROCM_MMQ_PAIRED_Y32=1` pending profile evidence for the warm shape.
+  engine frontiers are byte-identical to E046. Preserve the experiment behind
+  `DS4_ROCM_MMQ_PAIRED_Y32=1`, but do not use it as the performance lead.
 - The small-M F16 specialization replaces 184 warm hipBLAS calls with 184
   rocWMMA launches. Its profiled pool is 180.0 ms and total warm GPU work falls
   from 7.517 s to 7.304 s; the profiled frontier reaches 267.70 tokens/s.
@@ -242,10 +243,10 @@ must pass standalone output comparison and the saved four-frontier logit gate
 before admission.
 
 E047 implements shared activation staging in a paired x64/y32 raw-layout
-kernel. It materially improves full 2K prefill but leaves the warm 4K increment
-unchanged. The next profile must determine whether the remaining cost is
-duplicated IQ2 decode, lower y32 occupancy, or another kernel pool before
-extending the paired design.
+kernel, but its pair is about 2.3% slower than E046's separate kernels. Sharing
+Q8 staging alone does not repay the y32 scheduling and dual-weight decode cost.
+The next IQ2 design should reduce duplicated decode instructions or accumulator
+live state while retaining the validated compact x64/y64 launch topology.
 
 E037 safely captures the tile-staging part of that opportunity and raises the
 validated warm lead to 256.12-256.31 tokens/s. The remaining gap to 300 is about
