@@ -716,13 +716,16 @@ __global__ static void matmul_q8_0_f32_batch_wmma_rowtile_kernel(
     __shared__ _Float16 lds_x[N_TILE * K_TILE];
 
     for (uint32_t bi = 0; bi < n_blocks; bi++) {
-        for (uint32_t j = tid; j < N_TILE * K_TILE; j += blockDim.x) {
+        for (uint32_t j = tid * 2u; j < N_TILE * K_TILE; j += blockDim.x * 2u) {
             const uint32_t nt = j >> 5u;
             const uint32_t kk = j & 31u;
             const uint32_t tok = block_n + nt;
-            float xv = 0.0f;
-            if (tok < n_tokens) xv = x[(uint64_t)tok * in_dim + bi * 32u + kk];
-            lds_x[j] = (_Float16)xv;
+            half2 xv = __floats2half2_rn(0.0f, 0.0f);
+            if (tok < n_tokens) {
+                const float2 f = *(const float2 *)(x + (uint64_t)tok * in_dim + bi * 32u + kk);
+                xv = __floats2half2_rn(f.x, f.y);
+            }
+            *(half2 *)(lds_x + j) = xv;
         }
         __syncthreads();
 

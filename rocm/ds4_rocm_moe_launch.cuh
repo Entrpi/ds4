@@ -309,7 +309,7 @@ static int routed_moe_q2_float_down_launch(
                 const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
                                 (hot_max + mt * bm - 1u) / (mt * bm), hot_count);
                 const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(half) +
-                                        (mt * bm * bn) * sizeof(float);
+                                        (mt * bm * bn) * sizeof(float) + 2u * bn * 84u;
                 if (use_f16_down && hot_mid_f16 && mid_h_hot) {
                     moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true,true><<<grid, block, shmem_n2>>>(
                             NULL, down_h, down_w, NULL, mid_h_hot,
@@ -337,7 +337,7 @@ static int routed_moe_q2_float_down_launch(
                 const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
                                 (hot_max + mt * bm - 1u) / (mt * bm), hot_count);
                 const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(half) +
-                                        (mt * bm * bn) * sizeof(float);
+                                        (mt * bm * bn) * sizeof(float) + 2u * bn * 84u;
                 if (use_f16_down && hot_mid_f16 && mid_h_hot) {
                     moe_down_q2K_hotlist_wmma_n2_kernel<16,16,16,16,true,true><<<grid, block, shmem_n2>>>(
                             NULL, down_h, down_w, NULL, mid_h_hot,
@@ -365,7 +365,7 @@ static int routed_moe_q2_float_down_launch(
                 const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
                                 (hot_max + mt * bm - 1u) / (mt * bm), hot_count);
                 const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(half) +
-                                        (mt * bm * bn) * sizeof(float);
+                                        (mt * bm * bn) * sizeof(float) + 2u * bn * 84u;
                 if (use_f16_down && hot_mid_f16 && mid_h_hot) {
                     moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16,true,true><<<grid, block, shmem_n2>>>(
                             NULL, down_h, down_w, NULL, mid_h_hot,
@@ -801,7 +801,7 @@ static int routed_moe_launch(
             !batch_stream_selected && !batch_stream_split_selected &&
             !split_selected && !compact_selected && gate_w && up_w &&
             (stream_full_layer || full_table_cached) &&
-            getenv("DS4_ROCM_MMQ_IQ2") != NULL;
+            ds4_rocm_gfx1151_flag("DS4_ROCM_MMQ_IQ2");
         uint32_t down_row_groups = 1u;
         {
             const char *rge = getenv("DS4_ROCM_MXFP4_DOWN_RGROUP");
@@ -2247,7 +2247,7 @@ static int routed_moe_launch(
                             (wmma_f16_low_max + mt4 * bm - 1u) / (mt4 * bm),
                             wmma_f16_low_count);
             const size_t shmem_n2 = (mt4 * bm * bk + 2u * bk * bn) * sizeof(half) +
-                                    (2u * mt4 * bm * bn) * sizeof(float);
+                                    (2u * mt4 * bm * bn) * sizeof(float) + 2u * bn * 84u;
             if (!cuda_ok(cudaMemcpy(wmma_down_f16_low_dev, h_f16_low,
                                     wmma_f16_low_count * sizeof(uint32_t), cudaMemcpyHostToDevice),
                          "routed_moe q2 wmma f16-low down hot copy")) return 0;
@@ -2264,7 +2264,7 @@ static int routed_moe_launch(
                             (wmma_f16_hot_max + mt * bm - 1u) / (mt * bm),
                             wmma_f16_hot_count);
             const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(half) +
-                                    (2u * mt * bm * bn) * sizeof(float);
+                                    (2u * mt * bm * bn) * sizeof(float) + 2u * bn * 84u;
             if (!cuda_ok(cudaMemcpy(wmma_down_hot_dev, h_f16_hot,
                                     wmma_f16_hot_count * sizeof(uint32_t), cudaMemcpyHostToDevice),
                          "routed_moe q2 wmma f16-mid down hot copy")) return 0;
