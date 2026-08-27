@@ -121,6 +121,9 @@ Correctness artifacts on `fw2`:
   result to 219.90 tokens/s, so that path is not a viable substitute. An
   earlier 227.22/227.63 result was invalid because the all-hipBLAS early return
   still selected the original B GEMM; its trace caught the inactive selector.
+- A 64-head/1024-thread indexed-attention tile reaches 247.16 tokens/s with the
+  E029 lead enabled, below the validated 248.56 result. Halving KV staging does
+  not offset the larger block's occupancy cost; keep the 32-head tile.
 
 ## Next campaign
 
