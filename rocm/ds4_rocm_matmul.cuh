@@ -1,3 +1,21 @@
+__global__ static void matmul_f16_tinym24_wmma_kernel(
+        float *out, const half *w, const half *x) {
+    constexpr uint32_t M=24u, N=2048u, K=16384u, BM=32u, BN=64u, WAVES=8u;
+    __shared__ half sa[BM*16u]; __shared__ half sb[16u*BN]; __shared__ float sc[BM*BN];
+    const uint32_t tid=threadIdx.x, wave=tid>>5u, wm=wave&1u, wn=wave>>1u, n0=blockIdx.x*BN;
+    using fa_t=rocwmma::fragment<rocwmma::matrix_a,16,16,16,half,rocwmma::col_major>;
+    using fb_t=rocwmma::fragment<rocwmma::matrix_b,16,16,16,half,rocwmma::col_major>;
+    using fc_t=rocwmma::fragment<rocwmma::accumulator,16,16,16,float>;
+    fa_t a; fb_t b; fc_t c; rocwmma::fill_fragment(c,0.0f);
+    for (uint32_t k0=0;k0<K;k0+=16u) {
+        for (uint32_t j=tid;j<BM*16u;j+=WAVES*32u) { const uint32_t r=j&31u, k=j>>5u; sa[j]=r<M?w[(uint64_t)r*K+k0+k]:__float2half(0.0f); }
+        for (uint32_t p=tid;p<8u*BN;p+=WAVES*32u) { const uint32_t j=p*2u,k=j&15u,n=j>>4u; *reinterpret_cast<uint32_t*>(sb+j)=*reinterpret_cast<const uint32_t*>(x+k0+k+(uint64_t)(n0+n)*K); }
+        __syncthreads(); rocwmma::load_matrix_sync(a,sa+wm*16u,BM); rocwmma::load_matrix_sync(b,sb+wn*256u,16u); rocwmma::mma_sync(c,a,b,c); __syncthreads();
+    }
+    rocwmma::store_matrix_sync(sc+wm*16u+wn*16u*BM,c,BM,rocwmma::mem_col_major); __syncthreads();
+    for (uint32_t i=tid;i<M*BN;i+=WAVES*32u) { const uint32_t n=i/M,r=i-n*M; out[r+(uint64_t)(n0+n)*M]=sc[r+n*BM]; }
+}
+
 template <uint32_t BT>
 static void cuda_launch_q8_batch_sharedx_bt(
         float *out,
@@ -209,6 +227,12 @@ static int cuda_matmul_q8_0_tensor_f16_gemm(
     if (!xh) return 0;
     f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(xh, (const float *)x->ptr, xh_count);
     if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
+    const char *tinym_env = getenv("DS4_ROCM_F16_TINYM_WMMA");
+    if (in_dim == 16384u && out_dim == 24u && n_tok == 2048u && tinym_env &&
+        tinym_env[0] != '\0' && tinym_env[0] != '0') {
+        matmul_f16_tinym24_wmma_kernel<<<32u, 256u>>>((float *)out->ptr, w_f16, xh);
+        return cuda_ok(cudaGetLastError(), "q8 f16 tinym24 wmma launch");
+    }
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasStatus_t st = cublasGemmEx(g_cublas,
@@ -836,6 +860,12 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         if (!xh) return 0;
         f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
         if (!cuda_ok(cudaGetLastError(), "f16 activation convert launch")) return 0;
+        const char *tinym_env = getenv("DS4_ROCM_F16_TINYM_WMMA");
+        if (in_dim == 16384u && out_dim == 24u && n_tok == 2048u && tinym_env &&
+            tinym_env[0] != '\0' && tinym_env[0] != '0') {
+            matmul_f16_tinym24_wmma_kernel<<<32u, 256u>>>((float *)out->ptr, w, xh);
+            return cuda_ok(cudaGetLastError(), "f16 tinym24 wmma launch");
+        }
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasGemmEx(g_cublas,
