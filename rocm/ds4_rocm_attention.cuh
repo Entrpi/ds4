@@ -78,6 +78,67 @@ __global__ static void attention_noncausal_raw_batch_heads_kernel(
         oh[d] = acc / denom;
     }
 }
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+/* Shape-specialized attention-output-B GEMM for DSV4 prefill.
+ * A is the cached transposed F16 weight [4096,8192] in column-major form,
+ * B is the packed F16 activation [8192,n_tokens], and C is F32
+ * [4096,n_tokens].  Sixteen wave32 waves cooperatively stage a 64x16 A tile
+ * and a 16x64 B tile, then each wave owns one 16x16 output tile. */
+__global__ static void attention_output_b_f16_wmma_64x64_kernel(
+        float *out,
+        const half *weight_t,
+        const half *low_h,
+        uint32_t n_tokens) {
+    constexpr uint32_t M = 4096u;
+    constexpr uint32_t K = 8192u;
+    constexpr uint32_t BLOCK_M = 64u;
+    constexpr uint32_t BLOCK_N = 64u;
+    constexpr uint32_t WAVES = 16u;
+    __shared__ half sh_a[BLOCK_M * 16u];
+    __shared__ half sh_b[16u * BLOCK_N];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t wave_m = wave & 3u;
+    const uint32_t wave_n = wave >> 2u;
+    const uint32_t m0 = (uint32_t)blockIdx.x * BLOCK_M;
+    const uint32_t n0 = (uint32_t)blockIdx.y * BLOCK_N;
+
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, 16, 16, 16, half, rocwmma::col_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, 16, 16, 16, half, rocwmma::col_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, 16, 16, 16, float>;
+    frag_a a;
+    frag_b b;
+    frag_c acc;
+    rocwmma::fill_fragment(acc, 0.0f);
+
+    for (uint32_t k0 = 0; k0 < K; k0 += 16u) {
+        const uint32_t ja = tid * 2u;
+        const uint32_t a_row = ja & 63u;
+        const uint32_t a_k = ja >> 6u;
+        *reinterpret_cast<uint32_t *>(sh_a + ja) =
+            *reinterpret_cast<const uint32_t *>(weight_t + m0 + a_row + (uint64_t)(k0 + a_k) * M);
+
+        const uint32_t jb = tid * 2u;
+        const uint32_t b_k = jb & 15u;
+        const uint32_t b_col = jb >> 4u;
+        *reinterpret_cast<uint32_t *>(sh_b + jb) =
+            *reinterpret_cast<const uint32_t *>(low_h + k0 + b_k + (uint64_t)(n0 + b_col) * K);
+        __syncthreads();
+        rocwmma::load_matrix_sync(a, sh_a + wave_m * 16u, BLOCK_M);
+        rocwmma::load_matrix_sync(b, sh_b + wave_n * 16u * 16u, 16u);
+        rocwmma::mma_sync(acc, a, b, acc);
+        __syncthreads();
+    }
+
+    rocwmma::store_matrix_sync(
+        out + m0 + wave_m * 16u + (uint64_t)(n0 + wave_n * 16u) * M,
+        acc,
+        M,
+        rocwmma::mem_col_major);
+}
+#endif
 //
 // Included from ds4_cuda.cu in the same translation unit to keep launch/API
 // glue unchanged while kernel implementations are split into modules.

@@ -1310,6 +1310,24 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                     const __half *b_ptr = out_b_f16_t ? out_b_f16_t : out_b_f16;
                     const auto b_op = out_b_f16_t ? CUBLAS_OP_N : CUBLAS_OP_T;
                     const int b_lda = out_b_f16_t ? (int)out_dim : (int)low_dim;
+                    const int use_b_wmma =
+                        getenv("DS4_ROCM_ATTN_OUTPUT_B_WMMA") != NULL &&
+                        out_b_f16_t != NULL &&
+                        out_dim == 4096u && low_dim == 8192u &&
+                        (n_tokens & 63u) == 0u;
+                    if (use_b_wmma) {
+                        const dim3 b_grid(out_dim / 64u, n_tokens / 64u, 1u);
+                        attention_output_b_f16_wmma_64x64_kernel<<<b_grid, 512u>>>(
+                                (float *)out->ptr,
+                                out_b_f16_t,
+                                low_h,
+                                n_tokens);
+                        const cudaError_t launch_err = cudaGetLastError();
+                        if (launch_err == cudaSuccess) return 1;
+                        fprintf(stderr,
+                                "ds4: ROCm attention output B WMMA failed: %s; falling back\n",
+                                cudaGetErrorString(launch_err));
+                    }
                     st = cublasGemmEx(g_cublas,
                                       b_op,
                                       CUBLAS_OP_N,
