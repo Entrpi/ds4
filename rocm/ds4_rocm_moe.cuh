@@ -7,6 +7,26 @@
 #include <rocwmma/rocwmma.hpp>
 #endif
 
+__global__ static void moe_swiglu_weighted_f32_kernel(
+        float * __restrict__ mid,
+        const float * __restrict__ gate,
+        const float * __restrict__ up,
+        const float * __restrict__ weights,
+        uint64_t n,
+        uint32_t expert_mid_dim,
+        float clamp) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint64_t pair = i / expert_mid_dim;
+    float g = isfinite(gate[i]) ? gate[i] : 0.0f;
+    float u = isfinite(up[i]) ? up[i] : 0.0f;
+    if (clamp > 1.0e-6f) {
+        g = fminf(g, clamp);
+        u = fminf(fmaxf(u, -clamp), clamp);
+    }
+    mid[i] = (g / (1.0f + expf(-g))) * u * weights[pair];
+}
+
 __device__ static float dev_f16_to_f32(uint16_t v) {
     return __half2float(*reinterpret_cast<const __half *>(&v));
 }

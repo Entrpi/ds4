@@ -1,5 +1,13 @@
 #include "ds4_mmq_d2r.cuh"
 
+extern "C" int ds4_cuda_q8_fold_take_q81(
+        const void *src, uint64_t in_dim, const void **q81) {
+    (void)src;
+    (void)in_dim;
+    (void)q81;
+    return 0;
+}
+
 // The D2R kernels use NVIDIA cp.async and MMA assembly.  They are deliberately
 // disabled in the gfx1151 MMQ lab so the portable llama.cpp raw/SoA paths can
 // be measured independently.
