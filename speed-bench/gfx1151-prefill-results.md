@@ -11,11 +11,11 @@
 
 ## Current result
 
-The validated experimental stack reaches 256.31 and 256.12 tokens/s in two
-warm 4K runs, versus 248.56 before vectorized indexed-attention KV staging,
+The validated experimental stack reaches 263.45 and 263.65 tokens/s in two
+warm 4K runs, versus 256.12-256.31 before the tiny-M F16 specialization and 248.56 before vectorized indexed-attention KV staging,
 227.32 before the attention-output-B specialization, 187.26 for clean DS4, and
 190.66 for the accepted Q2_K down-only change. This is a 36.8% improvement over
-clean DS4. The remaining gap to 300 tokens/s requires about 14.6% less interval
+clean DS4. The remaining gap to 300 tokens/s requires about 12.2% less interval
 time from the current stack.
 
 Required experimental switches:
@@ -27,6 +27,7 @@ DS4_ROCM_ATTN_WMMA32_INDEXED=1
 DS4_ROCM_ATTN_WMMA32_RING=1
 DS4_ROCM_ATTN_OUTPUT_B_WMMA=1
 DS4_ROCM_ATTN_F32_VEC2=1
+DS4_ROCM_F16_TINYM_WMMA=1
 ```
 
 The implementation is split into reviewable commits:
@@ -42,6 +43,7 @@ The implementation is split into reviewable commits:
 | `fe74d50` | Replace hot SoA IQ2 sign-mask recomputation with the existing cache-hot 1 KiB lookup table. |
 | `55f4072` | Replace the 4096xN-by-8192 attention-output-B hipBLAS GEMM with a shape-exact 64x64 wave32 rocWMMA kernel and add its standalone harness. |
 | `8ae33fd` | Vectorize indexed-attention F32-to-F16 KV tile staging with aligned `float2` loads and packed `half2` LDS stores. |
+| `24a339c` | Replace the repeated `24x2048x16384` native-F16 hipBLAS GEMM with a shape-exact padded-row rocWMMA kernel and add its harness. |
 
 ## Correctness and build checks
 
@@ -69,6 +71,11 @@ The indexed-attention F32 vector-staging path is byte-identical to the validated
 tokens: same top-1, max-abs 0, RMSE 0, and zero differing elements. It introduces
 no new allocation or cache lifetime; conversion remains bounded by each owned
 LDS tile.
+
+The tiny-M F16 harness matches all 49,152 outputs (max-abs 0.00108, RMSE
+0.00038, zero over 0.05) and takes 1.259 ms versus hipBLAS 3.230 ms. Full engine
+logits are byte-identical through 2048 tokens; at 4096 top-1 matches with
+max-abs 1.249 and RMSE 0.256, inside the accepted envelope.
 
 `git diff --check` passes. After `aac604b`, the ROCm regression build compiles
 and links `ds4`, `ds4-server`, `ds4-bench`, `ds4-eval`, `ds4-agent`, and the test
