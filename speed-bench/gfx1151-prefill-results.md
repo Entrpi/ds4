@@ -143,6 +143,12 @@ Correctness artifacts on `fw2`:
   candidate from E045's 198.17/277.29 to 207.22/278.42 tok/s. The larger
   short-context gain and small warm gain show that empty-CTA overhead is now
   largely removed; the warm path is dominated by useful IQ2 tile computation.
+- Fusing raw-layout IQ2 gate/up into one x64/y32 CTA raises full 2K prefill to
+  221.21 tok/s (+6.75% over E046) while the warm 2K increment at 4K is flat at
+  277.73 versus 278.42 tok/s. A first-layer differential probe verifies all
+  6,291,456 outputs per leg bit-for-bit, and the clean 512/1024/2048/4096
+  engine frontiers are byte-identical to E046. Keep the experiment behind
+  `DS4_ROCM_MMQ_PAIRED_Y32=1` pending profile evidence for the warm shape.
 - The small-M F16 specialization replaces 184 warm hipBLAS calls with 184
   rocWMMA launches. Its profiled pool is 180.0 ms and total warm GPU work falls
   from 7.517 s to 7.304 s; the profiled frontier reaches 267.70 tokens/s.
@@ -234,6 +240,12 @@ shorten IQ2 unpack live ranges, or replace the raw-layout decoder with a
 gfx1151-specific paired kernel. Every surviving kernel
 must pass standalone output comparison and the saved four-frontier logit gate
 before admission.
+
+E047 implements shared activation staging in a paired x64/y32 raw-layout
+kernel. It materially improves full 2K prefill but leaves the warm 4K increment
+unchanged. The next profile must determine whether the remaining cost is
+duplicated IQ2 decode, lower y32 occupancy, or another kernel pool before
+extending the paired design.
 
 E037 safely captures the tile-staging part of that opportunity and raises the
 validated warm lead to 256.12-256.31 tokens/s. The remaining gap to 300 is about
