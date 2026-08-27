@@ -1382,7 +1382,14 @@ int ds4_mmq_moe_pair_impl(
      * token cannot select the same expert twice, so no expert bucket can
      * exceed n_tokens rows. Keep the conservative gathered-row bound for all
      * generic MMQ callers, including DSpark/MTP. */
-    const int64_t routed_ncols_max = fused_down
+    /* The IQ2 gate/up route is a true top-k selection: one token contributes
+     * at most one row to any expert. The default gathered-row upper bound
+     * overlaunches empty expert tiles by top_k; keep this opt-in until the
+     * compact expert-tile launch replaces the rectangular grid entirely. */
+    const bool tight_iq2_ncols =
+        type == GGML_TYPE_IQ2_XXS &&
+        getenv("DS4_ROCM_MMQ_TIGHT_NCOLS") != nullptr;
+    const int64_t routed_ncols_max = (fused_down || tight_iq2_ncols)
         ? (int64_t)n_tokens
         : ne_get_rows;
 
