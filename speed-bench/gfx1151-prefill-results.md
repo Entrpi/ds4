@@ -136,13 +136,40 @@ Correctness artifacts on `fw2`:
   exact-shape harness.
 - Packed-half2 Q2_K dequantization reaches 203.03/247.62 tokens/s at 2K/4K,
   below the validated lead, so it is rejected and the source is restored.
+- Four-lane Q2_K scale broadcast reaches only 201.39/245.35 tokens/s. The two
+  shuffles cost more than the redundant cache-hot metadata loads they replace.
+- Caching a full 32-key-by-512 KV tile in LDS improves the short frontier to
+  209.57 tokens/s but lowers warm 4K to 245.21 because it doubles online
+  softmax/rescale blocks.
+
+## Experimental 255 tokens/s lead
+
+An opt-in indexed-attention F16 mirror plus packed half2 LDS staging reaches
+208.01/255.46 tokens/s at 2K/4K; the lifetime-safe validation run reaches
+255.19 tokens/s at 4K. HIP-event instrumentation measures about 46.24 ms for
+the half-KV attention kernel versus 49.73 ms for the saved F32-load kernel,
+with about 0.053 ms spent producing both mirrors.
+
+This candidate is rejected and fully reverted. Reusing DS4's global temporary
+buffer caused an asynchronous lifetime fault. Dedicated scratch completes all
+four frontiers and preserves top-1, but the mirror still exceeds the accepted
+1024-token full-logit envelope (max-abs 17.67, RMSE 2.55). Scalar half staging
+is worse (24.93/3.98), isolating the difference to mirror production rather
+than vector indexing. The follow-up using scalar `__float2half` conversion
+generated repeated gfxhub TCP permission page faults at 16:02 and 16:07 and
+ultimately required rebooting fw2. Preserve the 255 tok/s measurement only as
+evidence for native F16 KV production or lifetime-bounded tile conversion; do
+not reproduce the full-cache mirror.
 
 ## Next campaign
 
 The refreshed lead profile prioritizes IQ2 gate/up (1.573 s), indexed attention
 (1.044 s), and Q2_K hot down (0.994 s). Q2_K work must reuse scale metadata or
 change data staging rather than widen output ownership or merely substitute
-packed-half arithmetic. IQ2 requires a structural mapping/live-range rewrite,
-not another tile or wave-count parameter sweep. Every surviving kernel must pass
-standalone output comparison and the saved four-frontier logit gate before
-admission.
+packed-half arithmetic. The indexed-attention experiment proves that F16 KV
+plus vector staging can contribute another ~2.8% end-to-end, but the unsafe
+full-cache mirror is closed. Future attention work must produce F16 KV natively
+or convert only bounded tiles. IQ2 requires a structural mapping/live-range
+rewrite, not another tile or wave-count parameter sweep. Every surviving kernel
+must pass standalone output comparison and the saved four-frontier logit gate
+before admission.
