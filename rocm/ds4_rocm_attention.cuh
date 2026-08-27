@@ -1347,11 +1347,12 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
         uint32_t ratio,
         uint32_t n_head,
         uint32_t head_dim) {
-    constexpr uint32_t KEYS = 64u;
+    constexpr uint32_t KEYS = 80u;
     constexpr uint32_t DIMS = 64u;
     constexpr uint32_t TILE = 16u;
-    constexpr uint32_t STRIDE = 64u;
+    constexpr uint32_t STRIDE = KEYS;
     constexpr uint32_t HEAD_TILES = HEADS / TILE;
+    constexpr uint32_t KEY_TILES = KEYS / TILE;
     constexpr uint32_t WORKGROUP = HEADS * 16u;
     const uint32_t t = (uint32_t)blockIdx.x;
     const uint32_t head_base = (uint32_t)blockIdx.y * HEADS;
@@ -1485,7 +1486,7 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
         frag_a qa;
         frag_b_col kk;
         frag_c score_acc;
-        if (wave < HEAD_TILES * 4u) rocwmma::fill_fragment(score_acc, 0.0f);
+        if (wave < HEAD_TILES * KEY_TILES) rocwmma::fill_fragment(score_acc, 0.0f);
 
         for (uint32_t d0 = 0; d0 < 512u; d0 += TILE) {
             if (tid < HEADS * TILE) {
@@ -1546,9 +1547,9 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
                 }
             }
             __syncthreads();
-            if (wave < HEAD_TILES * 4u) {
-                const uint32_t head_tile = wave >> 2u;
-                const uint32_t key_tile = wave & 3u;
+            if (wave < HEAD_TILES * KEY_TILES) {
+                const uint32_t head_tile = wave / KEY_TILES;
+                const uint32_t key_tile = wave - head_tile * KEY_TILES;
                 rocwmma::load_matrix_sync(qa,
                         sh_qp + head_tile * TILE * STRIDE, STRIDE);
                 rocwmma::load_matrix_sync(kk,
@@ -1557,9 +1558,9 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
             }
             __syncthreads();
         }
-        if (wave < HEAD_TILES * 4u) {
-            const uint32_t head_tile = wave >> 2u;
-            const uint32_t key_tile = wave & 3u;
+        if (wave < HEAD_TILES * KEY_TILES) {
+            const uint32_t head_tile = wave / KEY_TILES;
+            const uint32_t key_tile = wave - head_tile * KEY_TILES;
             rocwmma::store_matrix_sync(
                                        sh_matrix + head_tile * TILE * STRIDE + key_tile * TILE,
                                        score_acc,
@@ -1571,7 +1572,7 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
         const uint32_t lane16 = tid & 15u;
         float block_max = -INFINITY;
 #pragma unroll
-        for (uint32_t i = 0; i < 4u; i++) {
+        for (uint32_t i = 0; i < KEY_TILES; i++) {
             const uint32_t kl = lane16 + i * 16u;
             if (kb + kl < n_score) {
                 block_max = fmaxf(block_max, sh_matrix[hl * STRIDE + kl] * scale);
@@ -1588,7 +1589,7 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
         const float prev_scale = prev_sum == 0.0f ? 0.0f : expf(prev_max - next_max);
         float block_sum = 0.0f;
 #pragma unroll
-        for (uint32_t i = 0; i < 4u; i++) {
+        for (uint32_t i = 0; i < KEY_TILES; i++) {
             const uint32_t kl = lane16 + i * 16u;
             float p = 0.0f;
             if (kb + kl < n_score) {
@@ -1669,7 +1670,7 @@ __global__ static void attention_mixed_heads16_wmma_kernel(
             frag_c pv_acc;
             if (wave < HEAD_TILES * 4u) rocwmma::fill_fragment(pv_acc, 0.0f);
 #pragma unroll
-            for (uint32_t kc = 0; kc < 4u; kc++) {
+            for (uint32_t kc = 0; kc < KEY_TILES; kc++) {
                 frag_a pp;
                 frag_b_row vv;
                 if (wave < HEAD_TILES * 4u) {
