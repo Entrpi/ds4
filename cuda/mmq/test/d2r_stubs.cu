@@ -8,9 +8,8 @@ extern "C" int ds4_cuda_q8_fold_take_q81(
     return 0;
 }
 
-// The D2R kernels use NVIDIA cp.async and MMA assembly.  They are deliberately
-// disabled in the gfx1151 MMQ lab so the portable llama.cpp raw/SoA paths can
-// be measured independently.
+// The D2R kernels use NVIDIA cp.async and MMA assembly. Disable them in ROCm
+// builds and use the portable raw/SoA paths instead.
 bool ds4_mmq_q2_K_moe_d2r_available(int) { return false; }
 bool ds4_mmq_iq2_xxs_moe_d2r_available(int) { return false; }
 bool ds4_mmq_q8_0_dense_d2r_available(int) { return false; }
