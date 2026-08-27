@@ -941,6 +941,15 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
                 return cuda_ok(cudaGetLastError(), "f16 smallm wmma launch");
             }
         }
+        const char *largem_env = getenv("DS4_ROCM_F16_LARGEM_WMMA");
+        if (n_tok == 2048u && largem_env && largem_env[0] != '\0' &&
+            largem_env[0] != '0' && in_dim == 1024u && out_dim == 8192u) {
+            const dim3 grid((uint32_t)out_dim / 64u, (uint32_t)n_tok / 64u, 1u);
+            matmul_f16_smallm_wmma_kernel<64u, 64u><<<grid, 512u>>>(
+                    (float *)out->ptr, w, xh, (uint32_t)out_dim,
+                    (uint32_t)n_tok, (uint32_t)in_dim);
+            return cuda_ok(cudaGetLastError(), "f16 largem wmma launch");
+        }
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasGemmEx(g_cublas,
