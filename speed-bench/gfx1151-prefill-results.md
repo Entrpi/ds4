@@ -11,14 +11,15 @@
 
 ## Current result
 
-The validated experimental stack reaches 264.62 and 269.02 tokens/s in two
-warm 4K runs, versus 263.45-263.65 before the small-M F16 specialization,
+The validated experimental stack reaches 277.29 tokens/s in a warm 4K run
+after tightening the IQ2 MoE launch bound, versus 264.62 and 269.02 before
+that change, 263.45-263.65 before the small-M F16 specialization,
 256.12-256.31 before the tiny-M F16 specialization, 248.56 before vectorized
 indexed-attention KV staging, 227.32 before the attention-output-B
 specialization, 187.26 for clean DS4, and 190.66 for the accepted Q2_K
 down-only change. The best repeat is 43.7% faster than clean DS4. The remaining
-gap to 300 tokens/s requires about 10.3% less interval time from the current
-stack.
+gap to 300 tokens/s is 7.6% in throughput, or about 7.6% less interval time
+from the current stack.
 
 Required experimental switches:
 
@@ -31,6 +32,7 @@ DS4_ROCM_ATTN_OUTPUT_B_WMMA=1
 DS4_ROCM_ATTN_F32_VEC2=1
 DS4_ROCM_F16_TINYM_WMMA=1
 DS4_ROCM_F16_SMALLM_WMMA=1
+DS4_ROCM_MMQ_TIGHT_NCOLS=1
 ```
 
 The implementation is split into reviewable commits:
@@ -48,6 +50,7 @@ The implementation is split into reviewable commits:
 | `8ae33fd` | Vectorize indexed-attention F32-to-F16 KV tile staging with aligned `float2` loads and packed `half2` LDS stores. |
 | `24a339c` | Replace the repeated `24x2048x16384` native-F16 hipBLAS GEMM with a shape-exact padded-row rocWMMA kernel and add its harness. |
 | `73c7091` | Replace the `64/256/512/1024 x 2048 x 4096` F16 hipBLAS GEMMs with shape-selected rocWMMA tiles and extend the exact-shape harness. |
+| `0643952` | Bound IQ2 gate/up expert buckets by `n_tokens`, eliminating the known top-k factor from the rectangular launch. |
 
 ## Correctness and build checks
 
@@ -89,6 +92,12 @@ byte-identical to the tiny-M lead through 2048 tokens; at 4096 top-1 matches
 with max-abs 1.168 and RMSE 0.213, inside the accepted envelope. Artifacts are
 under `~/ds4/correctness/f16-smallm-wmma-20260827/`.
 
+The tightened IQ2 expert-column bound is byte-identical to E042 at the 512,
+1024, 2048, and 4096 token frontiers. It changes only the conservative launch
+extent: a true top-k route cannot place the same token into one expert twice,
+so no expert bucket can exceed `n_tokens`. The exact validation artifacts are
+under `~/ds4/correctness/e045-tight-ncols-exact-20260827/`.
+
 `git diff --check` passes. After `aac604b`, the ROCm regression build compiles
 and links `ds4`, `ds4-server`, `ds4-bench`, `ds4-eval`, `ds4-agent`, and the test
 binaries with the MMQ objects. Q4_K and MXFP4 dot tests pass 4/4, and the answer
@@ -118,6 +127,10 @@ Correctness artifacts on `fw2`:
   ISA inspection identify IQ2 unpack/live-state pressure as the next structural
   target: the kernel contains 384 `v_lshlrev_b16`, 256 `v_sub_nc_i16`, and 256
   `v_and_b16` instructions, with about a 69.5% L2 hit rate.
+- At 2K, the saved IQ2 trace sizes each expert from all 12,288 gathered rows.
+  Bounding an expert by the 2,048 input tokens removes the known top-k factor
+  of six from this empty-tile launch and raises warm 4K prefill from 269.02 to
+  277.29 tok/s.
 - The small-M F16 specialization replaces 184 warm hipBLAS calls with 184
   rocWMMA launches. Its profiled pool is 180.0 ms and total warm GPU work falls
   from 7.517 s to 7.304 s; the profiled frontier reaches 267.70 tokens/s.
@@ -199,8 +212,12 @@ change data staging rather than widen output ownership or merely substitute
 packed-half arithmetic. The indexed-attention experiment proves that F16 KV
 plus vector staging can contribute another ~2.8% end-to-end, but the unsafe
 full-cache mirror is closed. Future attention work must produce F16 KV natively
-or convert only bounded tiles. IQ2 requires a structural mapping/live-range
-rewrite, not another tile or wave-count parameter sweep. Every surviving kernel
+or convert only bounded tiles. E045 shows that IQ2 also wastes substantial
+dispatch capacity on empty expert tiles. The next candidate is a device-built
+compact `(expert, column-tile)` worklist that preserves the existing MMQ math
+while removing the remaining rectangular per-expert overlaunch. Only after
+compact launch should IQ2 move to a structural mapping/live-range rewrite.
+Every surviving kernel
 must pass standalone output comparison and the saved four-frontier logit gate
 before admission.
 
