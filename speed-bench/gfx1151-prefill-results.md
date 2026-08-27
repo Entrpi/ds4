@@ -11,14 +11,15 @@
 
 ## Current result
 
-The validated experimental stack reaches 277.29 tokens/s in a warm 4K run
-after tightening the IQ2 MoE launch bound, versus 264.62 and 269.02 before
-that change, 263.45-263.65 before the small-M F16 specialization,
+The validated experimental stack reaches 278.42 tokens/s in a warm 4K run
+after compacting the IQ2 MoE expert-tile launch, versus 277.29 with only the
+tightened launch bound, 264.62 and 269.02 before that change, 263.45-263.65
+before the small-M F16 specialization,
 256.12-256.31 before the tiny-M F16 specialization, 248.56 before vectorized
 indexed-attention KV staging, 227.32 before the attention-output-B
 specialization, 187.26 for clean DS4, and 190.66 for the accepted Q2_K
 down-only change. The best repeat is 43.7% faster than clean DS4. The remaining
-gap to 300 tokens/s is 7.6% in throughput, or about 7.6% less interval time
+gap to 300 tokens/s is 7.8% in throughput, or about 7.2% less interval time
 from the current stack.
 
 Required experimental switches:
@@ -33,6 +34,7 @@ DS4_ROCM_ATTN_F32_VEC2=1
 DS4_ROCM_F16_TINYM_WMMA=1
 DS4_ROCM_F16_SMALLM_WMMA=1
 DS4_ROCM_MMQ_TIGHT_NCOLS=1
+DS4_ROCM_MMQ_COMPACT_TILES=1
 ```
 
 The implementation is split into reviewable commits:
@@ -51,6 +53,7 @@ The implementation is split into reviewable commits:
 | `24a339c` | Replace the repeated `24x2048x16384` native-F16 hipBLAS GEMM with a shape-exact padded-row rocWMMA kernel and add its harness. |
 | `73c7091` | Replace the `64/256/512/1024 x 2048 x 4096` F16 hipBLAS GEMMs with shape-selected rocWMMA tiles and extend the exact-shape harness. |
 | `0643952` | Bound IQ2 gate/up expert buckets by `n_tokens`, eliminating the known top-k factor from the rectangular launch. |
+| `7345686` | Build a device-side list of live IQ2 `(expert, column-tile)` pairs and reuse it for gate and up. |
 
 ## Correctness and build checks
 
@@ -98,6 +101,11 @@ extent: a true top-k route cannot place the same token into one expert twice,
 so no expert bucket can exceed `n_tokens`. The exact validation artifacts are
 under `~/ds4/correctness/e045-tight-ncols-exact-20260827/`.
 
+The compact IQ2 launch is also byte-identical to E045 at all four frontiers.
+It preserves the x64/y64 MMQ tile body and changes only how live ragged expert
+tiles are scheduled. The exact validation artifacts are under
+`~/ds4/correctness/e046-compact-tiles-20260827/`.
+
 `git diff --check` passes. After `aac604b`, the ROCm regression build compiles
 and links `ds4`, `ds4-server`, `ds4-bench`, `ds4-eval`, `ds4-agent`, and the test
 binaries with the MMQ objects. Q4_K and MXFP4 dot tests pass 4/4, and the answer
@@ -131,6 +139,10 @@ Correctness artifacts on `fw2`:
   Bounding an expert by the 2,048 input tokens removes the known top-k factor
   of six from this empty-tile launch and raises warm 4K prefill from 269.02 to
   277.29 tok/s.
+- Compacting the remaining ragged expert tiles raises the separate 2K/4K
+  candidate from E045's 198.17/277.29 to 207.22/278.42 tok/s. The larger
+  short-context gain and small warm gain show that empty-CTA overhead is now
+  largely removed; the warm path is dominated by useful IQ2 tile computation.
 - The small-M F16 specialization replaces 184 warm hipBLAS calls with 184
   rocWMMA launches. Its profiled pool is 180.0 ms and total warm GPU work falls
   from 7.517 s to 7.304 s; the profiled frontier reaches 267.70 tokens/s.
@@ -215,9 +227,11 @@ full-cache mirror is closed. Future attention work must produce F16 KV natively
 or convert only bounded tiles. E045 shows that IQ2 also wastes substantial
 dispatch capacity on empty expert tiles. The next candidate is a device-built
 compact `(expert, column-tile)` worklist that preserves the existing MMQ math
-while removing the remaining rectangular per-expert overlaunch. Only after
-compact launch should IQ2 move to a structural mapping/live-range rewrite.
-Every surviving kernel
+while removing the remaining rectangular per-expert overlaunch. E046 validates
+that design but yields only 1.13 tok/s at the warm frontier, so the next IQ2
+campaign must reduce useful-tile cost: share activation staging across gate/up,
+shorten IQ2 unpack live ranges, or replace the raw-layout decoder with a
+gfx1151-specific paired kernel. Every surviving kernel
 must pass standalone output comparison and the saved four-frontier logit gate
 before admission.
 
