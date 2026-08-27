@@ -82,6 +82,10 @@ Correctness artifacts on `fw2`:
   ISA inspection identify IQ2 unpack/live-state pressure as the next structural
   target: the kernel contains 384 `v_lshlrev_b16`, 256 `v_sub_nc_i16`, and 256
   `v_and_b16` instructions, with about a 69.5% L2 hit rate.
+- The warm 4K interval starts at dispatch 4243. Its largest remaining kernel
+  groups are IQ2 MMQ gate/up (1.719 s), a 42-call 16K-by-64 hipBLAS projection
+  (1.087 s), indexed attention (1.054 s), Q2_K hot down (1.002 s), and the
+  remaining hipBLAS projection shapes (0.733 s).
 
 ## Rejected variants
 
@@ -92,13 +96,18 @@ Correctness artifacts on `fw2`:
   regresses the kernel to 37.3-37.5 ms.
 - A 128x32 Q8 tile loses to 128x64, and an eight-wave Q2_K down tile lowers the
   warm result to 219.75 tokens/s.
+- A four-output-tile Q2_K down kernel halves grid X but raises VGPRs from 48 to
+  80. It takes 2.154 s across the profiled 2K/4K run versus 2.014 s for the
+  two-output-tile kernel (+6.9%), and lowers the unprofiled warm result to
+  225.95 tokens/s. The first 227.28 tokens/s run did not exercise this variant:
+  its selector was in an inactive all-Q2 launcher, and the trace confirmed n2.
 
 ## Next campaign
 
-The next work should isolate IQ2 decode/unpack and the remaining Q2_K/hipBLAS
-groups in shape-specific microbenchmarks, then sweep structural variants against
-the x64/y64 reference. The leading hypotheses are to shorten IQ2 unpack live
-ranges, stage packed values differently for gfx1151 wave32 WMMA, and selectively
-replace the remaining projection paths using the current llama.cpp gfx1151 MMQ
-organization as a reference. Every surviving kernel must pass standalone output
-comparison and the saved four-frontier logit gate before admission.
+The next work should isolate the 1.087-second dense hipBLAS projection and its
+exact matrix shapes, then compare shape-specific rocWMMA/MMQ replacements. Q2_K
+work should change dequantization or data movement without adding live output
+accumulators; the n4 result rules out wider output reuse at the current tile.
+IQ2 remains a structural target through shorter unpack live ranges or a newer
+llama.cpp-style organization. Every surviving kernel must pass standalone
+output comparison and the saved four-frontier logit gate before admission.
