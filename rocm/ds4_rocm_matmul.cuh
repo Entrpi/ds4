@@ -392,10 +392,24 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
             out_dim >= 1024u &&
             n_tok >= 256u &&
             in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
-            const dim3 grid((uint32_t)((out_dim + 63u) / 64u),
+            if (out_dim >= 8192u) {
+                const dim3 grid((uint32_t)((out_dim + 255u) / 256u),
+                                (uint32_t)((n_tok + 63u) / 64u),
+                                1u);
+                matmul_q8_0_f32_batch_wmma_rowtile_kernel<256u, 16u><<<grid, 512u>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr,
+                        (uint32_t)n_tok,
+                        (uint32_t)in_dim,
+                        (uint32_t)out_dim,
+                        blocks * 34u);
+                return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 16w launch");
+            }
+            const dim3 grid((uint32_t)((out_dim + 127u) / 128u),
                             (uint32_t)((n_tok + 63u) / 64u),
                             1u);
-            matmul_q8_0_f32_batch_wmma_4w_kernel<<<grid, 128u>>>(
+            matmul_q8_0_f32_batch_wmma_rowtile_kernel<128u, 8u><<<grid, 256u>>>(
                     (float *)out->ptr,
                     reinterpret_cast<const unsigned char *>(wptr),
                     (const float *)x->ptr,
@@ -403,7 +417,7 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                     (uint32_t)in_dim,
                     (uint32_t)out_dim,
                     blocks * 34u);
-            return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 4w launch");
+            return cuda_ok(cudaGetLastError(), "matmul_q8_0 f32 batch wmma 8w launch");
         }
 #endif
         if ((in_dim & 31u) == 0u && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
