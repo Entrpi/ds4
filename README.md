@@ -268,58 +268,56 @@ syntax, but can create repeated text when applied to long code or file bodies.
 
 ### Replayed reasoning and agent-loop robustness
 
-Three knobs target long agent loops (measured on SWE-rebench-class
-workloads; see the changelog for the receipts):
+Deep agent loops on low-bit quants have a characteristic failure: past
+roughly 65K tokens the model sometimes answers a tools-armed turn with a
+prose completion report ("all tests pass, done") instead of a tool call —
+measured at up to 50% of turns in the 70-80K band, always right after a
+successful tool result. Agent harnesses reject those turns and their
+retry rules can convert a few of them into an abandoned task with real
+work discarded. Three knobs address it, one default and two optional
+levers (measured on SWE-rebench-class workloads; receipts in the
+changelog):
 
 **`--tool-call-reminder on|off`, default on** (v0.6.5; env
-`DS4_TOOL_CALL_REMINDER=0` disables). At depth, low-bit quants answer
-some tools-armed turns with a prose completion report instead of a tool
-call — measured at 50% of turns in the 70-80K band, always right after a
-successful tool result, and agent harnesses abandon tasks over it. Past
-~96KB of rendered conversation (~30K+ tokens), every tool result now
-carries a short protocol reminder. At the exact captured slip states the
-reminder measured 0/72 sampled slips vs 6/72 without, and it fixed the
-failing agent task end to end (submitted and harness-resolved, zero
-slips) with reasoning traces kept and no format deviation — the
-reference-faithful fix. Shallow conversations are never touched, so
-chat-with-tools flows that legitimately answer in prose after a tool
-result are unaffected. The injection is byte-stable across turns, so
-warm prefix reuse is unchanged.
+`DS4_TOOL_CALL_REMINDER=0` disables) — the default fix. Past ~96KB of
+rendered conversation (~30K+ tokens), every tool result carries a short
+protocol reminder. At the exact captured slip states the reminder
+measured 0/72 sampled slips vs 6/72 without, and it fixed the failing
+agent task end to end (submitted and harness-resolved, zero slips) with
+reasoning traces kept and no format deviation. Shallow conversations are
+never touched, so chat-with-tools flows that legitimately answer in
+prose after a tool result are unaffected, and the injection is
+byte-stable across turns, so warm prefix reuse is unchanged.
 
-**`--reasoning-replay keep|drop`** (env `DS4_REASONING_REPLAY=drop`).
-Most OpenAI-style agent scaffolds echo each assistant message back
-verbatim, including `reasoning_content`. That is what DeepSeek specifies
-for this model family: the V4 reference encoding keeps reasoning for
-every turn whenever tools are present, and DeepSeek's API requires the
-echo in tool loops (it returns 400 when `reasoning_content` is not
-passed back). Under the default `keep`, the tool-context render honors
-that format and re-emits the reasoning inside `<think>` blocks, which
-also keeps the rendered prefix byte-aligned with the live KV (warm
-in-place reuse, no re-prefill). The cost is depth: llama-server's
-template default drops replayed reasoning, a deviation from the
-reference format, and on the identical conversation that deviation runs
-16-28% shallower per turn. Depth is where low-bit quants start missing
-the tool-call protocol, so on this ship quant the deviation pays.
-`drop` reproduces it opt-in, rendering history assistant turns in the
-lean `</think>` replay form; the bank's partial-prefix admission absorbs
-the divergence at the cost of a one-turn-tail re-prefill (~270 tokens
-measured). An assistant turn being continued (after the last user-like
-message) always keeps its reasoning. For long agent loops on low-bit
-quants, `drop` is the recommended setting; the default stays `keep`,
-the reference-faithful behavior.
+**`--reasoning-replay keep|drop`** (env `DS4_REASONING_REPLAY=drop`) —
+an optional depth lever. Most OpenAI-style agent scaffolds echo each
+assistant message back verbatim, including `reasoning_content`, and that
+is what DeepSeek specifies for this model family: the V4 reference
+encoding keeps reasoning for every turn whenever tools are present, and
+DeepSeek's API requires the echo in tool loops (it returns 400 when
+`reasoning_content` is not passed back). The default `keep` honors that
+format, re-emitting the reasoning inside `<think>` blocks, which also
+keeps the rendered prefix byte-aligned with the live KV (warm in-place
+reuse, no re-prefill). llama-server's template default drops the echo
+instead — a deviation from the reference format that runs the identical
+conversation 16-28% shallower per turn, which delays the depth band
+where slips live. `drop` reproduces that deviation opt-in, rendering
+history assistant turns in the lean `</think>` replay form; the bank's
+partial-prefix admission absorbs the divergence at the cost of a
+one-turn-tail re-prefill (~270 tokens measured). An assistant turn being
+continued (after the last user-like message) always keeps its reasoning.
+With the default reminder on, most agent loops no longer need this.
 
 **`--tool-slip-resample`** (env `DS4_TOOL_SLIP_RESAMPLE=1`, off by
-default). At depth a quantized model occasionally answers a tools-armed
-turn with a prose completion report instead of a tool call; agent
-harnesses reject the turn, and their retry rules can convert a few such
-slips into a dead task. With this knob, a continuously-batched
-non-streaming chat turn that settles at `finish=stop` with no tool calls
-is requeued once for a fresh draw before anything reaches the client; the
-just-retired bank warm-admits the full prompt, so the retry costs one
-generation. `length`/`error` finishes, streaming turns, and the serial
-lane are never resampled. Note the obvious disclosure: this retries the
-server's own sampler before the harness sees the turn, so benchmark
-results should say whether it was on.
+default) — a second line of defense for slips that still get through.
+A continuously-batched non-streaming chat turn that settles at
+`finish=stop` with no tool calls is requeued once for a fresh draw
+before anything reaches the client; the just-retired bank warm-admits
+the full prompt, so the retry costs one generation. `length`/`error`
+finishes, streaming turns, and the serial lane are never resampled.
+Note the obvious disclosure, which applies to the default reminder as
+well: these change benchmark behavior, so results should say which
+knobs were on.
 
 ### Continuation registry and trust domain
 
@@ -1404,6 +1402,15 @@ results, each receipted there:
   ledger since v0.6.2: measured to 3M tokens of active context on one
   128 GB Spark (2.26M at zero config), typed refusals, a 4 GiB floor,
   idle trim. See [Memory and capacity](#memory-and-capacity).
+- **Agent robustness (v0.6.3.1-v0.6.5).** A field report of agent tasks
+  dying at depth was root-caused to three mechanisms and fixed with
+  receipts at each step: client effort fields compat-map away from the
+  checkpoint's injected preambles, deep tool results carry a protocol
+  reminder by default (0/72 slips vs 6/72 without at the captured
+  failure states), and two opt-in levers cover the rest. A previously
+  failing SWE-rebench task now resolves at stock defaults, matching
+  llama.cpp's outcome while keeping DeepSeek's reference format. See
+  [Replayed reasoning and agent-loop robustness](#replayed-reasoning-and-agent-loop-robustness).
 - **Ops.** A resident weight server imports the 81 GiB model into
   engine processes in seconds (VMM-backed IPC, manifest with a
   content-identity check), and standalone boots build the same aligned
