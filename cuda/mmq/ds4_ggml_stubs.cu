@@ -9,8 +9,12 @@
 
 #include "common.cuh"   // pulls in ds4_ggml_stubs.h via redirect headers
 
+#if defined(GGML_USE_HIP)
+#include "vendors/hip.h"
+#else
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#endif
 
 #include <chrono>
 #include <cstdio>
@@ -44,10 +48,23 @@ const ggml_cuda_device_info & ggml_cuda_info() {
         for (int i = 0; i < count; i++) {
             cudaDeviceProp p;
             CUDA_CHECK(cudaGetDeviceProperties(&p, i));
+#if defined(GGML_USE_HIP)
+            unsigned gfx_id = 0;
+            if (sscanf(p.gcnArchName, "gfx%x", &gfx_id) == 1) {
+                info.devices[i].cc = GGML_CUDA_CC_OFFSET_AMD + (int)gfx_id;
+            } else {
+                info.devices[i].cc = GGML_CUDA_CC_OFFSET_AMD + p.major * 0x100 + p.minor * 0x10;
+            }
+#else
             info.devices[i].cc                          = p.major * 100 + p.minor * 10;
+#endif
             info.devices[i].nsm                         = p.multiProcessorCount;
             info.devices[i].smpb                        = p.sharedMemPerBlock;
+#if defined(GGML_USE_HIP)
+            info.devices[i].smpbo                       = p.sharedMemPerBlock;
+#else
             info.devices[i].smpbo                       = p.sharedMemPerBlockOptin;
+#endif
             info.devices[i].integrated                  = p.integrated != 0;
             info.devices[i].vmm                         = false;
             info.devices[i].vmm_granularity             = 0;
