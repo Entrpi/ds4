@@ -367,6 +367,31 @@ static int attention_decode_batch_launch(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     const int fast_window_attention = !g_quality_mode;
+    const char *wmma_ring_env = getenv("DS4_ROCM_ATTN_WMMA32_RING");
+    const bool use_wmma_ring = wmma_ring_env && wmma_ring_env[0] != '\0' &&
+                               wmma_ring_env[0] != '0';
+    if (use_wmma_ring && !use_comp_mask && n_tokens > 1u &&
+        head_dim == 512u && fast_window_attention) {
+        dim3 grid(n_tokens, (n_head + 31u) / 32u, 1);
+        attention_mixed_heads16_wmma_kernel<2, 32><<<grid, 512>>>((float *)heads->ptr,
+                                                                  sinks,
+                                                                  (const float *)q->ptr,
+                                                                  (const float *)raw_kv->ptr,
+                                                                  n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                  NULL,
+                                                                  n_tokens,
+                                                                  pos0,
+                                                                  n_raw,
+                                                                  raw_cap,
+                                                                  raw_start,
+                                                                  n_comp,
+                                                                  0,
+                                                                  window,
+                                                                  ratio,
+                                                                  n_head,
+                                                                  head_dim);
+        return cuda_ok(cudaGetLastError(), "attention ring wmma32 launch");
+    }
     if (!cuda_attention_score_buffer_fits(n_comp)) {
         if (!use_comp_mask && head_dim == 512u) {
             dim3 online_grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -546,6 +571,53 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         top_k <= DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
         if (!g_quality_mode && n_head <= 64u) {
+            const char *wmma32_env = getenv("DS4_ROCM_ATTN_WMMA32_INDEXED");
+            const bool use_wmma32 = wmma32_env && wmma32_env[0] != '\0' &&
+                                    wmma32_env[0] != '0';
+            if (use_wmma32) {
+                dim3 grid(n_tokens, (n_head + 31u) / 32u, 1);
+                attention_mixed_heads16_wmma_kernel<1, 32><<<grid, 512>>>((float *)heads->ptr,
+                                                                            sinks,
+                                                                            (const float *)q->ptr,
+                                                                            (const float *)raw_kv->ptr,
+                                                                            (const float *)comp_kv->ptr,
+                                                                            topk_ptr,
+                                                                            n_tokens,
+                                                                            pos0,
+                                                                            n_raw,
+                                                                            raw_cap,
+                                                                            raw_start,
+                                                                            n_comp,
+                                                                            top_k,
+                                                                            window,
+                                                                            ratio,
+                                                                            n_head,
+                                                                            head_dim);
+                return cuda_ok(cudaGetLastError(), "attention indexed wmma32 launch");
+            }
+            const char *wmma_env = getenv("DS4_ROCM_ATTN_WMMA16_INDEXED");
+            const bool use_wmma = wmma_env && wmma_env[0] != '\0' && wmma_env[0] != '0';
+            if (use_wmma) {
+                dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
+                attention_mixed_heads16_wmma_kernel<1, 16><<<grid, 256>>>((float *)heads->ptr,
+                                                                        sinks,
+                                                                        (const float *)q->ptr,
+                                                                        (const float *)raw_kv->ptr,
+                                                                        (const float *)comp_kv->ptr,
+                                                                        topk_ptr,
+                                                                        n_tokens,
+                                                                        pos0,
+                                                                        n_raw,
+                                                                        raw_cap,
+                                                                        raw_start,
+                                                                        n_comp,
+                                                                        top_k,
+                                                                        window,
+                                                                        ratio,
+                                                                        n_head,
+                                                                        head_dim);
+                return cuda_ok(cudaGetLastError(), "attention indexed wmma16 launch");
+            }
             dim3 grid(n_tokens, (n_head + 31u) / 32u, 1);
             attention_indexed_mixed_heads8_online_kernel<8, 32><<<grid, 1024>>>((float *)heads->ptr,
                                                                                 sinks,
@@ -768,18 +840,41 @@ static int attention_prefill_mixed_launch(
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         !g_quality_mode &&
         ((window != 0u ? window : n_tokens) + n_comp <= 768u)) {
-        dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
-        attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
-                                                                   sinks,
-                                                                   (const float *)q->ptr,
-                                                                   (const float *)raw_kv->ptr,
-                                                                   n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-                                                                   n_tokens,
-                                                                   n_comp,
-                                                                   window,
-                                                                   ratio,
-                                                                   n_head,
-                                                                   head_dim);
+        const char *wmma_env = getenv("DS4_ROCM_ATTN_WMMA16");
+        const bool use_wmma = wmma_env && wmma_env[0] != '\0' && wmma_env[0] != '0';
+        if (use_wmma) {
+            dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
+            attention_mixed_heads16_wmma_kernel<0, 16><<<grid, 256>>>((float *)heads->ptr,
+                                                                      sinks,
+                                                                      (const float *)q->ptr,
+                                                                      (const float *)raw_kv->ptr,
+                                                                      n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                      NULL,
+                                                                      n_tokens,
+                                                                      0,
+                                                                      n_tokens,
+                                                                      n_tokens,
+                                                                      0,
+                                                                      n_comp,
+                                                                      0,
+                                                                      window,
+                                                                      ratio,
+                                                                      n_head,
+                                                                      head_dim);
+        } else {
+            dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
+            attention_static_mixed_heads8_online_kernel<<<grid, 256>>>((float *)heads->ptr,
+                                                                       sinks,
+                                                                       (const float *)q->ptr,
+                                                                       (const float *)raw_kv->ptr,
+                                                                       n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+                                                                       n_tokens,
+                                                                       n_comp,
+                                                                       window,
+                                                                       ratio,
+                                                                       n_head,
+                                                                       head_dim);
+        }
         return cuda_ok(cudaGetLastError(), "attention mixed window launch");
     }
     if (g_cublas_ready && n_tokens > 1 && head_dim == 512) {
