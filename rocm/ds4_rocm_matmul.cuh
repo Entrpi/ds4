@@ -1,3 +1,26 @@
+__global__ static void matmul_f16_tiny_batch_wave_kernel(
+        float *out,
+        const half *w,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim,
+        uint32_t n_tok) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tok = blockIdx.y;
+    const uint32_t lane = threadIdx.x;
+    if (row >= out_dim || tok >= n_tok) return;
+
+    const half *wr = w + (uint64_t)row * in_dim;
+    const float *xr = x + (uint64_t)tok * in_dim;
+    float sum = 0.0f;
+    for (uint32_t i = lane; i < in_dim; i += 32u) {
+        const float xv = __half2float(__float2half(xr[i]));
+        sum += __half2float(wr[i]) * xv;
+    }
+    sum = warp_sum_f32(sum);
+    if (lane == 0u) out[(uint64_t)tok * out_dim + row] = sum;
+}
+
 template <uint32_t BM, uint32_t BN>
 __global__ static void matmul_f16_smallm_wmma_kernel(
         float *out, const half *w, const half *x,
@@ -88,8 +111,12 @@ static void cuda_launch_q8_batch_sharedx_bt(
     const size_t shmem = (size_t)tile * BT * 32u * sizeof(float);
     if (tile == 2u) {
         matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<2u, BT><<<grid, rows_per_block * 32u, shmem>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
+    } else if (tile == 3u) {
+        matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<3u, BT><<<grid, rows_per_block * 32u, shmem>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
     } else if (tile == 4u) {
         matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<4u, BT><<<grid, rows_per_block * 32u, shmem>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
+    } else if (tile == 5u) {
+        matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<5u, BT><<<grid, rows_per_block * 32u, shmem>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
     } else if (tile == 8u) {
         matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kernel<8u, BT><<<grid, rows_per_block * 32u, shmem>>>(out, w, x, n_blocks, out_dim, n_tok, row_bytes);
     } else if (tile == 16u) {
@@ -502,8 +529,13 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
 #endif
         if ((in_dim & 31u) == 0u && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
             const uint32_t rows_per_block = 32u;
-            const uint32_t tile = 32u;
-            const uint32_t block_tile = 16u;
+            const bool exact_tiny = n_tok <= 5u;
+            const uint32_t tile = exact_tiny ? (uint32_t)n_tok :
+                                  n_tok <= 2u ? 2u :
+                                  n_tok <= 4u ? 4u :
+                                  n_tok <= 8u ? 8u :
+                                  n_tok <= 16u ? 16u : 32u;
+            const uint32_t block_tile = n_tok <= 8u ? 8u : 16u;
             cuda_launch_q8_batch_sharedx((float *)out->ptr,
                                          reinterpret_cast<const unsigned char *>(wptr),
                                          (const float *)x->ptr,
@@ -910,6 +942,13 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     if (!wptr) return 0;
     const __half *w = (const __half *)wptr;
     const int ordered_decode = n_tok == 1u;
+    if (n_tok > 1u && n_tok <= 8u && in_dim == 16384u && out_dim == 24u) {
+        const dim3 grid((uint32_t)out_dim, (uint32_t)n_tok, 1u);
+        matmul_f16_tiny_batch_wave_kernel<<<grid, 32u>>>(
+                (float *)out->ptr, w, (const float *)x->ptr,
+                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+        return cuda_ok(cudaGetLastError(), "f16 tiny-batch wave launch");
+    }
     if (g_cublas_ready && n_tok > 1) {
         const uint64_t xh_count = n_tok * in_dim;
         __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "f16 gemm activations");

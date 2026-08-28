@@ -222,13 +222,14 @@ static int routed_moe_q2_float_down_launch(
     }
 
     uint32_t h_counts[DS4_ROCM_MAX_N_EXPERT] = {0};
-    if (!cuda_ok(cudaMemcpy(h_counts, counts, n_total_expert * sizeof(uint32_t), cudaMemcpyDeviceToHost),
+    if (n_tokens >= 8u &&
+        !cuda_ok(cudaMemcpy(h_counts, counts, n_total_expert * sizeof(uint32_t), cudaMemcpyDeviceToHost),
                  "routed_moe iq2/q2 float-down counts copy")) {
         return 0;
     }
 
-    const uint32_t down_tile = 4u;
-    const uint32_t down_rpb = 16u;
+    const uint32_t down_tile = n_tokens <= 8u ? 2u : 4u;
+    const uint32_t down_rpb = 32u;
     const uint32_t down_threads = down_rpb * 32u;
     const size_t down_shmem = (size_t)down_tile * 256u * sizeof(float);
     const int use_f16_down = (out_dim & 1u) == 0u;
@@ -238,7 +239,7 @@ static int routed_moe_q2_float_down_launch(
     uint32_t hot_max = 0u;
     const uint32_t hot_threshold = 8u;
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-    const int use_wmma_hot = hot_experts_dev &&
+    const int use_wmma_hot = n_tokens >= hot_threshold && hot_experts_dev &&
         !g_quality_mode &&
         (expert_mid_dim % 16u) == 0u && (out_dim % 16u) == 0u;
 #else
@@ -256,39 +257,70 @@ static int routed_moe_q2_float_down_launch(
     }
 
     const uint32_t scalar_max = hot_count != 0u ? hot_threshold : 0u;
-    const dim3 down_grid((out_dim + down_rpb - 1u) / down_rpb, n_total_expert, 1u);
+    const bool compact_active = n_tokens <= 8u && hot_experts_dev != NULL;
+    uint32_t *active_count = compact_active ? hot_experts_dev : NULL;
+    uint32_t *active_experts = compact_active ? hot_experts_dev + 1u : NULL;
+    if (compact_active) {
+        moe_build_active_experts_kernel<<<1u, 1u>>>(
+                active_count, active_experts, counts, n_total_expert);
+        if (!cuda_ok(cudaGetLastError(),
+                     "routed_moe iq2/q2 active expert list launch")) {
+            return 0;
+        }
+    }
+    const dim3 down_grid((out_dim + down_rpb - 1u) / down_rpb,
+                         compact_active ? n_tokens * n_expert : n_total_expert,
+                         1u);
     if (use_f16_down) {
-        if (down_tile == 4u) {
+        if (down_tile == 2u) {
+            moe_down_q2K_expert_batch_sharedmid_kernel<2,false,true><<<down_grid, down_threads, down_shmem>>>(
+                    NULL, down_h, down_w, (const float *)mid->ptr, NULL,
+                    counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
+                    down_expert_bytes, down_row_bytes, n_expert, n_tokens,
+                    active_count, active_experts);
+        } else if (down_tile == 4u) {
             moe_down_q2K_expert_batch_sharedmid_kernel<4,false,true><<<down_grid, down_threads, down_shmem>>>(
                     NULL, down_h, down_w, (const float *)mid->ptr, NULL,
                     counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
-                    down_expert_bytes, down_row_bytes, n_expert);
+                    down_expert_bytes, down_row_bytes, n_expert, n_tokens,
+                    active_count, active_experts);
         } else if (down_tile == 8u) {
             moe_down_q2K_expert_batch_sharedmid_kernel<8,false,true><<<down_grid, down_threads, down_shmem>>>(
                     NULL, down_h, down_w, (const float *)mid->ptr, NULL,
                     counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
-                    down_expert_bytes, down_row_bytes, n_expert);
+                    down_expert_bytes, down_row_bytes, n_expert, n_tokens,
+                    active_count, active_experts);
         } else {
             moe_down_q2K_expert_batch_sharedmid_kernel<16,false,true><<<down_grid, down_threads, down_shmem>>>(
                     NULL, down_h, down_w, (const float *)mid->ptr, NULL,
                     counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
-                    down_expert_bytes, down_row_bytes, n_expert);
+                    down_expert_bytes, down_row_bytes, n_expert, n_tokens,
+                    active_count, active_experts);
         }
+    } else if (down_tile == 2u) {
+        moe_down_q2K_expert_batch_sharedmid_kernel<2><<<down_grid, down_threads, down_shmem>>>(
+                (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
+                counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
+                down_expert_bytes, down_row_bytes, n_expert, n_tokens,
+                active_count, active_experts);
     } else if (down_tile == 4u) {
         moe_down_q2K_expert_batch_sharedmid_kernel<4><<<down_grid, down_threads, down_shmem>>>(
                 (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
                 counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
-                down_expert_bytes, down_row_bytes, n_expert);
+                down_expert_bytes, down_row_bytes, n_expert, n_tokens,
+                active_count, active_experts);
     } else if (down_tile == 8u) {
         moe_down_q2K_expert_batch_sharedmid_kernel<8><<<down_grid, down_threads, down_shmem>>>(
                 (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
                 counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
-                down_expert_bytes, down_row_bytes, n_expert);
+                down_expert_bytes, down_row_bytes, n_expert, n_tokens,
+                active_count, active_experts);
     } else {
         moe_down_q2K_expert_batch_sharedmid_kernel<16><<<down_grid, down_threads, down_shmem>>>(
                 (float *)down->ptr, NULL, down_w, (const float *)mid->ptr, NULL,
                 counts, offsets, sorted_pairs, 1u, scalar_max, expert_mid_dim, out_dim,
-                down_expert_bytes, down_row_bytes, n_expert);
+                down_expert_bytes, down_row_bytes, n_expert, n_tokens,
+                active_count, active_experts);
     }
     if (!cuda_ok(cudaGetLastError(), "routed_moe iq2/q2 float-down scalar launch")) return 0;
     if (hot_count != 0u &&
@@ -757,7 +789,7 @@ static int routed_moe_launch(
             (!q4k_path || n_tokens >= 32u) &&
             !disable_resident_iq2_sorted;
         const uint32_t use_expert_tiles = use_sorted_pairs;
-        const uint32_t expert_tile_m = 8u;
+        const uint32_t expert_tile_m = n_tokens <= 8u ? 4u : 8u;
         const uint32_t write_gate_up = 0u;
         const uint32_t use_p2_sorted = 0u;
         const uint32_t use_atomic_down =
@@ -797,7 +829,7 @@ static int routed_moe_launch(
             !use_mxfp4_tile4 && n_tokens >= 8u &&
             getenv("DS4_ROCM_ENABLE_MXFP4_ROW64") != NULL;
         const uint32_t use_rocm_mmq_gateup =
-            ok && iq2_path && n_tokens > 1u && !g_quality_mode &&
+            ok && iq2_path && n_tokens >= 128u && !g_quality_mode &&
             !batch_stream_selected && !batch_stream_split_selected &&
             !split_selected && !compact_selected && gate_w && up_w &&
             (stream_full_layer || full_table_cached) &&
@@ -1119,7 +1151,8 @@ static int routed_moe_launch(
         const uint32_t iq2_down_hot_threshold = 8u;
         uint32_t h_iq2_gate_hot[DS4_ROCM_MAX_N_EXPERT] = {0};
         const uint32_t use_iq2_gate_wmma =
-            ok && !use_rocm_mmq_gateup && iq2_gate_path && n_tokens > 1u && n_expert == 6u && !write_gate_up &&
+            ok && !use_rocm_mmq_gateup && iq2_gate_path &&
+            n_tokens >= iq2_gate_hot_threshold && n_expert == 6u && !write_gate_up &&
             sorted_pairs && sorted_offsets && sorted_counts && tile_experts && iq2_gate_hot_dev && use_expert_tiles &&
             (expert_in_dim % 16u) == 0u && (expert_mid_dim % 16u) == 0u &&
             !g_quality_mode;

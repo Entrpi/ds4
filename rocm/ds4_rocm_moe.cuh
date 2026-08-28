@@ -1368,6 +1368,19 @@ __global__ static void moe_build_expert_tiles_kernel(
     }
 }
 
+__global__ static void moe_build_active_experts_kernel(
+        uint32_t *active_count,
+        uint32_t *active_experts,
+        const uint32_t *counts,
+        uint32_t n_total_expert) {
+    if (blockIdx.x != 0u || threadIdx.x != 0u) return;
+    uint32_t total = 0u;
+    for (uint32_t e = 0; e < n_total_expert; e++) {
+        if (counts[e] != 0u) active_experts[total++] = e;
+    }
+    *active_count = total;
+}
+
 __global__ static void moe_gate_up_mid_sorted_qwarp32_kernel(
         float *gate_out,
         float *up_out,
@@ -4674,14 +4687,18 @@ __global__ static void moe_down_q2K_expert_batch_sharedmid_kernel(
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         uint32_t n_expert,
-        uint32_t n_tokens = 0u) {
+        uint32_t n_tokens = 0u,
+        const uint32_t *active_count = NULL,
+        const uint32_t *active_experts = NULL) {
     extern __shared__ float shmid[];
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t wave = tid >> 5u;
     const uint32_t rows_per_block = blockDim.x >> 5u;
     const uint32_t row = blockIdx.x * rows_per_block + wave;
-    const uint32_t expert = blockIdx.y;
+    const uint32_t expert_index = blockIdx.y;
+    if (active_experts && expert_index >= *active_count) return;
+    const uint32_t expert = active_experts ? active_experts[expert_index] : expert_index;
     const bool row_valid = row < out_dim;
     const uint32_t count = counts[expert];
     if (count == 0u || count < min_count || (max_count != 0u && count >= max_count)) return;
