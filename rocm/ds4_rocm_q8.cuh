@@ -669,6 +669,70 @@ __global__ static void matmul_q8_0_f32_batch_sharedx_warp_rows_w32_toktile_kerne
     }
 }
 
+/* Exact q=2..5 verifier path.  These model dimensions are multiples of the
+ * eight-block K tile, so vectorize the cooperative X copy and fully unroll the
+ * inner tile without changing the F32 accumulation order. */
+template <uint32_t TOK_TILE>
+__launch_bounds__(1024u, 1)
+__global__ static void matmul_q8_0_f32_batch_sharedx_exact8_kernel(
+        float *out,
+        const unsigned char *w,
+        const float *x,
+        uint32_t n_blocks,
+        uint32_t out_dim,
+        uint64_t row_bytes) {
+    constexpr uint32_t BLOCKS_TILE = 8u;
+    constexpr uint32_t ROWS_PER_BLOCK = 32u;
+    constexpr uint32_t FLOAT4S_PER_TOKEN = BLOCKS_TILE * 8u;
+    extern __shared__ float shx[];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t row = blockIdx.x * ROWS_PER_BLOCK + wave;
+    const bool row_valid = row < out_dim;
+    const unsigned char *wr = w + (uint64_t)(row_valid ? row : 0u) * row_bytes;
+    const uint32_t in_dim = n_blocks << 5u;
+    float acc[TOK_TILE];
+#pragma unroll
+    for (uint32_t u = 0; u < TOK_TILE; ++u) acc[u] = 0.0f;
+
+    for (uint32_t b0 = 0; b0 < n_blocks; b0 += BLOCKS_TILE) {
+        for (uint32_t j4 = tid;
+             j4 < TOK_TILE * FLOAT4S_PER_TOKEN;
+             j4 += blockDim.x) {
+            const uint32_t u = j4 / FLOAT4S_PER_TOKEN;
+            const uint32_t r4 = j4 - u * FLOAT4S_PER_TOKEN;
+            const float4 xv = *(const float4 *)(x + (uint64_t)u * in_dim +
+                                                (uint64_t)b0 * 32u + r4 * 4u);
+            ((float4 *)shx)[j4] = xv;
+        }
+        __syncthreads();
+        if (row_valid) {
+#pragma unroll
+            for (uint32_t bb = 0; bb < BLOCKS_TILE; ++bb) {
+                const unsigned char *blk = wr + (uint64_t)(b0 + bb) * 34u;
+                const float d = q8_0_scale_broadcast_w32(blk);
+                const int8_t q = ((const int8_t *)(blk + 2u))[lane];
+                const float wv = d * (float)q;
+#pragma unroll
+                for (uint32_t u = 0; u < TOK_TILE; ++u) {
+                    acc[u] += wv * shx[(u * BLOCKS_TILE + bb) * 32u + lane];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (uint32_t u = 0; u < TOK_TILE; ++u) acc[u] = warp_sum_f32(acc[u]);
+    if (lane == 0u && row_valid) {
+#pragma unroll
+        for (uint32_t u = 0; u < TOK_TILE; ++u) {
+            out[(uint64_t)u * out_dim + row] = acc[u];
+        }
+    }
+}
+
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
 typedef _Float16 __attribute__((ext_vector_type(16))) ds4_q8_half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  ds4_q8_float8_t;

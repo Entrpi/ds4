@@ -495,6 +495,47 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     if (n_tok > 1) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        /* The 2048-row projection hits a 72-VGPR occupancy cliff in exact8;
+         * its retained 24-VGPR kernel is 2.4x faster on gfx1151. */
+        if (!g_quality_mode && (in_dim % 256u) == 0u &&
+            n_tok <= 5u && out_dim != 2048u && out_dim <= UINT32_MAX) {
+            constexpr uint32_t rows_per_block = 32u;
+            const dim3 grid(((uint32_t)out_dim + rows_per_block - 1u) /
+                                rows_per_block,
+                            1u, 1u);
+            const size_t shmem = (size_t)n_tok * 8u * 32u * sizeof(float);
+            if (n_tok == 2u) {
+                matmul_q8_0_f32_batch_sharedx_exact8_kernel<2u>
+                    <<<grid, rows_per_block * 32u, shmem>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr, (uint32_t)blocks,
+                        (uint32_t)out_dim, blocks * 34u);
+            } else if (n_tok == 3u) {
+                matmul_q8_0_f32_batch_sharedx_exact8_kernel<3u>
+                    <<<grid, rows_per_block * 32u, shmem>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr, (uint32_t)blocks,
+                        (uint32_t)out_dim, blocks * 34u);
+            } else if (n_tok == 4u) {
+                matmul_q8_0_f32_batch_sharedx_exact8_kernel<4u>
+                    <<<grid, rows_per_block * 32u, shmem>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr, (uint32_t)blocks,
+                        (uint32_t)out_dim, blocks * 34u);
+            } else {
+                matmul_q8_0_f32_batch_sharedx_exact8_kernel<5u>
+                    <<<grid, rows_per_block * 32u, shmem>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        (const float *)x->ptr, (uint32_t)blocks,
+                        (uint32_t)out_dim, blocks * 34u);
+            }
+            return cuda_ok(cudaGetLastError(),
+                           "matmul_q8_0 f32 tiny exact8 launch");
+        }
         if (!g_quality_mode && (in_dim % 32u) == 0u &&
             out_dim >= 1024u &&
             n_tok >= 256u &&
