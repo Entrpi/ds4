@@ -1180,160 +1180,6 @@ static __global__ void ds4_swiglu_weighted_f32(
     mid[i] = (g / (1.0f + expf(-g))) * u * router_weights[pair];
 }
 
-// gfx1151 IQ2 MoE compact launch experiment. The stock MMQ grid reserves the
-// same number of column tiles for every expert, although expert_bounds already
-// describes the exact ragged buckets. Build the live (expert, column-tile)
-// list entirely on-device and reuse the unchanged x64/y64 MMQ tile body.
-#if defined(GGML_USE_HIP)
-template <int tile_n>
-static __global__ void ds4_mmq_build_compact_tiles(
-        const int32_t * __restrict__ expert_bounds,
-        int * __restrict__ work,
-        int * __restrict__ n_items_out,
-        int n_experts) {
-    constexpr int nthreads = 256;
-    __shared__ int scan[nthreads];
-    __shared__ int running;
-    __shared__ int chunk_base;
-
-    const int tid = (int)threadIdx.x;
-    if (tid == 0) running = 0;
-    __syncthreads();
-
-    for (int base = 0; base < n_experts; base += nthreads) {
-        const int expert = base + tid;
-        int tiles = 0;
-        if (expert < n_experts) {
-            const int count = expert_bounds[expert + 1] - expert_bounds[expert];
-            tiles = count > 0 ? (count + tile_n - 1) / tile_n : 0;
-        }
-        scan[tid] = tiles;
-        __syncthreads();
-
-#pragma unroll
-        for (int offset = 1; offset < nthreads; offset <<= 1) {
-            const int add = tid >= offset ? scan[tid - offset] : 0;
-            __syncthreads();
-            scan[tid] += add;
-            __syncthreads();
-        }
-
-        if (tid == 0) chunk_base = running;
-        __syncthreads();
-
-        if (expert < n_experts && tiles > 0) {
-            const int exclusive = tid == 0 ? 0 : scan[tid - 1];
-            const int out_base = chunk_base + exclusive;
-            for (int jt = 0; jt < tiles; ++jt) {
-                work[out_base + jt] = (expert << 16) | jt;
-            }
-        }
-        __syncthreads();
-
-        if (tid == 0) running += scan[nthreads - 1];
-        __syncthreads();
-    }
-
-    if (tid == 0) *n_items_out = running;
-}
-
-template <bool need_check>
-#if defined(GGML_USE_HIP)
-__launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
-#endif
-static __global__ void ds4_mmq_iq2_compact_tiles(
-        const char * __restrict__ x,
-        const int * __restrict__ y,
-        const int32_t * __restrict__ ids_dst,
-        const int32_t * __restrict__ expert_bounds,
-        const int * __restrict__ work,
-        const int * __restrict__ n_items_ptr,
-        float * __restrict__ dst,
-        int nrows_x,
-        int stride_row_x,
-        int ncols_y,
-        int stride_col_dst,
-        int stride_channel_x,
-        const char * __restrict__ x_soa,
-        int64_t soa_blocks) {
-    constexpr int mmq_x = 64;
-    constexpr int mmq_y = get_mmq_y_device();
-    constexpr int nwarps = mmq_get_nwarps_device();
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
-    static_assert(mmq_y == 64, "compact IQ2 experiment requires the tuned y64 tile");
-
-    const int work_idx = (int)blockIdx.y;
-    if (work_idx >= *n_items_ptr) return;
-    const int packed = work[work_idx];
-    const int expert = packed >> 16;
-    const int jt = packed & 0xffff;
-    const int it = (int)blockIdx.x;
-
-    const int col_low = expert_bounds[expert];
-    const int col_high = expert_bounds[expert + 1];
-    const int col_diff = col_high - col_low;
-
-    extern __shared__ int ids_dst_shared[];
-#pragma unroll
-    for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
-        const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
-        if (j >= mmq_x) break;
-        const int j_col = jt*mmq_x + j;
-        ids_dst_shared[j] = j_col < col_diff ? ids_dst[col_low + j_col] : 0;
-    }
-    __syncthreads();
-
-    const int q8_words = sizeof(block_q8_1_mmq) / sizeof(int);
-    const int offset_y = (col_low + jt*mmq_x) * q8_words;
-    const int offset_dst = it*mmq_y;
-    const int offset_x = expert*stride_channel_x + it*mmq_y*stride_row_x;
-    const int tile_x_max_i = nrows_x - it*mmq_y - 1;
-    const int tile_y_max_j = col_diff - jt*mmq_x - 1;
-
-    mul_mat_q_process_tile<GGML_TYPE_IQ2_XXS, mmq_x, need_check, false>(
-        x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, nullptr,
-        stride_row_x, ncols_y, stride_col_dst, tile_x_max_i, tile_y_max_j,
-        0, stride_row_x, x_soa, soa_blocks);
-}
-
-static int ds4_mmq_launch_iq2_compact(
-        ggml_backend_cuda_context &ctx,
-        const mmq_args &args,
-        const int *work,
-        const int *n_items,
-        int capacity,
-        cudaStream_t stream) {
-    const int dev = ggml_cuda_get_device();
-    const int cc = ggml_cuda_info().devices[dev].cc;
-    const int warp_size = ggml_cuda_info().devices[dev].warp_size;
-    const int nwarps = mmq_get_nwarps_host(cc, warp_size);
-    const int mmq_y = get_mmq_y_host(cc);
-    if (mmq_y != 64 || args.ncols_x / ggml_cuda_type_traits<GGML_TYPE_IQ2_XXS>::qk > INT_MAX) {
-        return -1;
-    }
-
-    const int nbytes_shared = mmq_get_nbytes_shared<GGML_TYPE_IQ2_XXS>(
-        64, mmq_y, cc, warp_size, nwarps);
-    CUDA_SET_SHARED_MEMORY_LIMIT((ds4_mmq_iq2_compact_tiles<false>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((ds4_mmq_iq2_compact_tiles<true>), nbytes_shared);
-    const dim3 block(warp_size, nwarps, 1);
-    const dim3 grid((args.nrows_x + mmq_y - 1) / mmq_y, capacity, 1);
-    if (args.nrows_x % mmq_y == 0) {
-        ds4_mmq_iq2_compact_tiles<false><<<grid, block, nbytes_shared, stream>>>(
-            args.x, args.y, args.ids_dst, args.expert_bounds, work, n_items,
-            args.dst, args.nrows_x, args.stride_row_x, args.ncols_y,
-            args.nrows_dst, args.stride_channel_x, args.x_soa, args.soa_blocks);
-    } else {
-        ds4_mmq_iq2_compact_tiles<true><<<grid, block, nbytes_shared, stream>>>(
-            args.x, args.y, args.ids_dst, args.expert_bounds, work, n_items,
-            args.dst, args.nrows_x, args.stride_row_x, args.ncols_y,
-            args.nrows_dst, args.stride_channel_x, args.x_soa, args.soa_blocks);
-    }
-    (void)ctx;
-    return cudaGetLastError() == cudaSuccess ? 0 : -2;
-}
-#endif
-
 // Paired MoE: one helper + one quantize covers both weights.  See the
 // header comment on ds4_mmq_iq2_xxs_moe_pair for motivation.  Internal
 // structure mirrors ds4_mmq_moe_impl above; the only differences are the
@@ -1774,35 +1620,6 @@ int ds4_mmq_moe_pair_impl(
     }
 
     if (!gate_up_done) {
-    const bool compact_iq2 =
-#if defined(GGML_USE_HIP)
-        type == GGML_TYPE_IQ2_XXS &&
-        ds4_mmq_gfx1151_flag("DS4_ROCM_MMQ_COMPACT_TILES", cc) &&
-        n_experts < (1 << 16);
-#else
-        false;
-#endif
-    const int compact_capacity = compact_iq2
-        ? (int)((ne_get_rows + 63) / 64 + n_experts)
-        : 0;
-    ggml_cuda_pool_alloc<int> compact_work_alloc;
-    int *compact_work = nullptr;
-    int *compact_n_items = nullptr;
-    if (compact_iq2) {
-#if defined(GGML_USE_HIP)
-        compact_work = compact_work_alloc.alloc(ctx->pool(), compact_capacity + 1);
-        compact_n_items = compact_work + compact_capacity;
-        ds4_mmq_build_compact_tiles<64><<<1, 256, 0, stream>>>(
-            expert_bounds, compact_work, compact_n_items, n_experts);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "%s: compact tile builder failed: %s\n",
-                    tag, cudaGetErrorString(err));
-            return -4;
-        }
-#endif
-    }
-
     mmq_args args = {
         /*x=*/(const char *)W_a,
         /*type_x=*/type,
@@ -1837,20 +1654,7 @@ int ds4_mmq_moe_pair_impl(
                 "ds4/prefill/moe/iq2_gate",
                 ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                 nvtx_prefill);
-        int compact_rc = 0;
-#if defined(GGML_USE_HIP)
-        if (compact_iq2) {
-            compact_rc = ds4_mmq_launch_iq2_compact(
-                *ctx, args, compact_work, compact_n_items,
-                compact_capacity, stream);
-        }
-#endif
-        if (compact_iq2 && compact_rc != 0) {
-            fprintf(stderr, "%s: compact IQ2 gate launch failed: %d\n",
-                    tag, compact_rc);
-            return -4;
-        }
-        if (!compact_iq2) mul_mat_q_case<type>(*ctx, args, stream);
+        mul_mat_q_case<type>(*ctx, args, stream);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
             fprintf(stderr, "%s: mul_mat_q_case (pair a) launch failed: %s\n", tag, cudaGetErrorString(err));
@@ -1867,20 +1671,7 @@ int ds4_mmq_moe_pair_impl(
                 "ds4/prefill/moe/iq2_up",
                 ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                 nvtx_prefill);
-        int compact_rc = 0;
-#if defined(GGML_USE_HIP)
-        if (compact_iq2) {
-            compact_rc = ds4_mmq_launch_iq2_compact(
-                *ctx, args, compact_work, compact_n_items,
-                compact_capacity, stream);
-        }
-#endif
-        if (compact_iq2 && compact_rc != 0) {
-            fprintf(stderr, "%s: compact IQ2 up launch failed: %d\n",
-                    tag, compact_rc);
-            return -5;
-        }
-        if (!compact_iq2) mul_mat_q_case<type>(*ctx, args, stream);
+        mul_mat_q_case<type>(*ctx, args, stream);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
             fprintf(stderr, "%s: mul_mat_q_case (pair b) launch failed: %s\n", tag, cudaGetErrorString(err));
