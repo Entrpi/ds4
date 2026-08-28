@@ -1194,14 +1194,32 @@ static int routed_moe_launch(
         }
         int mmq_gateup_done = 0;
         if (ok && use_rocm_mmq_gateup) {
-            const int mmq_rc = ds4_mmq_init(0) == 0 ?
-                ds4_mmq_iq2_xxs_moe_pair(
-                    gate_w, up_w, (const float *)x->ptr,
-                    (const int32_t *)selected_exec->ptr,
-                    (float *)gate->ptr, (float *)up->ptr,
+            int mmq_rc = ds4_mmq_init(0) == 0 ? 0 : -1;
+            /* The gfx1151 MMQ pair is stable through 2048 token rows. Tile
+             * larger prefills instead of letting its flattened assignment
+             * grid corrupt the tail of a 4096-row batch. */
+            const uint32_t mmq_token_cap = 2048u;
+            for (uint32_t token0 = 0; mmq_rc == 0 && token0 < n_tokens; ) {
+                const uint32_t tile_tokens =
+                    n_tokens - token0 < mmq_token_cap ?
+                    n_tokens - token0 : mmq_token_cap;
+                const uint64_t x_offset =
+                    (uint64_t)token0 * expert_in_dim;
+                const uint64_t pair_offset =
+                    (uint64_t)token0 * n_expert;
+                const uint64_t out_offset =
+                    pair_offset * expert_mid_dim;
+                mmq_rc = ds4_mmq_iq2_xxs_moe_pair(
+                    gate_w, up_w,
+                    (const float *)x->ptr + x_offset,
+                    (const int32_t *)selected_exec->ptr + pair_offset,
+                    (float *)gate->ptr + out_offset,
+                    (float *)up->ptr + out_offset,
                     (int)expert_mid_dim, (int)expert_in_dim,
-                    (int)n_tokens, (int)n_total_expert, (int)n_expert,
-                    (cudaStream_t)0) : -1;
+                    (int)tile_tokens, (int)n_total_expert, (int)n_expert,
+                    (cudaStream_t)0);
+                token0 += tile_tokens;
+            }
             if (mmq_rc == 0) {
                 const uint64_t mid_count = pair_count64 * expert_mid_dim;
                 moe_swiglu_weighted_f32_kernel<<<
