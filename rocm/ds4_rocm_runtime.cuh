@@ -20,6 +20,9 @@ static int g_cublas_ready;
 #ifdef __HIP_PLATFORM_AMD__
 static rocblas_handle g_rocblas;
 static int g_rocblas_ready;
+/* rocBLAS solution indices are library-version specific. Disable the tuned
+ * DSpark F16 path for the process if the active rocBLAS rejects an index. */
+static int g_rocblas_f16_solutions_disabled;
 #include "ds4_rocm_hipblaslt.cuh"
 #endif
 static int g_quality_mode;

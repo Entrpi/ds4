@@ -1043,6 +1043,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         if ((n_tok == 4u ||
              (g_dspark_verify_mode && n_tok <= 6u)) &&
             g_rocblas_ready &&
+            !__atomic_load_n(&g_rocblas_f16_solutions_disabled, __ATOMIC_RELAXED) &&
             ds4_rocm_gfx1151_flag("DS4_ROCM_F16_Q4_SOLUTIONS")) {
             int32_t solution = 0;
             if (in_dim == 4096u &&
@@ -1079,13 +1080,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
                         solution,
                         0u);
                 if (rst == rocblas_status_success) return 1;
-                fprintf(stderr,
-                        "ds4: rocBLAS q4 F16 solution %d failed for %llux%llux%llu: status %d\n",
-                        solution,
-                        (unsigned long long)out_dim,
-                        (unsigned long long)n_tok,
-                        (unsigned long long)in_dim,
-                        (int)rst);
+                __atomic_store_n(&g_rocblas_f16_solutions_disabled, 1, __ATOMIC_RELAXED);
             }
         }
 #endif
