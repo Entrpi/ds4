@@ -1043,15 +1043,22 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         if ((n_tok == 4u ||
              (g_dspark_verify_mode && n_tok <= 6u)) &&
             g_rocblas_ready &&
+            g_rocblas_f16_solution_set != DS4_ROCBLAS_F16_SOLUTIONS_NONE &&
             !__atomic_load_n(&g_rocblas_f16_solutions_disabled, __ATOMIC_RELAXED) &&
             ds4_rocm_gfx1151_flag("DS4_ROCM_F16_Q4_SOLUTIONS")) {
             int32_t solution = 0;
             if (in_dim == 4096u &&
                 (out_dim == 64u || out_dim == 256u ||
                  out_dim == 512u || out_dim == 1024u)) {
-                solution = -217;
+                if (g_rocblas_f16_solution_set ==
+                    DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402) solution = -217;
+                if (g_rocblas_f16_solution_set ==
+                    DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E) solution = -50;
             } else if (in_dim == 1024u && out_dim == 8192u) {
-                solution = -216;
+                if (g_rocblas_f16_solution_set ==
+                    DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402) solution = -216;
+                if (g_rocblas_f16_solution_set ==
+                    DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E) solution = -49;
             }
             if (solution != 0) {
                 const rocblas_status rst = rocblas_gemm_ex(
