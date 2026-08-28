@@ -495,6 +495,17 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     if (n_tok > 1) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        const char *tiny_q8_mmvq = getenv("DS4_ROCM_DSPARK_Q8_MMVQ");
+        if (!g_quality_mode && n_tok <= 4u &&
+            in_dim <= INT_MAX && out_dim <= INT_MAX &&
+            tiny_q8_mmvq && tiny_q8_mmvq[0] != '0' &&
+            ds4_mmq_init(0) == 0 &&
+            ds4_mmq_q8_0_dense_vec(
+                wptr, (const float *)x->ptr, (float *)out->ptr,
+                (int)out_dim, (int)n_tok, (int)in_dim,
+                (cudaStream_t)0) == 0) {
+            return 1;
+        }
         /* The 2048-row projection hits a 72-VGPR occupancy cliff in exact8;
          * its retained 24-VGPR kernel is 2.4x faster on gfx1151. */
         if (!g_quality_mode && (in_dim % 256u) == 0u &&
@@ -1028,6 +1039,54 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         }
         const float alpha = 1.0f;
         const float beta = 0.0f;
+#ifdef __HIP_PLATFORM_AMD__
+        if (n_tok == 4u && g_rocblas_ready &&
+            ds4_rocm_gfx1151_flag("DS4_ROCM_F16_Q4_SOLUTIONS")) {
+            int32_t solution = 0;
+            if (in_dim == 4096u &&
+                (out_dim == 64u || out_dim == 256u ||
+                 out_dim == 512u || out_dim == 1024u)) {
+                solution = -217;
+            } else if (in_dim == 1024u && out_dim == 8192u) {
+                solution = -216;
+            }
+            if (solution != 0) {
+                const rocblas_status rst = rocblas_gemm_ex(
+                        g_rocblas,
+                        rocblas_operation_transpose,
+                        rocblas_operation_none,
+                        (rocblas_int)out_dim,
+                        (rocblas_int)n_tok,
+                        (rocblas_int)in_dim,
+                        &alpha,
+                        w,
+                        rocblas_datatype_f16_r,
+                        (rocblas_int)in_dim,
+                        xh,
+                        rocblas_datatype_f16_r,
+                        (rocblas_int)in_dim,
+                        &beta,
+                        out->ptr,
+                        rocblas_datatype_f32_r,
+                        (rocblas_int)out_dim,
+                        out->ptr,
+                        rocblas_datatype_f32_r,
+                        (rocblas_int)out_dim,
+                        rocblas_datatype_f32_r,
+                        rocblas_gemm_algo_solution_index,
+                        solution,
+                        0u);
+                if (rst == rocblas_status_success) return 1;
+                fprintf(stderr,
+                        "ds4: rocBLAS q4 F16 solution %d failed for %llux%llux%llu: status %d\n",
+                        solution,
+                        (unsigned long long)out_dim,
+                        (unsigned long long)n_tok,
+                        (unsigned long long)in_dim,
+                        (int)rst);
+            }
+        }
+#endif
         cublasStatus_t st = cublasGemmEx(g_cublas,
                                          CUBLAS_OP_T,
                                          CUBLAS_OP_N,

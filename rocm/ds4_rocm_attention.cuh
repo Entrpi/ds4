@@ -496,6 +496,22 @@ __global__ static void attention_pack_group_heads_f16_kernel(
     dst[gid] = __float2half(heads[((uint64_t)t * n_groups + g) * group_dim + d]);
 }
 
+__global__ static void attention_pack_group_heads_f32_kernel(
+        float *dst,
+        const float *heads,
+        uint32_t n_tokens,
+        uint32_t n_groups,
+        uint32_t group_dim) {
+    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n = (uint64_t)n_groups * n_tokens * group_dim;
+    if (gid >= n) return;
+    uint32_t d = gid % group_dim;
+    uint64_t q = gid / group_dim;
+    uint32_t t = q % n_tokens;
+    uint32_t g = q / n_tokens;
+    dst[gid] = heads[((uint64_t)t * n_groups + g) * group_dim + d];
+}
+
 __global__ static void attention_unpack_group_low_kernel(
         float *low,
         const float *tmp,

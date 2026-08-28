@@ -3271,8 +3271,8 @@ static __global__ void ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel(
     const int kqs = vdr * (lane % lanes_per_k);
 
 #pragma unroll
-    for (uint32_t rr = 0; rr < 4u; ++rr) {
-        const uint32_t row = blockIdx.x * 64u + row_lane + rr * 16u;
+    for (uint32_t rr = 0; rr < 8u; ++rr) {
+        const uint32_t row = blockIdx.x * 64u + row_lane + rr * 8u;
         if (row >= nrows_x) continue;
         float total = 0.0f;
 #pragma unroll
@@ -3516,7 +3516,7 @@ int ds4_mmq_moe_down_sum6_vec_impl(
     const uint32_t stride_channel_x = (uint32_t)((int64_t)M * stride_row_x);
 
     const dim3 block_nums((M + 63) / 64, n_tokens);
-    const dim3 block_dims(256);
+    const dim3 block_dims(128);
 
     ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel<type><<<block_nums, block_dims, 0, stream>>>(
         W, (const block_q8_1 *)src1_q8_1_ptr, ids, out_f32,

@@ -18,6 +18,8 @@ static uint64_t g_selected_readback_event_value;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 #ifdef __HIP_PLATFORM_AMD__
+static rocblas_handle g_rocblas;
+static int g_rocblas_ready;
 #include "ds4_rocm_hipblaslt.cuh"
 #endif
 static int g_quality_mode;
@@ -5840,6 +5842,14 @@ extern "C" int ds4_gpu_init(void) {
         g_cublas_ready = 1;
     }
 #ifdef __HIP_PLATFORM_AMD__
+    if (!g_rocblas_ready) {
+        const rocblas_status st = rocblas_create_handle(&g_rocblas);
+        if (st != rocblas_status_success) {
+            fprintf(stderr, "ds4: rocBLAS create handle failed: status %d\n", (int)st);
+            return 0;
+        }
+        g_rocblas_ready = 1;
+    }
     if (!g_hipblaslt_ready) {
         if (hipblaslt_ok(hipblasLtCreate(&g_hipblaslt), "create handle")) {
             g_hipblaslt_ready = 1;
@@ -5862,6 +5872,11 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cublas = NULL;
     }
 #ifdef __HIP_PLATFORM_AMD__
+    if (g_rocblas_ready) {
+        (void)rocblas_destroy_handle(g_rocblas);
+        g_rocblas_ready = 0;
+        g_rocblas = NULL;
+    }
     if (g_hipblaslt_ready) {
         (void)hipblasLtDestroy(g_hipblaslt);
         g_hipblaslt_ready = 0;

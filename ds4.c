@@ -32879,7 +32879,8 @@ static bool metal_graph_eval_dspark_base_logits(
         const ds4_model          *base_model,
         const ds4_weights        *base_weights,
         const ds4_model          *dspark_model,
-        const ds4_dspark_weights *dw) {
+        const ds4_dspark_weights *dw,
+        uint32_t                  draft_cap) {
     if (!g || !base_model || !base_weights || !dspark_model || !dw ||
         !dspark_final_head_ready(g, base_weights, dw)) {
         return false;
@@ -32887,7 +32888,9 @@ static bool metal_graph_eval_dspark_base_logits(
 
     const ds4_dspark_stage_weights *final =
         &dw->stage[dw->n_stages - 1u];
-    const uint32_t draft = dw->block_size;
+    const uint32_t draft =
+        draft_cap != 0 && draft_cap < dw->block_size ?
+            draft_cap : dw->block_size;
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t vocab_dim = base_weights->output->dim[1];
     ds4_gpu_tensor *stage_output_hc = metal_graph_dspark_final_output_hc(g);
@@ -33360,11 +33363,77 @@ static bool dspark_disable_reuse_confidence0_markov(void) {
     return cache != 0;
 }
 
+#ifndef __APPLE__
+static bool dspark_apply_markov_greedy_gpu_runtime(
+        ds4_gpu_graph            *g,
+        const ds4_model          *dspark_model,
+        const ds4_dspark_weights *dw,
+        int                       first_prev_token,
+        uint32_t                  draft_cap,
+        int32_t                   proposal[DS4_DSPARK_MAX_BLOCK_SIZE],
+        uint32_t                 *proposal_len) {
+    if (proposal_len) *proposal_len = 0;
+    if (!g || !g->spec_logits || !g->dspark_draft_tokens ||
+        !dspark_model || !dw || !proposal ||
+        first_prev_token < 0 ||
+        (uint32_t)first_prev_token >= DS4_N_VOCAB ||
+        !dspark_markov_probe_ready(dw)) {
+        return false;
+    }
+    const ds4_dspark_stage_weights *final =
+        &dw->stage[dw->n_stages - 1u];
+    if (dw->markov_rank == 0 || (dw->markov_rank & 31u) != 0 ||
+        final->markov_w1->type != DS4_TENSOR_Q8_0 ||
+        final->markov_w2->type != DS4_TENSOR_Q8_0) {
+        return false;
+    }
+
+    const uint64_t logits_bytes =
+        (uint64_t)DS4_N_VOCAB * sizeof(float);
+    int32_t prev_token = first_prev_token;
+    const uint32_t draft_count =
+        draft_cap != 0 && draft_cap < dw->block_size ?
+            draft_cap : dw->block_size;
+    for (uint32_t draft = 0; draft < draft_count; draft++) {
+        ds4_gpu_tensor *row_view =
+            ds4_gpu_tensor_view(g->spec_logits,
+                                (uint64_t)draft * logits_bytes,
+                                logits_bytes);
+        uint64_t gpu_key = 0;
+        const bool ok = row_view &&
+            ds4_gpu_dspark_markov_argmax_tensor(
+                g->dspark_draft_tokens,
+                row_view,
+                dspark_model->map,
+                dspark_model->size,
+                final->markov_w1->abs_offset,
+                final->markov_w2->abs_offset,
+                (uint32_t)prev_token,
+                DS4_N_VOCAB,
+                dw->markov_rank) != 0 &&
+            ds4_gpu_tensor_read(g->dspark_draft_tokens,
+                                0,
+                                &gpu_key,
+                                sizeof(gpu_key)) != 0;
+        ds4_gpu_tensor_free(row_view);
+        const uint32_t gpu_token = ~(uint32_t)(gpu_key & 0xffffffffu);
+        if (!ok || gpu_key == 0 || gpu_token >= DS4_N_VOCAB) {
+            return false;
+        }
+        proposal[draft] = (int32_t)gpu_token;
+        prev_token = (int32_t)gpu_token;
+    }
+    if (proposal_len) *proposal_len = draft_count;
+    return true;
+}
+#endif
+
 static bool dspark_apply_markov_greedy_probe(
         float                  *logits,
         const ds4_model        *dspark_model,
         const ds4_dspark_weights *dw,
         int                     first_prev_token,
+        uint32_t                draft_cap,
         float                  *markov_state,
         float                  *markov_bias,
         int32_t                 proposal[DS4_DSPARK_MAX_BLOCK_SIZE],
@@ -33386,7 +33455,10 @@ static bool dspark_apply_markov_greedy_probe(
         &dw->stage[dw->n_stages - 1u];
     const bool no_bias = dspark_markov_bias_disabled();
     int32_t prev_token = first_prev_token;
-    for (uint32_t draft = 0; draft < dw->block_size; draft++) {
+    const uint32_t draft_count =
+        draft_cap != 0 && draft_cap < dw->block_size ?
+            draft_cap : dw->block_size;
+    for (uint32_t draft = 0; draft < draft_count; draft++) {
         float *row = logits + (uint64_t)draft * DS4_N_VOCAB;
         if (!no_bias) {
             if (!dspark_dense_row_to_f32(markov_state,
@@ -33405,7 +33477,7 @@ static bool dspark_apply_markov_greedy_probe(
         prev_token = (int32_t)token;
     }
 
-    if (proposal_len) *proposal_len = dw->block_size;
+    if (proposal_len) *proposal_len = draft_count;
     return true;
 }
 
@@ -61236,6 +61308,11 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
         const bool batch_capture_ok =
             ds4_session_dspark_capture_batch_current(s);
         const ds4_dspark_weights *dw = &s->engine->dspark_weights;
+        const uint32_t verify_cap =
+            ds4_dspark_env_u32("DS4_DSPARK_VERIFY_CAP", 0);
+        const uint32_t proposal_cap =
+            verify_cap != 0 && verify_cap < dw->block_size ?
+                verify_cap : dw->block_size;
         const bool stage0_ready = dspark_stage0_weights_ready(&s->graph, dw);
         const bool runtime_fused_stage0_setup =
             enabled && !fake_argmax_enabled && !probe_log;
@@ -61427,7 +61504,8 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                                                     &s->engine->model,
                                                     &s->engine->weights,
                                                     &s->engine->mtp_model,
-                                                    dw);
+                                                    dw,
+                                                    proposal_cap);
             DS4_DSPARK_PROP_ADD(propose_logits_ms, logits_t0);
         }
         const bool markov_ready =
@@ -61456,9 +61534,27 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
             DS4_DSPARK_PROP_ADD(propose_markov_ms, markov_t0);
             confidence_ok = markov_ok;
         } else if (markov_ready) {
+#ifndef __APPLE__
+            const char *gpu_markov =
+                getenv("DS4_ROCM_DSPARK_GREEDY_GPU_MARKOV");
+            if (gpu_markov && gpu_markov[0] != '0' &&
+                !dspark_markov_bias_disabled() &&
+                getenv("DS4_DSPARK_NO_GPU_MARKOV") == NULL) {
+                const double markov_t0 = DS4_DSPARK_PROP_T0();
+                markov_ok = dspark_apply_markov_greedy_gpu_runtime(
+                    &s->graph,
+                    &s->engine->mtp_model,
+                    dw,
+                    token,
+                    proposal_cap,
+                    markov_proposal,
+                    &markov_proposal_len);
+                DS4_DSPARK_PROP_ADD(propose_markov_ms, markov_t0);
+            }
+#endif
             const uint64_t logits_count =
-                (uint64_t)dw->block_size * (uint64_t)DS4_N_VOCAB;
-            if (logits_count != 0 &&
+                (uint64_t)proposal_cap * (uint64_t)DS4_N_VOCAB;
+            if (!markov_ok && logits_count != 0 &&
                 logits_count <= (uint64_t)SIZE_MAX / sizeof(float)) {
                 const double markov_t0 = DS4_DSPARK_PROP_T0();
                 const uint64_t logits_bytes = logits_count * sizeof(float);
@@ -61477,6 +61573,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                         &s->engine->mtp_model,
                         dw,
                         token,
+                        proposal_cap,
                         markov_state,
                         markov_bias,
                         markov_proposal,
@@ -61552,6 +61649,9 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
                 proposal_len = confidence_ok ? confidence_prefix_len : 0;
             }
             s->dspark_draft_len = proposal_len;
+            if (verify_cap != 0 && s->dspark_draft_len > verify_cap) {
+                s->dspark_draft_len = verify_cap;
+            }
             if (s->dspark_draft_len > DS4_DSPARK_MAX_BLOCK_SIZE) {
                 s->dspark_draft_len = DS4_DSPARK_MAX_BLOCK_SIZE;
             }

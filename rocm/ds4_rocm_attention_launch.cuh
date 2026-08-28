@@ -1454,6 +1454,65 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 rank);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a unpack launch")) return 0;
     } else {
+        const char *grouped_mmvq =
+            getenv("DS4_ROCM_DSPARK_ATTN_A_MMVQ");
+        if (!g_quality_mode && n_tokens == 4u &&
+            group_dim == 4096u && rank == 1024u && n_groups == 8u &&
+            grouped_mmvq && grouped_mmvq[0] != '0' &&
+            ds4_mmq_init(0) == 0) {
+            const uint64_t heads_count =
+                (uint64_t)n_groups * n_tokens * group_dim;
+            const uint64_t low_count =
+                (uint64_t)n_groups * n_tokens * rank;
+            const uint64_t heads_bytes = heads_count * sizeof(float);
+            const uint64_t low_offset = (heads_bytes + 255u) & ~255ull;
+            void *tmp = cuda_tmp_alloc(
+                low_offset + low_count * sizeof(float),
+                "attention output a q4 grouped MMVQ");
+            if (!tmp) return 0;
+            float *heads_packed = (float *)tmp;
+            float *low_packed = (float *)((char *)tmp + low_offset);
+            attention_pack_group_heads_f32_kernel
+                <<<(heads_count + 255u) / 256u, 256u>>>(
+                    heads_packed,
+                    (const float *)heads->ptr,
+                    n_tokens,
+                    n_groups,
+                    (uint32_t)group_dim);
+            if (!cuda_ok(cudaGetLastError(),
+                         "attention_output_q8_a q4 MMVQ pack")) {
+                return 0;
+            }
+            for (uint32_t group = 0; group < n_groups; ++group) {
+                const unsigned char *group_w =
+                    out_a + (uint64_t)group * rank * blocks_a * 34u;
+                const float *group_x =
+                    heads_packed + (uint64_t)group * n_tokens * group_dim;
+                float *group_out =
+                    low_packed + (uint64_t)group * n_tokens * rank;
+                if (ds4_mmq_q8_0_dense_vec(
+                        group_w,
+                        group_x,
+                        group_out,
+                        (int)rank,
+                        (int)n_tokens,
+                        (int)group_dim,
+                        (cudaStream_t)0) != 0) {
+                    return 0;
+                }
+            }
+            attention_unpack_group_low_kernel
+                <<<(low_count + 255u) / 256u, 256u>>>(
+                    (float *)low->ptr,
+                    low_packed,
+                    n_tokens,
+                    n_groups,
+                    (uint32_t)rank);
+            if (!cuda_ok(cudaGetLastError(),
+                         "attention_output_q8_a q4 MMVQ unpack")) {
+                return 0;
+            }
+        } else {
         const uint64_t x_rows = (uint64_t)n_tokens * n_groups;
         const uint64_t xq_bytes = x_rows * blocks_a * 32u;
         const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
@@ -1482,6 +1541,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                                           blocks_a,
                                                           use_dp4a);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a preq launch")) return 0;
+        }
     }
 
     if (attn_output_cublas && !g_quality_mode) {

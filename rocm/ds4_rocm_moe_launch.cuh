@@ -1765,11 +1765,30 @@ static int routed_moe_launch(
             } else if (split_ptr_down_done) {
                 /* The split pointer-table path writes the final token row. */
             } else if (use_iq2_q2_float_down) {
-                ok = routed_moe_q2_float_down_launch(
-                        out, down, mid, iq2_hot_mid_h, use_iq2_hot_f16_mid, down_w,
-                        sorted_counts, sorted_offsets, sorted_pairs, tile_experts,
-                        n_tokens, n_total_expert, n_expert, expert_mid_dim, out_dim,
-                        down_expert_bytes, down_row_bytes);
+                const char *mmvq_down =
+                    getenv("DS4_ROCM_DSPARK_Q2_DOWN_MMVQ");
+                if (!g_quality_mode && n_tokens <= 4u &&
+                    mmvq_down && mmvq_down[0] != '0' &&
+                    ds4_mmq_init(0) == 0 &&
+                    ds4_mmq_q2_K_moe_down_sum6_vec(
+                        down_w,
+                        (const float *)mid->ptr,
+                        (const int32_t *)selected_exec->ptr,
+                        (float *)out->ptr,
+                        (int)out_dim,
+                        (int)expert_mid_dim,
+                        (int)n_tokens,
+                        (int)n_total_expert,
+                        (int)n_expert,
+                        (cudaStream_t)0) == 0) {
+                    ok = 1;
+                } else {
+                    ok = routed_moe_q2_float_down_launch(
+                            out, down, mid, iq2_hot_mid_h, use_iq2_hot_f16_mid, down_w,
+                            sorted_counts, sorted_offsets, sorted_pairs, tile_experts,
+                            n_tokens, n_total_expert, n_expert, expert_mid_dim, out_dim,
+                            down_expert_bytes, down_row_bytes);
+                }
             } else {
             dim3 dgrid((out_dim + 31u) / 32u, pair_count, 1);
             uint32_t *down_tile_total = tile_total;
