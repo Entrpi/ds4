@@ -3,7 +3,7 @@ set -e
 
 GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
-GLM_53_FLASH_ANTIREZ_REPO="antirez/glm-5.3-flash-gguf"
+GLM53_REPO="antirez/glm-5.3-flash-gguf"
 REPO="antirez/deepseek-v4-gguf"
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
@@ -19,9 +19,9 @@ GLM_UNSLOTH_Q4_FIRST_FILE="$GLM_UNSLOTH_Q4_LOCAL_BASE-00001-of-00011.gguf"
 GLM_ANTIREZ_IQ2XXS_FILE="GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf"
 GLM_ANTIREZ_Q2_FILE="GLM-5.2-UD-Q2_K_RoutedQ2K.gguf"
 GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
-GLM_53_FLASH_ANTIREZ_Q2_FILE="GLM-5.3-Flash-Q2.gguf"
-GLM_53_FLASH_ANTIREZ_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
-GLM_53_FLASH_ANTIREZ_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"
+GLM53_Q2_FILE="GLM-5.3-Flash-Q2.gguf"
+GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"
+GLM53_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -49,9 +49,9 @@ Usage:
   ./download_model.sh glm-antirez-iq2xxs [--token TOKEN]
   ./download_model.sh glm-antirez-q2 [--token TOKEN]
   ./download_model.sh glm-antirez-q4 [--token TOKEN]
-  ./download_model.sh glm-53-flash-antirez-fp8 [--token TOKEN]
-  ./download_model.sh glm-53-flash-antirez-q2 [--token TOKEN]
-  ./download_model.sh glm-53-flash-antirez-q4 [--token TOKEN]
+  ./download_model.sh glm53-q2 [--token TOKEN]
+  ./download_model.sh glm53-q4 [--token TOKEN]
+  ./download_model.sh glm53-fp8 [--token TOKEN]
 
 Targets:
 
@@ -76,7 +76,7 @@ Targets:
 
   ds4f-dspark
        Optional DSpark speculative decoding support GGUF for Flash 0731, about
-       6 GB. Enable it with --dspark and --mtp when running ds4 or ds4-server.
+       6 GB. Enable it with --dspark and --mtp-model when running ds4 or ds4-server.
 
   pro-q2-imatrix
        DeepSeek V4 PRO 0813 q2 imatrix quant, as a single GGUF file. About
@@ -111,17 +111,18 @@ Targets:
        GLM 5.2 antirez routed Q4_K GGUF from antirez/GLM-5.2-GGUF.
        About 434 GB on disk.
 
-  glm-53-flash-antirez-q2
-       GLM 5.3-flash antirez routed Q2 GGUF from antirez/glm-5.3-flash-gguf.
-       About 96 GB on disk.
+  glm53-q2
+       GLM 5.3 Flash imatrix Q2 GGUF, about 90 GiB on disk. Intended for
+       resident inference on 128 GB Macs.
 
-    glm-53-flash-antirez-q4
-       GLM 5.3-flash antirez routed Q4_K GGUF from antirez/glm-5.3-flash-gguf.
-       About 191 GB on disk.
+  glm53-q4
+       GLM 5.3 Flash Q4_K GGUF, about 178 GiB on disk. Intended for two-Mac
+       tensor parallelism or single-Mac SSD streaming.
 
-    glm-53-flash-antirez-fp8
-       GLM 5.3-flash antirez routed FP8 GGUF from antirez/glm-5.3-flash-gguf.
-       About 327 GB on disk.
+  glm53-fp8
+       Text-only GLM 5.3 Flash native FP8 GGUF, about 305 GiB on disk. It
+       preserves the released weights without requantization. DwarfStar
+       inference support for this paired FP8-code/scale format is pending.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -139,7 +140,7 @@ Then the default commands work:
   ./ds4-server --ctx 100000
 
 After downloading DSpark support, enable it explicitly in greedy mode:
-  ./ds4 --dspark --mtp <download directory>/$DS4F_DSPARK_FILE --temp 0
+  ./ds4 --dspark --mtp-model <download directory>/$DS4F_DSPARK_FILE --temp 0
 
 PRO and GLM files are downloaded with the official Hugging Face downloader
 because they are too large, sharded, or nested for the curl path used by the
@@ -197,20 +198,21 @@ case "$MODEL" in
         MODEL_FILE=$GLM_ANTIREZ_Q4_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
-    glm-53-flash-antirez-q2)
-        REPO=$GLM_53_FLASH_ANTIREZ_REPO
-        MODEL_FILE=$GLM_53_FLASH_ANTIREZ_Q2_FILE
+    glm53-q2)
+        REPO=$GLM53_REPO
+        MODEL_FILE=$GLM53_Q2_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
-    glm-53-flash-antirez-q4)
-        REPO=$GLM_53_FLASH_ANTIREZ_REPO
-        MODEL_FILE=$GLM_53_FLASH_ANTIREZ_Q4_FILE
+    glm53-q4)
+        REPO=$GLM53_REPO
+        MODEL_FILE=$GLM53_Q4_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
-    glm-53-flash-antirez-fp8)
-        REPO=$GLM_53_FLASH_ANTIREZ_REPO
-        MODEL_FILE=$GLM_53_FLASH_ANTIREZ_FP8_FILE
+    glm53-fp8)
+        REPO=$GLM53_REPO
+        MODEL_FILE=$GLM53_FP8_FILE
         FORCE_HF_DOWNLOAD=1
+        LINK_MODEL=0
         ;;
     -h|--help|help)
         usage
@@ -383,7 +385,7 @@ fi
 if [ "$MODEL" = "ds4f-dspark" ]; then
     echo
     echo "DSpark support downloaded. Enable it explicitly in greedy mode:"
-    echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp $OUT_DIR/$DS4F_DSPARK_FILE --temp 0"
+    echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp-model $OUT_DIR/$DS4F_DSPARK_FILE --temp 0"
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"

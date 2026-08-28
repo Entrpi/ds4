@@ -172,6 +172,12 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   `gguf-tools/quality-testing/score_official models/GLM-5.2-UD-Q4_K_XL.gguf gguf-tools/quality-testing/data/glm52-openrouter-100/manifest.tsv /tmp/glm52-q4.tsv 4096`.
   Current Q4 XL reference band: first-token match `95/100`, API top-1 agreement
   about `0.942`, and API pair-order agreement about `0.880`.
+- Run the 100-case GLM 5.3 Flash fixture separately for both release artifacts:
+  `gguf-tools/quality-testing/score_official /path/to/GLM-5.3-Flash-Q2.gguf gguf-tools/quality-testing/data/glm53-flash-openrouter-zai-fp8-100/manifest.tsv /tmp/glm53-q2.tsv 4096`
+  and repeat with `GLM-5.3-Flash-Q4_K.gguf`. The current Q2 reference is
+  average NLL `0.458030488`, first-token match `89/100`, and average greedy
+  prefix `7.37`; Q4 is `0.299917952`, `90/100`, and `9.66`. These are fresh
+  GLM-5.3 Z.AI FP8 continuations and must not be replaced by GLM 5.2 fixtures.
 - Run the same GLM fixture for reduced-precision GLM release files.  The Q2
   routed reference is lower quality but should stay near first-token match
   `92/100`, API top-1 agreement about `0.890`, and API pair-order agreement
@@ -220,7 +226,7 @@ Use the normal Flash GGUF that 128 GB users run.
 DSpark is opt-in, but it mutates the verifier, target-hidden capture, support
 model loading, and scheduler paths.  Run these whenever DSpark support,
 speculative verification, confidence/scheduler policy, target hidden capture,
-tiny routed-MoE verifier kernels, or shared `--mtp` support-model code changes:
+tiny routed-MoE verifier kernels, or shared `--mtp-model` support-model code changes:
 
 Use the 0731 DSpark support GGUF only with a Flash 0731 target. A support model
 from another checkpoint can have plausible acceptance statistics while
@@ -289,8 +295,11 @@ or backend fallback selection changes.
   `DS4_METAL_SESSION_BATCH_QKV=0`. The first run must use the complete fallback;
   the second may batch the shared expert only. Both must remain bit-exact.
 - The oracle must cover reversed row ordering, at least six decode steps, and a
-  mixed prefill/decode call. Any nonzero differing-logit count is a blocker;
-  argmax-only agreement is insufficient.
+  mixed prefill/decode call. Any nonzero differing-logit count is a blocker
+  unless the model-specific section below declares a measured full-logit
+  tolerance; argmax-only agreement is insufficient. When
+  `DS4_TEST_LIVE_CONTROLS=1` is used, its interleaved serial evaluations are a
+  correctness stress and must remain excluded from the reported batch timing.
 - Benchmark 1, 2, 4, 8, and 16 simultaneous resident sessions on the same host
   and model. Record model-step latency and aggregate decode tokens/second, not
   only request completion speed. The current Metal path batches QKV and part of
@@ -301,8 +310,9 @@ or backend fallback selection changes.
   over explicit `tcp` and `rdma` transports. Set `DS4_TEST_TP_MODE=leader` on
   the leader and `DS4_TEST_TP_MODE=worker DS4_TEST_TP_LEADER_HOST=HOST` on the
   worker, with a unique `DS4_TEST_TP_PORT`. Run at least 2 and 4 sessions and
-  preserve both logs. TP currently uses the ordered per-session fallback, so
-  native single-machine row-grid flags must remain off in the TP logs.
+  preserve both logs. GLM 5.3 uses native row batching below token 4096 in TP
+  too; its model-specific tolerance applies. Other unsupported TP shapes must
+  select their established ordered fallback.
 - For the current TB5 MacBook link, US is `10.99.0.2` on `en1`/`rdma_en1` and
   IT is `10.99.0.1` on `en6`/`rdma_en6`; both use GID index 1. Before testing,
   require `rdma_ctl status` to report `enabled` and `ibv_devinfo -v` to show
@@ -311,12 +321,29 @@ or backend fallback selection changes.
   selection is ambiguous. A working TB IP ping alone is not RDMA evidence.
 - Kill the TP worker during one batch with `DS4_TEST_TP_DISCONNECT=1` on the
   leader. The operation must fail cleanly, invalidate every affected session,
-  and return control without hanging.
-- Verify unsupported combinations explicitly: GLM, DSpark/MTP support models,
-  SSD streaming, quality/reference modes, steering, resident Q4 expert
-  overlap, and CPU-router modes must use the established exact fallback or
-  reject the combination before evaluation. They must not partially activate
-  native batching.
+  and return control without hanging. When remote control latency exceeds the
+  default one-second marker window, set
+  `DS4_TEST_TP_DISCONNECT_DELAY_MS=10000` and signal the worker as soon as
+  `TP_DISCONNECT_READY` appears. Repeat over TCP and RDMA by sending `SIGSTOP`
+  to the exact worker PID at that marker, then resume it after the leader
+  returns. Startup must report the default `gate-timeout=750ms`; both paused
+  runs must fail the gate and invalidate all affected sessions without a Metal
+  GPU watchdog error. Before accepting that deadline, run one normal
+  GLM-5.3 batch over each transport and one GLM-5.2 IQ2 RDMA prompt using the
+  larger 108 GiB shard. `DS4_TP_GATE_TIMEOUT_MS` is a diagnostic override, not
+  a setting required for normal inference.
+- Set `DS4_TEST_TP_IDENTITY_MISMATCH=1` on the test leader once and require both
+  ranks to reject the hello before inference. Also reflect a leader hello from
+  a test peer without changing its role; the leader must reject two peers that
+  both claim the coordinator rank. Separately point a worker at an unused port
+  with `DS4_TP_TIMEOUT_SEC=1`; it must return a connection error rather than
+  retrying indefinitely.
+- Verify unsupported combinations explicitly. GLM 5.2, GLM 5.3 after the
+  4,096-token sparse boundary, DSpark support models, quality/reference modes,
+  steering, and CPU-router modes must use their established exact fallback or
+  reject the combination before evaluation. GLM 5.3 below the boundary and
+  supported SSD-streaming configurations have native batching and must pass
+  their model-specific oracle instead of being forced off.
 
 ## 5. Metal PRO Path
 
@@ -329,7 +356,7 @@ PRO support is experimental, but release builds must not break it silently.
   touching model shape, tensor lookup, routed expert mapping, template logic,
   and KV payload compatibility.
 
-## 6. GLM 5.2
+## 6. GLM 5.2 And GLM 5.3
 
 GLM has a different template, model shape, MTP block, attention layout,
 tensor-parallel gate width, and streaming policy. Flash or PRO success does not
@@ -355,12 +382,12 @@ substitute for this matrix.
 - Run `tests/glm_long_context_smoke.sh` with the release-advertised context on
   the 512 GB Metal host. The generated continuation must begin with `>` and
   contain none of the known token-corruption markers.
-- Exercise integrated GLM MTP with `--glm-mtp-timing` on a deterministic
+- Exercise integrated GLM MTP with `--mtp-timing` on a deterministic
   prompt. Compare the greedy text to
   a non-MTP run, require clean speculative cycles, and record acceptance and
   timing. Also run once with MTP disabled to prove ordinary decode remains the
   default.
-- Run the Metal session oracle with 2 and 4 GLM sessions. It must report
+- Run the Metal session oracle with 2 and 4 GLM 5.2 sessions. It must report
   `family=glm native_shared=0 native_qkv=0` and remain exact, including mixed
   prefill/decode; the DeepSeek-only row-grid kernels must not activate.
 - Run resident and SSD-streaming GLM Q2 prompts with the same greedy input.
@@ -368,11 +395,21 @@ substitute for this matrix.
   prefix and dynamic expert-cache budget.
 - Run physical two-machine GLM TP over TCP and RDMA with short and long prompts.
   Record prefill/decode speed, transport, rank residency, and clean shutdown.
+  The long prompt must cross the 4,096-token indexed-attention boundary. After
+  changes to split attention, score at least 100 teacher-forced tokens beyond
+  that boundary against the unsplit reference and run the 100-case Q2 fixture
+  once through physical TP, preserving its `summary` and `api_summary` lines.
   Repeat one run with `--tensor-parallel-token-prefill` as the exact-arithmetic
-  diagnostic. Use a GGUF whose routed-expert type has ownership-aware GLM TP
-  kernels. Also test a Q4-routed GLM file as a negative gate: until Q4 ownership
-  kernels are implemented, both ranks must reject it clearly before evaluation
-  rather than loading a partial split or hanging.
+  diagnostic. Test both Q2 and Q4 routed-expert files whose types have
+  ownership-aware GLM TP kernels. Each rank must map only its owned experts and
+  match the accepted single-host graph. A routed type without ownership-aware
+  kernels must still reject clearly before evaluation rather than loading a
+  partial split or hanging.
+  The released GLM 5.2 IQ2_XXS file keeps `indexer.proj.weight` in FP32. Its
+  loader and Metal graph must accept that established layout; GLM 5.3 may use
+  its quantized or BF16 indexer projection instead. A short exact-output smoke
+  on the current two-M5 RDMA setup returned `GLM52_OK` with 108.63 GiB planned
+  per rank.
 - With explicit permission for the current QA pass, run one resident GLM Q2
   prompt, a long-context prompt, integrated GLM MTP, and concurrent server
   requests on the eight-GPU CUDA host. Use ordinary eight-GPU layer placement
@@ -392,6 +429,116 @@ substitute for this matrix.
   against GLM, including thinking and SSE. DeepSeek compatibility endpoint
   aliases may resolve to the loaded model, but rendered prompts and generated
   text must use the GLM template.
+- Compare a non-tool prompt and a complete assistant tool-call/tool-result
+  transition against the model's `chat_template.jinja` byte for byte. Include
+  reasoning effort, a client system message, a function description and JSON
+  schema, assistant reasoning, and an observation. Token-count agreement alone
+  is insufficient. The fixed one-tool fixture is 901 bytes with SHA-256
+  `f1718f3ebb1c41532bcd5eedd9ebd5c84ae930b018e31962d8743efdbc5affc3`.
+  Run `./ds4_test --server` as the model-free regression for the same exact
+  schema instructions and transition delimiters.
+
+### GLM 5.3 Flash
+
+GLM 5.3 adds mHC, recurrent KDA, a pool-4 DSA indexer, and a different MTP
+block. A GLM 5.2 pass does not cover these paths.
+
+- Run the section 3 GLM 5.3 Q2 and Q4 100-case fixtures before and after any
+  graph, quantization, attention, KDA, mHC, TP, or cache change.
+- Build and run the focused primitive test:
+  `make tests/test_glm53_kda && ./tests/test_glm53_kda`.
+  It covers BF16 projections, pool-4 state construction and expansion, grouped
+  scorer arithmetic and causal visibility, and recurrent KDA prefill versus
+  sequential decode.
+- On this 128 GB M3 Max, run the resident Q2 through the generic non-NAX Metal
+  path. Repeat the 4,096-4,100 boundary, official-continuation, MTP, snapshot,
+  server-session, and continued-prefill gates used on M5. Record the different
+  M3 performance floor rather than borrowing the M5 result. Run Q4 only with a
+  bounded SSD-streaming cache; never try to make it fully resident.
+- On one M5 Max, run resident Q2 with a prompt whose actionable instruction
+  begins after token 4096. The model must recover the tail instruction and
+  complete a tool or exact-output task. A short coherent continuation at token
+  4109 is not sufficient: it previously missed a broken sparse selector.
+- Run physical Q4 50/50 TP over the explicit TB5 RDMA devices. Graduate context
+  allocation through 10K, 25K, and 50K, checking both ranks before advancing.
+  The original 50K Q4 run reported 102.20 GiB per rank. Correct accounting for
+  the dynamically allocated mHC/KDA prefill workspace adds about 0.44 GiB, so
+  the expected plan is about 102.64 GiB per rank; record the exact new value on
+  the next run. It remains below the fixed 110 GiB ceiling. Swap must not grow
+  from idle, SSH must stay responsive, and both roles must exit cleanly.
+- The 25K gate must place a read/edit/test task after a long inert archive and
+  include one harmless tool failure that the agent must recover from. The 50K
+  gate must contain at least 30K live prompt tokens and a real source repair:
+  reproduce a failing test, edit the implementation without weakening tests,
+  and pass a warning-strict build. Inspect the resulting diff manually.
+- Confirm the logs select `rdma_en1` with GID 1 on US and `rdma_en6` with GID 1
+  on IT. A TCP fallback does not satisfy this gate. Keep Q2 and Q4 in
+  `~/ds4/gguf` on both hosts after testing.
+- Run ordinary greedy decode, opportunistic MTP, and `--mtp-exact-sampling`.
+  Greedy MTP must preserve the accepted continuation and provide a measured
+  gain; the current short Q2 control improved from 34.21 to 41.97 t/s.
+- Run the two- and four-session GLM 5.3 server oracle below token 4096 on one
+  M5 and physical TP. For both native single-M5 and TP paths, set
+  `DS4_TEST_LOGIT_TOLERANCE=0.001`: row-batched reductions may differ from the
+  serial launch order, but every selected token must match and the maximum
+  full-logit delta must remain below that bound. Also run the serial rollback
+  with zero tolerance. The current four- and eight-session Q2 maxima are both
+  `0.0001297`; the current six-step two-session RDMA maximum is `0.000175238`. Past
+  4096, require the exact ordered fallback until a sparse native batch oracle
+  proves full-vocabulary correctness.
+- Exercise every pool remainder at the dense-to-sparse boundary with prompts
+  ending at tokens 4096 through 4100. Token 4096 must remain bit-identical to
+  the serial control. The four sparse cases must retain the same greedy token,
+  contain no nonfinite logits, and pass a multi-token exact-output task. Small
+  batched-reduction logit differences are acceptable only when the official
+  continuation and long-task gates remain in band. Build each prompt against
+  `--dump-tokens`; word counts are not a valid substitute for rendered-token
+  counts. The current `.180` CUDA reference returned exactly `BOUNDARY_OK` at
+  all five frontiers.
+- Run the session snapshot test across the sparse boundary:
+  `DS4_TEST_MODEL=/path/to/GLM-5.3-Flash-Q2.gguf
+  DS4_TEST_SNAPSHOT_PROMPT=/path/to/a-4k-plus-prompt.txt
+  DS4_TEST_SNAPSHOT_CTX=8192 ./ds4_test --session-snapshot`.
+  Restored top logits before and after one continued token must match the
+  uninterrupted session within the test's `1e-6` tolerance.
+- Repeat that command with `DS4_TEST_GLM_MTP=1`. The test must replay 16
+  integrated-MTP cycles across the snapshot, including both one- and two-token
+  outcomes, and match every committed token plus the final top-eight logits.
+  The M5 Max reference produced 10 one-token cycles, 6 two-token cycles, and
+  22 committed tokens without a verifier failure. It then synced back to the
+  original long prompt, reproduced its top-eight logits within `1e-6`, and
+  completed four more MTP cycles. The current `.180` CUDA run produced 5
+  one-token and 11 two-token outcomes, committed 27 tokens, and also passed.
+- Measure continued prefill as actual appends to one live session, not only as
+  a single cold prompt. On an M5 Max, run:
+  `./ds4-bench -m /path/to/GLM-5.3-Flash-Q2.gguf --metal
+  --prompt-file /path/to/a-25k-prompt.txt --ctx-start 4096 --ctx-max 12288
+  --ctx-alloc 16384 --step-incr 2048 --gen-tokens 0 --csv /tmp/glm53.csv`.
+  The current 2K append results are 452.56, 423.74, 409.79, and 396.72 t/s at
+  4K, 6K, 8K, and 10K resident prefixes. A warmed first append below 350 t/s
+  requires investigation. The serial rollback control measured 29.68 t/s.
+  On `.180` CUDA, the current 4K, 6K, and 8K append results are 522.66, 506.20,
+  and 502.50 t/s.
+- Keep the 33987-token Q4 TP agent run as the final long-state gate. The old
+  serial sparse path took about 24 minutes to reach its first tool call. The
+  batched path processed a 34023-token initial suffix in 109.846 seconds
+  (309.74 t/s), completed the full read/edit/test task in 178.93 seconds, and
+  used explicit RDMA. A faster result must still pass the tail task, fixture
+  inspection, and official-continuation gates.
+- On one DGX Spark, run Q2 through CUDA and repeat the primitive, official
+  continuation, 4,096-4,100 boundary, continued-prefill, snapshot, MTP, server,
+  and coding-agent gates. Validate independently on `.180` and `.181`; they are
+  separate single-host runs, not CUDA TP. Q4 and Spark-to-Spark RDMA are not
+  supported in this pass. The accepted `.180` 100-case reference is average
+  NLL `0.461783551`, first-token agreement `90/100`, and average greedy prefix
+  `7.49`.
+- For the default compact CUDA graph, dump the complete first-token logits at
+  a 1,024-token frontier twice with the same context allocation. Both files
+  must be byte-identical. Run the 100-case GLM-5.3 fixture from the same linked
+  objects, then run the two-session single-GPU oracle with
+  `DS4_TEST_CUDA_SINGLE_GPU=1 DS4_TEST_SESSION_COUNT=2`. Require
+  `nonexact_logits=0`. Finally run the fused D2R kernels under CUDA memcheck;
+  an argmax-only comparison or coherent text does not replace these gates.
 
 ## 7. SSD Streaming
 
@@ -417,6 +564,12 @@ SSD streaming is a capacity path, so test both correctness and user experience.
 Before a release, ask the user for CUDA access if it is not already configured.
 Use either DGX Spark / GB10 host, `toor@192.168.4.180` or
 `toor@192.168.4.181`. Do not claim CUDA is release-ready without this pass.
+
+Both Sparks normally run vLLM. Before stopping it, record its process, service
+or container, model, ports, and exact launch command. Confirm all vLLM workers
+have exited before loading DwarfStar. At the end, stop every DwarfStar process,
+restore the exact vLLM service, and verify its original ports and model health.
+Do not use high-performance Hugging Face Xet mode while vLLM is resident.
 
 - Fetch or push the exact release commit to the CUDA machine.
 - Build:
@@ -473,6 +626,10 @@ Use either DGX Spark / GB10 host, `toor@192.168.4.180` or
   single-GPU fallback without creating peer-only TP/EP state. The eight-GPU
   native oracle is not a valid Spark test because its topology is intentionally
   unavailable there.
+- For GLM 5.3, use the resident Q2 artifact only. Require the dedicated CUDA
+  primitive and continuation gates in section 6, then record prefill,
+  generation, MTP, continued-prefill, server aggregate throughput, and peak
+  memory. Do not attempt the 178 GiB Q4 artifact on one 128 GB Spark.
 - If CUDA Q4, distributed, streaming hooks, tensor span loading, or model cache
   code changed, test the specific GGUF and split mode that uses that path.
 - Verify that any CUDA-only warning fixes are also clean on macOS and do not
@@ -529,7 +686,7 @@ a substitute for CUDA or Metal release testing.
   changes to GLM attention, typed quantized projections, streaming expert
   caches, or memory budgeting. Record the context, cache split, and whether
   the continuation stays free of token-corruption markers.
-- Run the same GLM model with `--glm-mtp-timing --temp 0`. At least one draft
+- Run the same GLM model with `--mtp-timing --temp 0`. At least one draft
   verification cycle must complete without a `glm mtp step failed` message.
 - Record startup memory/cache messages, prefill speed, generation speed, and
   whether the backend reports `ROCm backend initialized`.
@@ -580,6 +737,12 @@ clients.
   and streaming decode. Repeat across OpenAI chat, Responses, Anthropic, and
   completions. Abandoned work must stop at the next backend-safe boundary, and
   a valid request after each cancellation must complete normally.
+- For the repeatable chat-completions cancellation and slot-reuse gate, run
+  `python3 tests/test_server_batching.py --url http://127.0.0.1:8000 --pairs 2
+  --workers 4 --case short-sampled --max-tokens 12 --cancel-first 4`. Then run
+  at least twelve short four-request waves against the same four-slot server.
+  Every pair must remain deterministic and the server must answer `/v1/models`
+  after malformed JSON and an over-context request.
 - Only after receiving explicit permission for this QA pass, start
   `ds4-server` on the eight-L40S CUDA TP target with the release TP options and
   verify all 16 100k-context sessions allocate. Startup must report a
@@ -609,6 +772,12 @@ The agent is the most stateful component.  Test it manually, not only by build.
   ASCII character ramp or output dimensions.  Verify the agent edits the
   existing file instead of rewriting the whole project, and that the final
   program still builds and runs.
+- For GLM-5.3 integrated MTP, repeat a long-context edit/build/test task after
+  the prompt crosses token 4,096. Require real file and shell tool calls,
+  accepted and rejected draft cycles, and no `glm mtp: GLM 5.3 verify failed`
+  message. Continue the same session after one harmless tool error and after a
+  snapshot restore so a hidden MTP fallback or damaged recurrent state is not
+  mistaken for success.
 - With a matched DSpark support file and temperature 1, repeat a coding-tool
   turn that crosses sampled prose, greedy DSML structure, parameter text, and
   back to sampled prose. Require the tool to execute, the final answer to be
@@ -679,7 +848,16 @@ claims across different models or contexts.
 | MacBook Pro M5 Max 128 GB, Metal | Flash 0731 q2, opportunistic temperature-1 128-token code prompt | - | 44.49 t/s ordinary median; 48.19 t/s DSpark median |
 | Mac Studio M3 Ultra 512 GB, Metal | Flash q2, 11,709-token prompt | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra 512 GB, Metal | Flash q4, 12,018-token prompt | 448.82 t/s | 26.62 t/s |
-| Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.2 IQ2_XXS, 4,096-token context | about 94 t/s | 15.4 t/s |
+| Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.2 IQ2_XXS, 4,096-token prefill and 256-token teacher-forced decode | about 214 t/s | about 16.7 t/s |
+| MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, resident short prompt | 86.68 t/s | 34.45 t/s; 41.97 t/s greedy MTP |
+| Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.3 Flash Q2, short prompt | 29.06 t/s | 32.70 t/s |
+| MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, 24,988/49,948-token long prompts | 424.80 / 421.75 t/s | 29.50 / 28.10 t/s |
+| Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.3 Flash Q2, 10,819-token prompt | 468.97 t/s | 22.85 t/s |
+| Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.3 Flash Q4, 34,023-token agent prefill suffix | 309.74 t/s | full coding task: 178.93 s wall |
+| MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, 2/4/8 resident decode sessions | - | 54.49 / 73.96 / 86.17 aggregate rows/s |
+| DGX Spark GB10, CUDA | GLM 5.3 Flash Q2, 2,048-token prefill and 16-token decode | 531.39 t/s | 14.35 t/s at 2,048 context |
+| DGX Spark GB10, CUDA | GLM 5.3 Flash Q2, live-session 4K/6K/8K continued prefills | 522.66 / 506.20 / 502.50 t/s | - |
+| DGX Spark GB10, CUDA | GLM 5.3 Flash Q2, strict two-session 24-step oracle | - | 16.5 aggregate rows/s; byte-exact full logits |
 | DGX Spark GB10, CUDA | Flash q2, 7,047-token prompt | 343.81 t/s | 13.75 t/s |
 | DGX Spark GB10, CUDA | Flash q2 DSpark, 64-token C fixture | - | 24.48 t/s direct; 13.93 t/s replay predecessor |
 | DGX Spark GB10, CUDA | pre-0731 Flash q2, exact-sampled 128-token code prompt | - | 18.17 t/s ordinary; 18.30 t/s DSpark |

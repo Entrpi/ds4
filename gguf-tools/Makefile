@@ -9,6 +9,8 @@ LLAMA_CPP_CXXFLAGS ?= -O3 -Wall -Wextra -std=c++17 \
 
 ifeq ($(UNAME_S),Darwin)
 NATIVE_CPU_FLAG ?= -mcpu=native
+QUANTS_SHARED := libds4quants.dylib
+SHARED_FLAGS := -dynamiclib
 QUALITY_LDLIBS := -lm -pthread -framework Foundation -framework Metal
 QUALITY_TARGETS := ds4.o ds4_metal.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o rax.o ds4_gpu_args.o
 QUALITY_OBJS := ../ds4.o ../ds4_metal.o ../ds4_distributed.o ../ds4_tp.o ../ds4_ssd.o ../ds4_layer_pack.o ../rax.o ../ds4_gpu_args.o
@@ -18,6 +20,8 @@ LLAMA_CPP_LDLIBS ?= -L$(LLAMA_CPP_BIN) -Wl,-rpath,$(abspath $(LLAMA_CPP_BIN)) \
 	-framework Foundation -framework Metal -framework Accelerate
 else
 NATIVE_CPU_FLAG ?= -march=native
+QUANTS_SHARED := libds4quants.so
+SHARED_FLAGS := -shared
 CUDA_NVCC := $(shell command -v nvcc 2>/dev/null)
 CUDA_HOME ?= $(if $(wildcard /usr/local/cuda/bin/nvcc),/usr/local/cuda,$(if $(CUDA_NVCC),$(patsubst %/bin/nvcc,%,$(CUDA_NVCC)),/usr/local/cuda))
 NVCC ?= $(CUDA_HOME)/bin/nvcc
@@ -43,10 +47,13 @@ CPPFLAGS ?= -D_GNU_SOURCE
 
 .PHONY: all clean quality-score quality-llama-score
 
-all: deepseek4-quantize
+all: deepseek4-quantize $(QUANTS_SHARED)
 
 deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread
+
+$(QUANTS_SHARED): quants.c quants.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(SHARED_FLAGS) -fPIC -o $@ quants.c -lm -pthread
 
 quality-score:
 	$(MAKE) -C .. $(QUALITY_TARGETS)
@@ -56,4 +63,5 @@ quality-llama-score:
 	$(CXX) $(LLAMA_CPP_CXXFLAGS) -o quality-testing/score_llama quality-testing/score_llama.cpp $(LLAMA_CPP_LDLIBS)
 
 clean:
-	rm -f deepseek4-quantize quality-testing/score_official quality-testing/score_llama
+	rm -f deepseek4-quantize libds4quants.dylib libds4quants.so \
+		quality-testing/score_official quality-testing/score_llama

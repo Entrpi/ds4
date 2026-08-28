@@ -195,6 +195,17 @@ struct ds4_metal_args_glm_store_indexer_k {
     float    pad1;
 };
 
+struct ds4_metal_args_glm53_indexer_pool_update {
+    uint32_t pos0;
+    uint32_t n_tokens;
+    uint32_t cache_cap;
+    uint32_t head_dim;
+    uint32_t pool_size;
+    uint32_t cache_f16;
+    float    eps;
+    uint32_t pad0;
+};
+
 struct ds4_metal_args_glm_attention_full {
     uint32_t pos0;
     uint32_t n_tokens;
@@ -219,6 +230,15 @@ struct ds4_metal_args_glm_fill_selected_range_batch {
     uint32_t pos0;
     uint32_t n_selected;
     uint32_t pad_row;
+};
+
+struct ds4_metal_args_glm53_expand_pool_selection {
+    uint32_t n_tokens;
+    uint32_t pos0;
+    uint32_t selected_pools;
+    uint32_t index_topk;
+    uint32_t pool_size;
+    uint32_t output_width;
 };
 
 struct ds4_metal_args_glm_indexer_rope_tail {
@@ -252,12 +272,21 @@ struct ds4_metal_args_glm_indexer_scores_batch {
     uint32_t head_dim;
     uint32_t pos0;
     uint32_t cache_f16;
+    uint32_t row_group_size;
+    uint32_t pad0;
     uint64_t q_token_stride;
     uint64_t q_head_stride;
     uint64_t weights_token_stride;
     uint64_t score_token_stride;
     float    scale;
 };
+
+static inline uint glm_indexer_batch_visible_rows(
+        constant ds4_metal_args_glm_indexer_scores_batch &args,
+        uint token) {
+    const uint group = max(args.row_group_size, 1u);
+    return min((args.pos0 + token + 1u) / group, args.n_rows);
+}
 
 struct ds4_metal_args_glm_qk_lowrank {
     uint32_t n_head;
@@ -933,6 +962,117 @@ kernel void kernel_glm_store_indexer_k(
     }
 }
 
+static inline float glm53_pool_bf16_to_f32(ushort value) {
+    return as_type<float>((uint)value << 16);
+}
+
+kernel void kernel_glm53_indexer_pool_update(
+        constant ds4_metal_args_glm53_indexer_pool_update &args,
+        device const char   *raw_k,
+        device const char   *gate,
+        device const float  *norm_weight,
+        device const float  *norm_bias,
+        device const ushort *ape,
+        device       char   *pool_cache,
+        device       float  *tail_k,
+        device       float  *tail_gate,
+        threadgroup  float  *shared [[threadgroup(0)]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    if (args.head_dim == 0u || args.pool_size == 0u ||
+        tid >= args.head_dim || args.n_tokens == 0u) return;
+
+    const uint pool = args.pos0 / args.pool_size + tgpig.x;
+    const uint pool_start = pool * args.pool_size;
+    const uint input_end = args.pos0 + args.n_tokens;
+    if (pool_start >= input_end || pool_start + args.pool_size <= args.pos0) return;
+
+    threadgroup float *rows = shared;
+    threadgroup float *mean = rows + args.pool_size * args.head_dim;
+    threadgroup float *inv = mean + args.pool_size;
+    const bool complete = pool_start + args.pool_size <= input_end;
+
+    for (uint r = 0; r < args.pool_size; r++) {
+        const uint pos = pool_start + r;
+        float k_value = 0.0f;
+        float gate_value = 0.0f;
+        if (pos >= args.pos0 && pos < input_end) {
+            const uint src_row = pos - args.pos0;
+            k_value = ((device const float *)raw_k)[
+                (uint64_t)src_row * args.head_dim + tid];
+            gate_value = ((device const float *)gate)[
+                (uint64_t)src_row * args.head_dim + tid];
+            if (!complete) {
+                tail_k[(uint64_t)r * args.head_dim + tid] = k_value;
+                tail_gate[(uint64_t)r * args.head_dim + tid] = gate_value;
+            }
+        } else {
+            k_value = tail_k[(uint64_t)r * args.head_dim + tid];
+            gate_value = tail_gate[(uint64_t)r * args.head_dim + tid];
+        }
+        rows[(uint64_t)r * args.head_dim + tid] = k_value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (!complete || pool >= (args.cache_cap + args.pool_size - 1u) / args.pool_size) {
+        return;
+    }
+
+    if (tid < args.pool_size) {
+        const uint r = tid;
+        float sum = 0.0f;
+        for (uint d = 0; d < args.head_dim; d++) {
+            sum += rows[(uint64_t)r * args.head_dim + d];
+        }
+        const float m = sum / (float)args.head_dim;
+        float ss = 0.0f;
+        for (uint d = 0; d < args.head_dim; d++) {
+            const float delta = rows[(uint64_t)r * args.head_dim + d] - m;
+            ss += delta * delta;
+        }
+        mean[r] = m;
+        inv[r] = rsqrt(ss / (float)args.head_dim + args.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float max_logit = -INFINITY;
+    float logits[4];
+    for (uint r = 0; r < args.pool_size; r++) {
+        const uint pos = pool_start + r;
+        float gate_value;
+        if (pos >= args.pos0) {
+            const uint src_row = pos - args.pos0;
+            gate_value = ((device const float *)gate)[
+                (uint64_t)src_row * args.head_dim + tid];
+        } else {
+            gate_value = tail_gate[(uint64_t)r * args.head_dim + tid];
+        }
+        logits[r] = gate_value +
+            glm53_pool_bf16_to_f32(ape[(uint64_t)r * args.head_dim + tid]);
+        max_logit = max(max_logit, logits[r]);
+    }
+
+    float denom = 0.0f;
+    for (uint r = 0; r < args.pool_size; r++) {
+        logits[r] = exp(logits[r] - max_logit);
+        denom += logits[r];
+    }
+    float pooled = 0.0f;
+    for (uint r = 0; r < args.pool_size; r++) {
+        const float normalized =
+            (rows[(uint64_t)r * args.head_dim + tid] - mean[r]) * inv[r] *
+            norm_weight[tid] + norm_bias[tid];
+        pooled += (logits[r] / denom) * normalized;
+    }
+
+    const uint64_t dst_index = (uint64_t)pool * args.head_dim + tid;
+    if (args.cache_f16 != 0u) {
+        ((device half *)pool_cache)[dst_index] = (half)pooled;
+    } else {
+        ((device float *)pool_cache)[dst_index] = pooled;
+    }
+}
+
 static inline void glm_dense_cache_store_f32_or_f16(
         device char *base,
         uint64_t index,
@@ -1011,7 +1151,8 @@ kernel void kernel_glm_build_kv_cache(
                                 corr_dims);
     }
     const float theta_base = (float)pos;
-    const float inv_ndims = -1.0f / (float)args.qk_rope;
+    const float inv_ndims = args.qk_rope != 0u ?
+        -1.0f / (float)args.qk_rope : 0.0f;
     for (uint r = tid * 2u; r < args.qk_rope; r += nth * 2u) {
 #ifdef DS4_METAL_ROPE_EXP2_LOG2
         const float theta = theta_base * exp2(inv_ndims * (float)r * log2(args.freq_base));
@@ -1096,7 +1237,8 @@ kernel void kernel_glm_build_kv_cache_decode_group4(
                                 corr_dims);
     }
     const float theta_base = (float)pos;
-    const float inv_ndims = -1.0f / (float)args.qk_rope;
+    const float inv_ndims = args.qk_rope != 0u ?
+        -1.0f / (float)args.qk_rope : 0.0f;
     for (uint r = tid * 2u; r < args.qk_rope; r += 512u) {
 #ifdef DS4_METAL_ROPE_EXP2_LOG2
         const float theta = theta_base * exp2(inv_ndims * (float)r * log2(args.freq_base));
@@ -1179,7 +1321,8 @@ kernel void kernel_glm_build_kv_cache_flash(
                                 corr_dims);
     }
     const float theta_base = (float)pos;
-    const float inv_ndims = -1.0f / (float)args.qk_rope;
+    const float inv_ndims = args.qk_rope != 0u ?
+        -1.0f / (float)args.qk_rope : 0.0f;
     for (uint r = tid * 2u; r < args.qk_rope; r += nth * 2u) {
 #ifdef DS4_METAL_ROPE_EXP2_LOG2
         const float theta = theta_base * exp2(inv_ndims * (float)r * log2(args.freq_base));
@@ -1398,6 +1541,35 @@ kernel void kernel_glm_fill_selected_range_batch(
     const uint slot = gid - token * args.n_selected;
     const uint visible = args.pos0 + token + 1u;
     selected[gid] = slot < visible ? slot : args.pad_row;
+}
+
+kernel void kernel_glm53_expand_pool_selection(
+        constant ds4_metal_args_glm53_expand_pool_selection &args,
+        device const uint32_t *pool_selected,
+        device       uint32_t *raw_selected,
+        uint gid [[thread_position_in_grid]]) {
+    const uint total = args.n_tokens * args.output_width;
+    if (gid >= total || args.output_width == 0u || args.pool_size == 0u) return;
+
+    const uint token = gid / args.output_width;
+    const uint slot = gid - token * args.output_width;
+    uint value = 0xffffffffu;
+    if (slot < args.index_topk) {
+        const uint pool_slot = slot / args.pool_size;
+        if (pool_slot < args.selected_pools) {
+            const uint pool = pool_selected[
+                (uint64_t)token * args.selected_pools + pool_slot];
+            value = pool * args.pool_size + slot % args.pool_size;
+        }
+    } else {
+        const uint tail_slot = slot - args.index_topk;
+        const uint visible = args.pos0 + token + 1u;
+        const uint tail_count = visible % args.pool_size;
+        if (tail_slot < tail_count) {
+            value = visible - tail_count + tail_slot;
+        }
+    }
+    raw_selected[gid] = value;
 }
 
 kernel void kernel_glm_indexer_rope_tail_f32(
@@ -1849,7 +2021,7 @@ kernel void kernel_glm_indexer_scores_batch(
 
     device float *dst = (device float *)(scores +
         (uint64_t)token * args.score_token_stride) + row;
-    const uint visible = min(args.pos0 + token + 1u, args.n_rows);
+    const uint visible = glm_indexer_batch_visible_rows(args, token);
     if (row >= visible) {
         if (tid == 0) *dst = -INFINITY;
         return;
@@ -1910,7 +2082,7 @@ kernel void kernel_glm_indexer_scores_tiled_f32(
 
     const uint last_token = min(token_base + TM, args.n_tokens);
     const uint max_visible = last_token > token_base ?
-        min(args.pos0 + last_token, args.n_rows) : 0u;
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
 
     if (row_base >= max_visible) {
         for (uint i = tid; i < TM*TN; i += 128) {
@@ -2005,13 +2177,13 @@ kernel void kernel_glm_indexer_scores_tiled_f32(
     }
 
     if (token0 < args.n_tokens && row0 < args.n_rows) {
-        const uint visible = min(args.pos0 + token0 + 1u, args.n_rows);
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
         device float *dst = (device float *)(scores +
             (uint64_t)token0 * args.score_token_stride) + row0;
         *dst = row0 < visible ? acc0 : -INFINITY;
     }
     if (token1 < args.n_tokens && row1 < args.n_rows) {
-        const uint visible = min(args.pos0 + token1 + 1u, args.n_rows);
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
         device float *dst = (device float *)(scores +
             (uint64_t)token1 * args.score_token_stride) + row1;
         *dst = row1 < visible ? acc1 : -INFINITY;
@@ -2043,7 +2215,7 @@ kernel void kernel_glm_indexer_scores_tiled(
 
     const uint last_token = min(token_base + TM, args.n_tokens);
     const uint max_visible = last_token > token_base ?
-        min(args.pos0 + last_token, args.n_rows) : 0u;
+        glm_indexer_batch_visible_rows(args, last_token - 1u) : 0u;
 
     if (row_base >= max_visible) {
         for (uint i = tid; i < TM*TN; i += 128) {
@@ -2138,13 +2310,13 @@ kernel void kernel_glm_indexer_scores_tiled(
     }
 
     if (token0 < args.n_tokens && row0 < args.n_rows) {
-        const uint visible = min(args.pos0 + token0 + 1u, args.n_rows);
+        const uint visible = glm_indexer_batch_visible_rows(args, token0);
         device float *dst = (device float *)(scores +
             (uint64_t)token0 * args.score_token_stride) + row0;
         *dst = row0 < visible ? acc0 : -INFINITY;
     }
     if (token1 < args.n_tokens && row1 < args.n_rows) {
-        const uint visible = min(args.pos0 + token1 + 1u, args.n_rows);
+        const uint visible = glm_indexer_batch_visible_rows(args, token1);
         device float *dst = (device float *)(scores +
             (uint64_t)token1 * args.score_token_stride) + row1;
         *dst = row1 < visible ? acc1 : -INFINITY;
@@ -2241,7 +2413,6 @@ kernel void kernel_glm_qk_lowrank_q8_0_glm52_sg(
         ushort3 ntg_u [[threads_per_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    constexpr uint n_head = 64u;
     constexpr uint kv_lora_dim = 512u;
     constexpr uint qk_nope = 192u;
     constexpr uint qk_dim = 256u;
@@ -2249,8 +2420,8 @@ kernel void kernel_glm_qk_lowrank_q8_0_glm52_sg(
 
     const uint head = tgpig.x;
     const uint wt = args.weight_type;
-    if (head >= n_head ||
-        args.n_head != n_head ||
+    if (head >= args.n_head ||
+        (args.n_head != 32u && args.n_head != 64u) ||
         args.kv_lora_dim != kv_lora_dim ||
         args.qk_nope != qk_nope ||
         args.qk_dim != qk_dim ||
@@ -3624,7 +3795,7 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_impl(
         args.n_selected == 0u ||
         args.cache_f16 == 0u ||
         args.kv_lora_dim != 512u ||
-        args.qk_rope != 64u) {
+        (args.qk_rope != 0u && args.qk_rope != 64u)) {
         return;
     }
 
@@ -3668,7 +3839,7 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_impl(
     }
 
     float corr_dims[2] = {0.0f, 0.0f};
-    if (args.ext_factor != 0.0f) {
+    if (args.qk_rope != 0u && args.ext_factor != 0.0f) {
         glm_rope_yarn_corr_dims((int)args.qk_rope,
                                 (int)args.n_ctx_orig,
                                 args.freq_base,
@@ -4586,14 +4757,15 @@ kernel void kernel_glm_router_select_one(
         threadgroup float *scratch [[threadgroup(0)]],
         uint token [[threadgroup_position_in_grid]],
         uint tid [[thread_position_in_threadgroup]]) {
+    const uint sort_width = args.n_expert > 256u ? 512u : 256u;
     threadgroup float *sel_scores = scratch;
-    threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + 256);
+    threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + sort_width);
     device const float *token_logits = logits + (uint64_t)token * args.n_expert;
     device int32_t *token_selected = selected + (uint64_t)token * args.n_expert_used;
     device float *token_weights = weights + (uint64_t)token * args.n_expert_used;
     device float *token_probs = probs + (uint64_t)token * args.n_expert;
 
-    const uint n_expert = min(args.n_expert, 256u);
+    const uint n_expert = min(args.n_expert, 512u);
     const bool active = tid < n_expert;
     const float p = active ? ds4_glm_router_sigmoid(token_logits[tid]) : 0.0f;
     if (active) token_probs[tid] = p;
@@ -4601,7 +4773,7 @@ kernel void kernel_glm_router_select_one(
     idx[tid] = (int32_t)tid;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint k = 2; k <= 256; k <<= 1) {
+    for (uint k = 2; k <= sort_width; k <<= 1) {
         for (uint j = k >> 1; j > 0; j >>= 1) {
             const uint other = tid ^ j;
             if (other > tid) {

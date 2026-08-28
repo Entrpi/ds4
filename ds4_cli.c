@@ -1834,14 +1834,14 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
+            c.engine.glm_mtp = true;
+        } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
-        } else if (!strcmp(arg, "--glm-mtp")) {
-            c.engine.glm_mtp = true;
-        } else if (!strcmp(arg, "--glm-mtp-timing")) {
+        } else if (!strcmp(arg, "--mtp-timing")) {
             c.engine.glm_mtp = true;
             c.engine.glm_mtp_timing = true;
         } else if (!strcmp(arg, "--dspark")) {
@@ -1855,7 +1855,6 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;
         } else if (!strcmp(arg, "--mtp-exact-sampling")) {
-            c.engine.dspark = true;
             c.engine.dspark_exact_sampling = true;
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
@@ -2062,9 +2061,18 @@ int main(int argc, char **argv) {
             free(cfg.prompt_owned);
             return 2;
         }
-        int rc = ds4_dump_text_tokenization(cfg.engine.model_path,
+        int rc;
+        if (cfg.gen.raw_prompt || is_rendered_chat_prompt(cfg.gen.prompt)) {
+            rc = ds4_dump_text_tokenization(cfg.engine.model_path,
                                             cfg.gen.prompt,
                                             stdout);
+        } else {
+            rc = ds4_dump_chat_tokenization(cfg.engine.model_path,
+                                            cfg.gen.system,
+                                            cfg.gen.prompt,
+                                            cli_effective_think_mode(&cfg.gen),
+                                            stdout);
+        }
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return rc;
@@ -2139,7 +2147,8 @@ int main(int argc, char **argv) {
         ds4_engine_tp_gate_schedule(engine,
                                     &tp_id.gate_slot_start,
                                     &tp_id.gate_slot_step,
-                                    &tp_id.gates_per_token);
+                                    &tp_id.gates_per_token,
+                                    tp_id.gate_slot_mask);
         if (!ds4_tp_create(&tp_leader, &cfg.engine.tp, &tp_id, tp_err, sizeof(tp_err)) ||
             !ds4_engine_tp_bind(engine, tp_leader, tp_err, sizeof(tp_err))) {
             fprintf(stderr, "ds4: %s\n", tp_err);

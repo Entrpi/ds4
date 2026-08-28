@@ -958,14 +958,20 @@ static bool model_alias_disables_thinking(const char *model) {
             !strcmp(model, "glm-5.2-chat") ||
             !strcmp(model, "glm-5.2-no-think") ||
             !strcmp(model, "glm-5.2-nothink") ||
-            !strcmp(model, "zai/glm-5.2-chat"));
+            !strcmp(model, "zai/glm-5.2-chat") ||
+            !strcmp(model, "glm-5.3-flash-chat") ||
+            !strcmp(model, "glm-5.3-flash-no-think") ||
+            !strcmp(model, "glm-5.3-flash-nothink") ||
+            !strcmp(model, "zai/glm-5.3-flash-chat"));
 }
 
 static bool model_alias_enables_thinking(const char *model) {
     return model &&
            (!strcmp(model, "deepseek-reasoner") ||
             !strcmp(model, "glm-5.2-reasoner") ||
-            !strcmp(model, "zai/glm-5.2-reasoner"));
+            !strcmp(model, "zai/glm-5.2-reasoner") ||
+            !strcmp(model, "glm-5.3-flash-reasoner") ||
+            !strcmp(model, "zai/glm-5.3-flash-reasoner"));
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
@@ -974,6 +980,7 @@ static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
+    if (ds4_engine_is_glm53(engine)) return "glm-5.3-flash";
     if (ds4_engine_is_glm_dsa(engine)) return "glm-5.2";
     return ds4_engine_model_id(engine) == 1 ?
            "deepseek-v4-pro" : "deepseek-v4-flash";
@@ -990,7 +997,15 @@ static bool server_model_alias_known(const char *id) {
             !strcmp(id, "glm-5.2-reasoner") ||
             !strcmp(id, "zai/glm-5.2") ||
             !strcmp(id, "zai/glm-5.2-chat") ||
-            !strcmp(id, "zai/glm-5.2-reasoner"));
+            !strcmp(id, "zai/glm-5.2-reasoner") ||
+            !strcmp(id, "glm-5.3-flash") ||
+            !strcmp(id, "glm-5.3-flash-chat") ||
+            !strcmp(id, "glm-5.3-flash-no-think") ||
+            !strcmp(id, "glm-5.3-flash-nothink") ||
+            !strcmp(id, "glm-5.3-flash-reasoner") ||
+            !strcmp(id, "zai/glm-5.3-flash") ||
+            !strcmp(id, "zai/glm-5.3-flash-chat") ||
+            !strcmp(id, "zai/glm-5.3-flash-reasoner"));
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -2097,24 +2112,6 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
                 "Use the exact parameter names from the schemas.");
 }
 
-static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
-    if (!tool_schemas || !tool_schemas[0]) return;
-    buf_puts(b,
-        "## Tools\n\n"
-        "You may call one or more functions to help answer the user question.\n\n"
-        "You are provided with function signatures within <tools></tools> XML tags:\n"
-        "<tools>\n");
-    buf_puts(b, tool_schemas);
-    buf_puts(b,
-        "\n</tools>\n\n"
-        "For each function call, use exactly this XML format:\n"
-        "<tool_call>{function-name}"
-        "<arg_key>{argument-name}</arg_key>"
-        "<arg_value>{argument-value}</arg_value>"
-        "</tool_call>\n\n"
-        "Emit one <tool_call> block per function call. Use the exact tool and argument names from the schemas.");
-}
-
 static void json_escape(buf *b, const char *s);
 
 typedef struct {
@@ -2200,6 +2197,79 @@ bad:
     return true;
 }
 
+static bool append_glm_tool_schema_json(buf *b, const char *json,
+                                        bool *emitted) {
+    json_args args = {0};
+    *emitted = false;
+    if (!json_args_parse(json, &args)) return false;
+
+    for (int i = 0; i < args.len; i++) {
+        const json_arg *arg = &args.v[i];
+        if (!strcmp(arg->key, "defer_loading") &&
+            !arg->is_string && !strcmp(arg->value, "true")) {
+            json_args_free(&args);
+            return true;
+        }
+    }
+
+    buf_putc(b, '{');
+    bool wrote = false;
+    for (int i = 0; i < args.len; i++) {
+        const json_arg *arg = &args.v[i];
+        if (!strcmp(arg->key, "defer_loading") ||
+            !strcmp(arg->key, "strict")) continue;
+        if (wrote) buf_puts(b, ", ");
+        json_escape(b, arg->key);
+        buf_puts(b, ": ");
+        if (arg->is_string) json_escape(b, arg->value);
+        else buf_puts(b, arg->value);
+        wrote = true;
+    }
+    buf_putc(b, '}');
+    json_args_free(&args);
+    *emitted = true;
+    return true;
+}
+
+static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
+    if (!tool_schemas || !tool_schemas[0]) return;
+    buf_puts(b,
+        "\n# Tools\n\n"
+        "You may call one or more functions to assist with the user query.\n\n"
+        "You are provided with function signatures within <tools></tools> XML tags:\n"
+        "<tools>\n\n");
+
+    const char *p = tool_schemas;
+    bool any = false;
+    json_ws(&p);
+    while (*p) {
+        char *raw = NULL;
+        if (!json_raw_value(&p, &raw)) break;
+        bool emitted = false;
+        if (!append_glm_tool_schema_json(b, raw, &emitted)) {
+            buf_puts(b, raw);
+            emitted = true;
+        }
+        free(raw);
+        if (emitted) {
+            buf_puts(b, "\n\n\n");
+            any = true;
+        }
+        json_ws(&p);
+    }
+    if (!any) buf_putc(b, '\n');
+
+    buf_puts(b,
+        "</tools>\n\n"
+        "For each function call, output the function name and arguments within the following XML format:\n"
+        "<tool_call>{function-name}"
+        "<arg_key>{arg-key-1}</arg_key>"
+        "<arg_value>{arg-value-1}</arg_value>"
+        "<arg_key>{arg-key-2}</arg_key>"
+        "<arg_value>{arg-value-2}</arg_value>"
+        "...</tool_call>");
+}
+
 static void append_dsml_attr_escaped(buf *b, const char *s) {
     for (s = s ? s : ""; *s; s++) {
         if (*s == '&') buf_puts(b, "&amp;");
@@ -2245,6 +2315,44 @@ static void append_glm_arg_value_text(buf *b, const char *s) {
 
 static void append_glm_tool_response_text(buf *b, const char *s) {
     append_glm_tag_body_text(b, s, "</tool_response>");
+}
+
+static bool chat_msg_is_glm_tool_result(const chat_msg *m) {
+    if (!m || !m->role) return false;
+    if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) return true;
+    /* Anthropic carries tool_result blocks in a user-role message.  Its parser
+     * records the call ids and preserves each block with a <tool_result>
+     * wrapper, which lets the GLM renderer distinguish it from user text. */
+    return !strcmp(m->role, "user") && m->tool_call_ids_len > 0;
+}
+
+static void append_glm_tool_response(buf *b, const char *text, size_t len) {
+    char *body = xstrndup(text ? text : "", len);
+    buf_puts(b, "<tool_response>");
+    append_glm_tool_response_text(b, body);
+    buf_puts(b, "</tool_response>");
+    free(body);
+}
+
+static void append_glm_tool_result_message(buf *b, const chat_msg *m) {
+    const char *content = m && m->content ? m->content : "";
+    if (m && m->role && !strcmp(m->role, "user") &&
+        m->tool_call_ids_len > 0) {
+        static const char open[] = "<tool_result>";
+        static const char close[] = "</tool_result>";
+        const char *p = content;
+        bool found = false;
+        while ((p = strstr(p, open)) != NULL) {
+            const char *body = p + sizeof(open) - 1;
+            const char *end = strstr(body, close);
+            if (!end) break;
+            append_glm_tool_response(b, body, (size_t)(end - body));
+            found = true;
+            p = end + sizeof(close) - 1;
+        }
+        if (found) return;
+    }
+    append_glm_tool_response(b, content, strlen(content));
 }
 
 static void append_tool_result_text(buf *b, const char *s) {
@@ -2388,11 +2496,11 @@ static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
         buf_puts(b, calls->raw_tool_text);
         return;
     }
+    buf_putc(b, '\n');
     for (int i = 0; i < calls->len; i++) {
         const tool_call *tc = &calls->v[i];
         const tool_schema_order *order =
             tool_schema_orders_find(tool_orders, tc->name);
-        if (i || b->len) buf_puts(b, "\n\n");
         buf_puts(b, "<tool_call>");
         buf_puts(b, tc->name ? tc->name : "");
         if (!append_glm_arguments_from_json(b, tc->arguments, order)) {
@@ -2402,6 +2510,7 @@ static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
         }
         buf_puts(b, "</tool_call>");
     }
+    buf_putc(b, '\n');
 }
 
 static void append_tool_calls_text_for_syntax(buf *b,
@@ -2521,6 +2630,14 @@ static bool text_starts_with_think_tag(const char *s) {
     return s && (!strncmp(s, "<think>", 7) || !strncmp(s, "</think>", 8));
 }
 
+static void append_trimmed_text(buf *out, const char *text) {
+    const unsigned char *start = (const unsigned char *)(text ? text : "");
+    while (*start && isspace(*start)) start++;
+    const unsigned char *end = start + strlen((const char *)start);
+    while (end > start && isspace(end[-1])) end--;
+    buf_append(out, (const char *)start, (size_t)(end - start));
+}
+
 static void append_glm_assistant_message_prefix(buf *out,
                                                 const chat_msg *m,
                                                 bool preserve_reasoning) {
@@ -2571,25 +2688,29 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
     }
 
     bool pending_assistant = false;
+    bool observation_open = false;
     for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) {
+            observation_open = false;
             continue;
+        } else if (chat_msg_is_glm_tool_result(m)) {
+            if (!observation_open) buf_puts(&out, "<|observation|>");
+            append_glm_tool_result_message(&out, m);
+            observation_open = true;
+            pending_assistant = true;
         } else if (!strcmp(m->role, "user")) {
+            observation_open = false;
             buf_puts(&out, "<|user|>");
             buf_puts(&out, m->content ? m->content : "");
             pending_assistant = true;
-        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            buf_puts(&out, "<|observation|><tool_response>");
-            append_glm_tool_response_text(&out, m->content);
-            buf_puts(&out, "</tool_response>");
-            pending_assistant = true;
         } else if (!strcmp(m->role, "assistant")) {
+            observation_open = false;
             (void)pending_assistant;
             buf_puts(&out, "<|assistant|>");
             append_glm_assistant_message_prefix(
                 &out, m, think && (tool_context || i > last_user_idx));
-            buf_puts(&out, m->content ? m->content : "");
+            append_trimmed_text(&out, m->content);
             append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_GLM,
                                               &m->calls, tool_orders);
             pending_assistant = false;
@@ -2699,23 +2820,27 @@ static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
     const bool think = ds4_think_mode_enabled(think_mode);
     buf out = {0};
     bool pending_assistant = false;
+    bool observation_open = false;
     for (int i = start; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) {
+            observation_open = false;
             continue;
+        } else if (chat_msg_is_glm_tool_result(m)) {
+            if (!observation_open) buf_puts(&out, "<|observation|>");
+            append_glm_tool_result_message(&out, m);
+            observation_open = true;
+            pending_assistant = true;
         } else if (!strcmp(m->role, "user")) {
+            observation_open = false;
             buf_puts(&out, "<|user|>");
             buf_puts(&out, m->content ? m->content : "");
             pending_assistant = true;
-        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            buf_puts(&out, "<|observation|><tool_response>");
-            append_glm_tool_response_text(&out, m->content);
-            buf_puts(&out, "</tool_response>");
-            pending_assistant = true;
         } else if (!strcmp(m->role, "assistant")) {
+            observation_open = false;
             buf_puts(&out, "<|assistant|>");
             append_glm_assistant_message_prefix(&out, m, think);
-            buf_puts(&out, m->content ? m->content : "");
+            append_trimmed_text(&out, m->content);
             append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_GLM,
                                               &m->calls, tool_orders);
             pending_assistant = false;
@@ -10458,7 +10583,12 @@ static void server_prefill_leave(server *s) {
 
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
-    return generation_active ? s->mixed_prefill_quantum : 2048;
+    int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
+    if (generation_active && quantum < 1024 && s->engine &&
+        ds4_engine_is_glm53(s->engine)) {
+        quantum = 1024;
+    }
+    return quantum;
 }
 
 static int server_prefill_quantum(server *s) {
@@ -13118,14 +13248,14 @@ static server_config parse_options(int argc, char **argv) {
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
+            c.engine.glm_mtp = true;
+        } else if (!strcmp(arg, "--mtp-model")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
-        } else if (!strcmp(arg, "--glm-mtp")) {
-            c.engine.glm_mtp = true;
-        } else if (!strcmp(arg, "--glm-mtp-timing")) {
+        } else if (!strcmp(arg, "--mtp-timing")) {
             c.engine.glm_mtp = true;
             c.engine.glm_mtp_timing = true;
         } else if (!strcmp(arg, "--dspark")) {
@@ -13139,7 +13269,6 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;
         } else if (!strcmp(arg, "--mtp-exact-sampling")) {
-            c.engine.dspark = true;
             c.engine.dspark_exact_sampling = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
@@ -14960,6 +15089,13 @@ static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.2-reasoner"));
     TEST_ASSERT(server_model_alias_known("glm-5.2-chat"));
     TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner"));
+    TEST_ASSERT(model_alias_disables_thinking("glm-5.3-flash-chat"));
+    TEST_ASSERT(model_alias_disables_thinking("zai/glm-5.3-flash-chat"));
+    TEST_ASSERT(model_alias_enables_thinking("glm-5.3-flash-reasoner"));
+    TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.3-flash-reasoner"));
+    TEST_ASSERT(server_model_alias_known("glm-5.3-flash"));
+    TEST_ASSERT(server_model_alias_known("glm-5.3-flash-chat"));
+    TEST_ASSERT(server_model_alias_known("glm-5.3-flash-reasoner"));
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -15121,19 +15257,27 @@ static void test_render_glm_chat_prompt_text(void) {
 
     tool_schema_orders orders = make_bash_order();
     const char *tool_schemas =
+        "{\"name\":\"hidden\",\"defer_loading\":true,\"parameters\":{}}\n"
         "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
-        "\"command\":{}}}}";
+        "\"command\":{}}},\"strict\":true}";
     char *prompt = render_chat_prompt_text_for_syntax(
         SERVER_MODEL_SYNTAX_GLM, &msgs, tool_schemas, &orders, DS4_THINK_HIGH);
 
     TEST_ASSERT(prompt != NULL);
-    TEST_ASSERT(!strncmp(prompt, "[gMASK]<sop>", strlen("[gMASK]<sop>")));
-    TEST_ASSERT(strstr(prompt, "<|system|>Reasoning Effort: High") != NULL);
-    TEST_ASSERT(strstr(prompt, "<tools>") != NULL);
-    TEST_ASSERT(strstr(prompt, "<tool_call>{function-name}") != NULL);
-    TEST_ASSERT(strstr(prompt, "<|system|>You are terse.") != NULL);
-    TEST_ASSERT(strstr(prompt, "<|user|>Hello<|assistant|><think>") != NULL);
-    TEST_ASSERT(strstr(prompt, "DSML") == NULL);
+    const char *expected =
+        "[gMASK]<sop><|system|>Reasoning Effort: High<|system|>\n"
+        "# Tools\n\n"
+        "You may call one or more functions to assist with the user query.\n\n"
+        "You are provided with function signatures within <tools></tools> XML tags:\n"
+        "<tools>\n\n"
+        "{\"name\": \"bash\", \"parameters\": {\"type\":\"object\",\"properties\":{\"command\":{}}}}\n\n\n"
+        "</tools>\n\n"
+        "For each function call, output the function name and arguments within the following XML format:\n"
+        "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>"
+        "<arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key>"
+        "<arg_value>{arg-value-2}</arg_value>...</tool_call>"
+        "<|system|>You are terse.<|user|>Hello<|assistant|><think>";
+    TEST_ASSERT(!strcmp(prompt, expected));
 
     free(prompt);
     tool_schema_orders_free(&orders);
@@ -15181,6 +15325,10 @@ static void test_render_glm_preserves_reasoning_with_tools(void) {
     tc.name = xstrdup("bash");
     tc.arguments = xstrdup("{\"command\":\"pwd\"}");
     tool_calls_push(&assistant.calls, tc);
+    tool_call tc2 = {0};
+    tc2.name = xstrdup("bash");
+    tc2.arguments = xstrdup("{\"command\":\"ls\"}");
+    tool_calls_push(&assistant.calls, tc2);
     chat_msgs_push(&msgs, assistant);
     chat_msg tool = {0};
     tool.role = xstrdup("tool");
@@ -15191,13 +15339,67 @@ static void test_render_glm_preserves_reasoning_with_tools(void) {
     char *prompt = render_chat_prompt_text_for_syntax(
         SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, &orders, DS4_THINK_HIGH);
     TEST_ASSERT(prompt != NULL);
-    TEST_ASSERT(strstr(prompt, "<think>tool reasoning</think>") != NULL);
-    TEST_ASSERT(strstr(prompt, "<tool_call>bash") != NULL);
-    TEST_ASSERT(strstr(prompt, "<|observation|><tool_response>/tmp</tool_response>") != NULL);
+    const char *expected =
+        "[gMASK]<sop><|system|>Reasoning Effort: High"
+        "<|user|>first<|assistant|><think>tool reasoning</think>\n"
+        "<tool_call>bash<arg_key>command</arg_key><arg_value>pwd</arg_value>"
+        "</tool_call><tool_call>bash<arg_key>command</arg_key>"
+        "<arg_value>ls</arg_value></tool_call>\n"
+        "<|observation|><tool_response>/tmp</tool_response>"
+        "<|assistant|><think>";
+    TEST_ASSERT(!strcmp(prompt, expected));
 
     free(prompt);
     tool_schema_orders_free(&orders);
     chat_msgs_free(&msgs);
+}
+
+static void test_render_glm_groups_tool_results(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("inspect both");
+    chat_msgs_push(&msgs, user);
+
+    chat_msg first = {0};
+    first.role = xstrdup("tool");
+    first.content = xstrdup("first result");
+    chat_msgs_push(&msgs, first);
+    chat_msg second = {0};
+    second.role = xstrdup("tool");
+    second.content = xstrdup("second result");
+    chat_msgs_push(&msgs, second);
+
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    const char *observation = strstr(prompt, "<|observation|>");
+    TEST_ASSERT(observation != NULL);
+    TEST_ASSERT(strstr(observation + 1, "<|observation|>") == NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|observation|><tool_response>first result</tool_response>"
+        "<tool_response>second result</tool_response>"
+        "<|assistant|><think>") != NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+
+    chat_msgs anthropic = {0};
+    chat_msg wrapped = {0};
+    wrapped.role = xstrdup("user");
+    wrapped.content = xstrdup(
+        "<tool_result>one</tool_result><tool_result>two</tool_result>");
+    chat_msg_add_tool_call_id(&wrapped, "call_1");
+    chat_msg_add_tool_call_id(&wrapped, "call_2");
+    chat_msgs_push(&anthropic, wrapped);
+    prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &anthropic, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|observation|><tool_response>one</tool_response>"
+        "<tool_response>two</tool_response><|assistant|><think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<|user|><tool_result>") == NULL);
+    free(prompt);
+    chat_msgs_free(&anthropic);
 }
 
 static void test_dsml_tool_args_preserve_call_order(void) {
@@ -18325,6 +18527,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_glm_chat_prompt_text();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
+    test_render_glm_groups_tool_results();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();

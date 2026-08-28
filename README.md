@@ -3,10 +3,10 @@
 </p>
 
 **DwarfStar** is a small native inference engine optimized first for
-**DeepSeek V4 Flash**. It also supports **GLM 5.2** and, on very high-memory
-machines, **DeepSeek V4 PRO**. It is self-contained and deliberately narrow,
-not a general GGUF runner. Model loading, prompt rendering, tool calls, KV
-state, the HTTP server, and the coding agent are built and tested together.
+**DeepSeek V4 Flash**. It also supports **GLM 5.2**, **GLM 5.3 Flash**, and,
+on very high-memory machines, **DeepSeek V4 PRO**. It is self-contained and
+deliberately narrow, not a general GGUF runner. Model loading, prompt rendering,
+tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
 The repository also includes tools and data for GGUF, imatrix, quality, and speed.
 
 Supported backends:
@@ -28,7 +28,7 @@ workstations. A model may be removed when a better replacement arrives.
 
 * You can run a very capable models in your consumer hardware, a MacBook, a DGX Spark, or a Strix Halo for example. Even if you have not enough RAM, with SSD streaming, you can run it at a decent speed.
 * Using the CUDA multi-GPU support and with ds4-server micro batching of decoding and generation, you can turn a server with old-ish CUDA cards (Ada Lovelace architecture), no longer supported for new models by vLLM, into a multi-user LLM server for your company. We tested this setup with 8xL40S NVIDIA cards and multiple sessions with very good results. 120 t/s aggreated generation, 2000 t/s prefill.
-* Using two MacBook M5 Max / M3 Ultra RDMA, you can run 4 bit DeepSeek Flash or GLM 5.2 with tensor parallelism.
+* Using two MacBook M5 Max / M3 Ultra RDMA, you can run 4 bit DeepSeek Flash, GLM 5.2, or GLM 5.3 Flash with tensor parallelism.
 * You can also use pipeline paralellism to glue together multiple systems to sum their RAM and run larger models.
 
 ## Motivations
@@ -97,7 +97,7 @@ next sections.
 
 ## Model Weights
 
-This implementation only works with the DeepSeek V4 and GLM 5.2 GGUFs listed
+This implementation only works with the DeepSeek V4 and GLM GGUFs listed
 below. It is not a general GGUF loader, and arbitrary GGUF files will not have
 the tensor layout, quantization mix, metadata, or optional MTP state expected by
 the engine. The 2 bit quantizations provided here are verified to be actually
@@ -130,9 +130,11 @@ For the full PRO Q4 distributed run, download one half on each machine:
 ./download_model.sh pro-q4-layers31-output  # second half of PRO Q4 split
 ```
 
-The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
-stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
-updates `./ds4flash.gguf` to point at the selected main model.
+The script stores files under `./gguf/` and updates `./ds4flash.gguf` to point
+at the selected main model. DeepSeek files come from
+`antirez/deepseek-v4-gguf`; GLM targets use the repository named in the script's
+help. Smaller files resume with `curl -C -`, while large files use the official
+Hugging Face downloader.
 The `pro-q4-layers00-30`, `pro-q4-layers31-output`, and `pro-q4-split` targets
 download distributed PRO Q4 pieces and do not update `./ds4flash.gguf`.
 Authentication is optional for public downloads, but `--token TOKEN`,
@@ -154,30 +156,34 @@ GLM 5.2 support is limited to the GGUF files tested by this branch:
 ./download_model.sh glm-antirez-q4  # antirez routed Q4_K single-file GGUF
 ```
 
-The supported GLM layout keeps dense/model-control tensors in the existing
+GLM 5.3 Flash has its own graph, artifacts, and run instructions in the
+[GLM 5.3 Flash](#glm-53-flash) section below.
+
+The supported GLM 5.2 layout keeps dense/model-control tensors in the existing
 Q8/F32 paths and supports routed expert gate/up tensors in `Q2_K`, `Q4_K`, or
 `Q5_K`; routed expert down tensors are supported in `Q2_K`, `Q4_K`, `Q5_K`, or
 `Q6_K`. Other GLM GGUF quant layouts should be treated as unsupported until they
 are added deliberately and scored against the official 100-case fixture.
 
-These formats do not all support the same execution modes. The Q4 files work
-for normal Metal and CUDA inference. Two-Mac tensor parallelism currently
-requires an ownership-aware IQ2_XXS or Q2_K routed layout; a routed Q4 GLM
-must be rejected before evaluation.
+These GLM 5.2 formats do not all support the same execution modes. The Q4 files
+work for normal Metal and CUDA inference. Two-Mac tensor parallelism for GLM
+5.2 currently requires an ownership-aware IQ2_XXS or Q2_K routed layout. GLM
+5.3 has its own ownership-aware Q4 path.
 
 GLM's MTP block is part of the main GGUF; it does not use the separate Flash
-MTP file. Ordinary decode remains the default. `--glm-mtp` enables experimental
-greedy speculation. `--glm-mtp-timing` also enables it and prints acceptance
+MTP file. Ordinary decode remains the default. `--mtp` enables experimental
+greedy speculation. `--mtp-timing` also enables it and prints acceptance
 and timing counters:
 
 ```sh
 ./ds4 -m gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf \
-  --glm-mtp-timing --temp 0
+  --mtp-timing --temp 0
 ```
 
-GLM inference uses the Metal, CUDA, or ROCm graph backend. Directional steering,
-`--power` below 100, an explicit `--prefill-chunk`, and the external `--mtp`
-file are not supported for GLM yet.
+GLM 5.2 uses the Metal, CUDA, or ROCm graph backend. GLM 5.3 is validated on
+Metal, with Q2 also validated on CUDA. Directional steering, `--power` below
+100, an explicit `--prefill-chunk`, and an external `--mtp-model` file are not
+supported for GLM yet.
 
 Then build:
 
@@ -192,6 +198,74 @@ make cpu              # CPU-only diagnostics build
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
+
+## GLM 5.3 Flash
+
+GLM 5.3 Flash uses a separate graph for its recurrent KDA layers, sparse DSA
+layers, hyper-connections, and built-in MTP block. The release GGUFs were made
+from the official FP8 checkpoint:
+
+```sh
+./download_model.sh glm53-q2  # about 90 GiB
+./download_model.sh glm53-q4  # about 178 GiB
+./download_model.sh glm53-fp8 # about 305 GiB; packaged weights only
+```
+
+The Q2 file uses imatrix-guided IQ2_XXS gate/up experts and Q2_K down experts.
+It runs resident on a 128 GB M3 Max or M5 Max, and on one DGX Spark. The Q4
+file is the higher-quality control. Run it across two 128 GB Macs, or use SSD
+streaming on one Mac. The FP8 file preserves the released text weights without
+requantization; DwarfStar cannot execute that artifact yet.
+
+On one 128 GB Mac:
+
+```sh
+./ds4 -m gguf/GLM-5.3-Flash-Q2.gguf --ctx 32768
+```
+
+Q2 is close to the practical memory limit on a 128 GB Mac. Stop other
+memory-heavy workloads before loading it resident.
+
+The model's MTP block is already inside the same GGUF. `--mtp` enables it;
+`--mtp-timing` also prints acceptance and timing counters. At non-zero
+temperature the default mode directly keeps target-matching greedy drafts.
+Add `--mtp-exact-sampling` when the output must preserve the ordinary target
+sampling distribution.
+
+```sh
+./ds4 -m gguf/GLM-5.3-Flash-Q2.gguf --mtp --temp 0 --ctx 32768
+./ds4-agent -m gguf/GLM-5.3-Flash-Q2.gguf --mtp --ctx 50000
+```
+
+For a small multi-user server on one M5 Max, four 4096-token sessions fit the
+tested Q2 layout. Native decode batching is used below token 4096; longer
+sessions automatically use the ordered fallback.
+
+```sh
+./ds4-server -m gguf/GLM-5.3-Flash-Q2.gguf \
+  --ctx 4096 --batched-session 4
+```
+
+To run Q4 on one Mac without making it resident:
+
+```sh
+./ds4 -m gguf/GLM-5.3-Flash-Q4_K.gguf --ssd-streaming --ctx 4096
+```
+
+For resident Q2 or Q4 across two 128 GB Macs, use the 50/50 setup documented
+under [Tensor Parallelism over RDMA](#tensor-parallelism-over-rdma). Put the
+same GGUF at the same path on both machines, start the worker first, and select
+`--transport rdma` on both sides. Q4 is the main reason to use this setup.
+
+On one DGX Spark, use Q2 without CUDA tensor parallelism:
+
+```sh
+make cuda-spark
+./ds4 --cuda -m gguf/GLM-5.3-Flash-Q2.gguf --ctx 16384
+```
+
+Q4 does not fit one Spark, and Spark-to-Spark RDMA tensor parallelism is not
+implemented.
 
 ## DSpark Speculative Decoding
 
@@ -236,11 +310,11 @@ Run it with the normal sampling defaults:
 
 ```sh
 ./ds4 -m ds4flash.gguf \
-  --mtp gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
+  --mtp-model gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
   --dspark
 ```
 
-`--mtp` supplies the support GGUF, while `--dspark` selects the DSpark runtime.
+`--mtp-model` supplies the support GGUF, while `--dspark` selects the DSpark runtime.
 The default confidence threshold is `0.6` on Metal and `0.7` on CUDA and ROCm.
 It prunes suffixes that are unlikely to repay their verification cost.
 `--dspark-confidence 0` forces fixed five-token blocks and is intended for
@@ -655,7 +729,7 @@ attention, shared-expert, embedding, and output weights remain replicated.
 This lets a model whose routed experts do not fit on one machine run fully
 resident across the pair; routed kernels never touch the peer's expert half.
 
-### Running GLM 5.2 across two 128 GB MacBooks
+### Running GLM 5.2 or GLM 5.3 across two 128 GB MacBooks
 
 One-time setup per boot, on **both** machines:
 
@@ -690,6 +764,7 @@ on the Thunderbolt member interface, not the bridge address:
 
 ```sh
 MODEL=gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf
+# For GLM 5.3 Q4, use MODEL=gguf/GLM-5.3-Flash-Q4_K.gguf instead.
 
 # Machine B: worker.
 ./ds4 -m "$MODEL" --tensor-parallel --role worker \
@@ -704,14 +779,15 @@ MODEL=gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf
 The active verbs device and IPv4-mapped GID are selected automatically. If that
 is ambiguous, add `--rdma-device rdma_en6 --rdma-gid-index 1` on the worker and
 the matching `rdma_en1` flags on the coordinator. Use `--transport tcp` on both
-sides to force TCP. Tensor parallel roles are currently exposed by the `ds4`
-CLI, not by `ds4-server` or `ds4-agent`.
+sides to force TCP. Run workers with `ds4`; the coordinator may be `ds4`,
+`ds4-agent`, or `ds4-server`.
 
 Startup takes about 9 seconds per machine: each rank pre-faults its
 ~100 GiB shard from SSD and pins it through a Metal residency set.
 DeepSeek V4 Flash works the same way with its own GGUF on both machines.
-DeepSeek gate vectors are 16 KB and ride as one RDMA message. GLM's
-6144-wide 24 KB vectors are split into two ordered RDMA messages.
+DeepSeek gate vectors are 16 KB and ride as one RDMA message. GLM 5.2's
+6144-wide 24 KB vectors are split into two ordered RDMA messages. GLM 5.3 uses
+its own KDA/DSA gate schedule, exchanged and checked during TP startup.
 
 Measured on two M5 Max 128 GB MacBooks (GLM 5.2, IQ2_XXS, 188 GiB):
 
@@ -1009,10 +1085,10 @@ conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
 and returns to `ds4>`.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct
-answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
-path; it is useful only for greedy decoding, currently uses a confidence gate
-(`--mtp-margin`) to avoid slow partial accepts, and should be treated as an
-experimental slight-speedup path.
+answers. Models with a built-in draft block use `--mtp`; models with a separate
+support GGUF use `--mtp-model MTP.gguf`. `--mtp-draft 2` sets the maximum draft
+depth. At non-zero temperature, add `--mtp-exact-sampling` when the output must
+preserve the ordinary target sampling distribution.
 
 ## Server
 
@@ -1042,14 +1118,16 @@ While generation is active, prefill yields every 128 tokens by default.
 `--mixed-prefill-quantum N` changes that interval for testing; larger values
 reduce scheduling handoffs but can make active decoders wait longer.
 
-Decode batching is exact: when a native batched kernel is unavailable,
-DwarfStar runs the affected rows in a fixed order and returns the same full
-logits as separate session evaluations. The current backend behavior is:
+Native decode batching runs the same model graph, but grouping rows can change
+floating-point reduction order slightly. When a native kernel is unavailable,
+DwarfStar runs the rows in a fixed order and returns the same full logits as
+separate session evaluations. The current backend behavior is:
 
 | Backend and model | Session execution |
 | --- | --- |
 | Metal, resident DeepSeek Flash | Native shared-expert and QKV batching from two rows upward when supported; ordered fallback otherwise. |
 | Metal, GLM 5.2 | Ordered exact fallback. |
+| Metal, GLM 5.3 | Native decode batching below token 4096; ordered exact fallback at longer contexts. |
 | CUDA, DeepSeek Flash on a supported multi-GPU TP/EP layout | Native decode and mixed prefill/decode, with exact fallbacks for unsupported kernel shapes. |
 | CUDA single GPU, including DGX Spark | Ordered exact fallback. |
 
@@ -1608,6 +1686,11 @@ The batching tests are model-backed and must run on the matching GPU backend:
 DS4_TEST_MODEL=/path/to/model.gguf DS4_TEST_SESSION_COUNT=4 \
   make test-metal-session-batch
 
+# GLM 5.3 native row batching uses a bounded numerical comparison.
+DS4_TEST_MODEL=/path/to/GLM-5.3-Flash-Q2.gguf \
+  DS4_TEST_SESSION_COUNT=4 DS4_TEST_LOGIT_TOLERANCE=0.001 \
+  make test-metal-session-batch
+
 # CUDA multi-GPU Flash.
 DS4_TEST_MODEL=/path/to/model.gguf make test-cuda-session-batch
 DS4_TEST_MODEL=/path/to/model.gguf make test-cuda-mixed-batch
@@ -1631,9 +1714,10 @@ first answer:
 ./ds4-server --trace /tmp/ds4-trace.txt ...
 ```
 
-- `--dump-tokens` tokenizes the `-p` or `--prompt-file` string exactly as
-  written, recognizes DS4 protocol specials, and then exits before inference
-  starts. For example, the DSML tool close marker starts as two tokens: `</`
+- `--dump-tokens` prints the exact chat prompt token stream the CLI would use,
+  then exits before inference starts. Add `--raw` to tokenize the `-p` or
+  `--prompt-file` text literally. Protocol specials are recognized in both
+  modes; for example, the DSML tool close marker starts as two tokens: `</`
   and `｜DSML｜`.
 - `--dump-logprobs` stores a greedy continuation with the top local
   alternatives at each step, which helps separate sampling choices from

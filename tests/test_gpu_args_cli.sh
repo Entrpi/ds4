@@ -47,8 +47,14 @@ for i in "${!BINS[@]}"; do
     assert_grep "$name --help mentions --cuda-tensor-parallel" "cuda-tensor-parallel" "$LOG"
     if [ "$name" != "ds4-bench" ]; then
         "$bin" --help runtime > "$LOG" 2>&1 || true
+        assert_grep "$name --help runtime mentions --mtp" \
+            "--mtp" "$LOG"
+        assert_grep "$name --help runtime mentions --mtp-model" \
+            "--mtp-model" "$LOG"
         assert_grep "$name --help runtime mentions --mtp-exact-sampling" \
             "mtp-exact-sampling" "$LOG"
+        assert_not_grep "$name --help runtime omits --glm-mtp" \
+            "--glm-mtp" "$LOG"
     fi
     if [ "$name" = "ds4" ]; then
         "$bin" --help distributed > "$LOG" 2>&1 || true
@@ -58,11 +64,32 @@ for i in "${!BINS[@]}"; do
     fi
 done
 
+if [ -x ./ds4-eval ]; then
+    ./ds4-eval --help runtime > "$LOG" 2>&1 || true
+    assert_grep "ds4-eval --help runtime mentions --mtp-model" \
+        "--mtp-model" "$LOG"
+    ./ds4-eval --mtp-model /dev/null -m /dev/null --questions 1 \
+        > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && ! grep -q "unknown option" "$LOG"; then
+        ok "ds4-eval parses --mtp-model"
+    else
+        fail "ds4-eval rejected --mtp-model in option parsing"
+    fi
+    ./ds4-eval --mtp /dev/null -m /dev/null --questions 1 > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && grep -q "unknown option" "$LOG"; then
+        ok "ds4-eval rejects obsolete --mtp FILE spelling"
+    else
+        fail "ds4-eval retained obsolete --mtp FILE spelling"
+    fi
+fi
+
 # 1b: exact DSpark sampling is parsed by every frontend that can run DSpark.
 for i in 0 1 3; do
     name=${NAMES[$i]}; bin=${BINS[$i]}
     [ -x "$bin" ] || continue
-    "$bin" --mtp-exact-sampling --mtp /dev/null -m /dev/null \
+    "$bin" --mtp-exact-sampling --mtp-model /dev/null -m /dev/null \
         > "$LOG" 2>&1
     rc=$?
     if [ $rc -ne 0 ] && ! grep -q "unknown option" "$LOG"; then
@@ -70,6 +97,31 @@ for i in 0 1 3; do
     else
         fail "$name rejected --mtp-exact-sampling in option parsing"
     fi
+done
+
+# Embedded MTP uses one family-neutral switch; external support has its own
+# file option. The old GLM-specific spellings are intentionally rejected.
+for i in 0 1 3; do
+    name=${NAMES[$i]}; bin=${BINS[$i]}
+    [ -x "$bin" ] || continue
+    for flag in --mtp --mtp-timing; do
+        "$bin" "$flag" -m /dev/null > "$LOG" 2>&1
+        rc=$?
+        if [ $rc -ne 0 ] && ! grep -q "unknown option" "$LOG"; then
+            ok "$name parses $flag"
+        else
+            fail "$name rejected $flag in option parsing"
+        fi
+    done
+    for flag in --glm-mtp --glm-mtp-timing; do
+        "$bin" "$flag" -m /dev/null > "$LOG" 2>&1
+        rc=$?
+        if [ $rc -ne 0 ] && grep -q "unknown option" "$LOG"; then
+            ok "$name rejects obsolete $flag"
+        else
+            fail "$name retained obsolete $flag"
+        fi
+    done
 done
 
 # The provisional DSpark-specific spelling was never released.
@@ -220,6 +272,59 @@ if [ -x ./ds4 ]; then
             fail "obsolete ${old_arg%% *} was not rejected"
         fi
     done
+fi
+
+# 6b: ds4-agent accepts the same TP coordinator flags as ds4. The worker role
+# remains a serving mode and is intentionally handled by ./ds4.
+if [ -x ./ds4-agent ]; then
+    ./ds4-agent --metal --tensor-parallel --role coordinator \
+        --listen 127.0.0.1 9911 --transport tcp \
+        --tensor-parallel-token-prefill --debug-hash 2 \
+        --rdma-device rdma-test --rdma-gid-index 0 \
+        --non-interactive -p test -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] &&
+       grep -qE "model file is too small|another ds4 process is already running" "$LOG" &&
+       ! grep -q "unknown option" "$LOG"; then
+        ok "ds4-agent tensor-parallel coordinator options reach model loading"
+    else
+        fail "ds4-agent tensor-parallel coordinator options did not reach model loading"
+        head -10 "$LOG" | sed 's/^/    /'
+    fi
+
+    ./ds4-agent --metal --tensor-parallel --role worker \
+        --coordinator 127.0.0.1 9911 -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && grep -q "serving mode; start workers with ./ds4" "$LOG"; then
+        ok "ds4-agent tensor-parallel worker directs users to ds4"
+    else
+        fail "ds4-agent tensor-parallel worker returned the wrong error"
+        head -10 "$LOG" | sed 's/^/    /'
+    fi
+
+    PROMPT_FILE=$(mktemp)
+    printf 'prompt file parser smoke\n' > "$PROMPT_FILE"
+    ./ds4-agent --non-interactive --prompt-file "$PROMPT_FILE" \
+        --raw-prompt -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] &&
+       grep -qE "model file is too small|another ds4 process is already running" "$LOG" &&
+       ! grep -q "unknown option" "$LOG"; then
+        ok "ds4-agent --prompt-file reaches model loading"
+    else
+        fail "ds4-agent --prompt-file did not reach model loading"
+        head -10 "$LOG" | sed 's/^/    /'
+    fi
+
+    ./ds4-agent --non-interactive -p inline --prompt-file "$PROMPT_FILE" \
+        -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && grep -q "specify only one" "$LOG"; then
+        ok "ds4-agent rejects two initial prompt sources"
+    else
+        fail "ds4-agent accepted two initial prompt sources"
+    fi
+    rm -f "$PROMPT_FILE"
 fi
 
 # 7: --gpu-vram 40,12 layout line.

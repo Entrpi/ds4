@@ -24,6 +24,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -39,11 +40,13 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 7u
+#define DS4_TP_PROTOCOL_VERSION 8u
 
-/* Default gate timeout is generous: the first gate after a sync waits for
- * the peer's whole (possibly cold page cache) prefill. */
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
+/* Once both ranks enter a Metal gate, a live exchange normally completes in
+ * microseconds. Fail well before Metal's command-buffer watchdog if the peer
+ * stalls while keeping its sockets open. */
+#define DS4_TP_DEFAULT_GATE_TIMEOUT_MS 750
 
 typedef struct {
     uint32_t magic;
@@ -67,6 +70,7 @@ typedef struct {
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
     uint32_t pad;
+    uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
 } ds4_tp_hello_fixed;
 
 typedef struct {
@@ -122,9 +126,10 @@ typedef struct {
  * RTR requires GRH addressing with the IPv4-mapped GID that appears only
  * once the Thunderbolt member interface has an IPv4 address of its own.
  * UC delivery is in-order and the gate sequence is globally deterministic
- * (86 gates per token, fixed order). After any initial bulk prefill, decode
- * keeps a receive window posted by sequence number: recv for seq s lands in
- * the slab in-slot (s-1) % slots and its completion IS the arrival signal. */
+ * (a model-fixed number of gates per token). After any initial bulk prefill,
+ * decode keeps a receive window posted by sequence number: recv for seq s
+ * lands in the slab in-slot (s-1) % slots and its completion is the arrival
+ * signal. */
 #define DS4_TP_RDMA_MAX_MSG 16384
 #define DS4_TP_RDMA_RECV_WINDOW 16
 #define DS4_TP_RDMA_BULK_SLOTS 64
@@ -165,6 +170,7 @@ struct ds4_tp {
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
+    uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
     uint8_t *slab;
     uint64_t slab_bytes;
     /* Slab regions, see ds4_tp.h layout comment. */
@@ -177,6 +183,7 @@ struct ds4_tp {
     uint64_t batch_out_off;     /* [layer][row] verify-block local partials */
     uint64_t batch_in_off;      /* [layer][row] verify-block peer partials */
     uint64_t timeout_sec;
+    uint64_t gate_timeout_ms;
     atomic_bool failed;
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma rdma;
@@ -246,6 +253,18 @@ static void tp_socket_tune(int fd) {
     int sz = 4 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+}
+
+static int tp_socket_set_gate_timeout(int fd, uint64_t timeout_ms) {
+    struct timeval tv = {
+        .tv_sec = (time_t)(timeout_ms / 1000u),
+        .tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u),
+    };
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0)
+        return 0;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0)
+        return 0;
+    return 1;
 }
 
 #ifdef DS4_TP_HAVE_VERBS
@@ -499,10 +518,6 @@ int ds4_tp_validate_engine_options(
         tp_set_err(err, errlen, "tensor parallelism requires the Metal backend");
         return 0;
     }
-    if (opt->ssd_streaming) {
-        tp_set_err(err, errlen, "tensor parallelism requires resident weights (no --ssd-streaming)");
-        return 0;
-    }
     if (opt->distributed.role != DS4_DISTRIBUTED_NONE) {
         tp_set_err(err, errlen, "tensor parallelism and --role distributed modes are exclusive");
         return 0;
@@ -572,6 +587,29 @@ uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer) {
 uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer) {
     return tp->batch_in_off +
            (uint64_t)layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
+}
+
+static uint32_t tp_gate_mask_count(
+        const uint64_t mask[DS4_TP_GATE_MASK_WORDS]) {
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < DS4_TP_GATE_MASK_WORDS; i++)
+        count += (uint32_t)__builtin_popcountll(mask[i]);
+    return count;
+}
+
+static int tp_gate_mask_fits(
+        const uint64_t mask[DS4_TP_GATE_MASK_WORDS],
+        uint32_t n_slots) {
+    for (uint32_t word = 0; word < DS4_TP_GATE_MASK_WORDS; word++) {
+        uint64_t bits = mask[word];
+        while (bits) {
+            const uint32_t slot =
+                word * 64u + (uint32_t)__builtin_ctzll(bits);
+            if (slot >= n_slots) return 0;
+            bits &= bits - 1u;
+        }
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------------
@@ -835,6 +873,24 @@ static const char *tp_wc_status_str(int status) {
  * (identity mapping); GLM's schedule from the hello skips dense layers
  * and the ATTN slots. */
 static uint32_t tp_gate_slot(const ds4_tp *tp, uint64_t seq) {
+    if (tp->gate_slot_mask[0] || tp->gate_slot_mask[1] ||
+        tp->gate_slot_mask[2]) {
+        uint32_t ordinal = (uint32_t)((seq - 1) % tp->gates_per_token);
+        for (uint32_t word = 0; word < DS4_TP_GATE_MASK_WORDS; word++) {
+            uint64_t bits = tp->gate_slot_mask[word];
+            const uint32_t count = (uint32_t)__builtin_popcountll(bits);
+            if (ordinal >= count) {
+                ordinal -= count;
+                continue;
+            }
+            while (ordinal > 0) {
+                bits &= bits - 1u;
+                ordinal--;
+            }
+            return word * 64u + (uint32_t)__builtin_ctzll(bits);
+        }
+        return tp->n_slots;
+    }
     if (tp->gates_per_token == 0)
         return (uint32_t)((seq - 1) % tp->n_slots);
     return tp->gate_slot_start +
@@ -878,27 +934,28 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
      * sides post/send strictly in seq order, so the k'th send always
      * matches the k'th recv; only the FINAL chunk carries the seq as
      * wr_id, so the arrival watermark advances when the slot is whole. */
-    uint64_t off = 0;
-    while (off < tp->vec_bytes) {
+    struct ibv_sge sge[2];
+    struct ibv_recv_wr wr[2];
+    memset(wr, 0, sizeof(wr));
+    uint32_t count = 0;
+    for (uint64_t off = 0; off < tp->vec_bytes; count++) {
         const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
             DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
         const int last = off + len == tp->vec_bytes;
-        struct ibv_sge sge;
-        struct ibv_recv_wr wr, *bad = NULL;
-        memset(&wr, 0, sizeof(wr));
-        sge.addr = base + off;
-        sge.length = (uint32_t)len;
-        sge.lkey = r->mr->lkey;
-        wr.wr_id = last ? seq : 0;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        if (ibv_post_recv(r->qp, &wr, &bad) != 0) {
-            fprintf(stderr, "ds4-tp: rdma post_recv(seq %llu off %llu): %s\n",
-                    (unsigned long long)seq, (unsigned long long)off,
-                    strerror(errno));
-            return 0;
-        }
+        sge[count].addr = base + off;
+        sge[count].length = (uint32_t)len;
+        sge[count].lkey = r->mr->lkey;
+        wr[count].wr_id = last ? seq : 0;
+        wr[count].sg_list = &sge[count];
+        wr[count].num_sge = 1;
+        if (count != 0) wr[count - 1u].next = &wr[count];
         off += len;
+    }
+    struct ibv_recv_wr *bad = NULL;
+    if (ibv_post_recv(r->qp, wr, &bad) != 0) {
+        fprintf(stderr, "ds4-tp: rdma post_recv(seq %llu): %s\n",
+                (unsigned long long)seq, strerror(errno));
+        return 0;
     }
     return 1;
 }
@@ -926,38 +983,45 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
             ok = tp_rdma_post_gate_recv(tp, s);
         if (ok) r->recv_window_active = true;
     }
-    for (uint64_t off = 0; ok && off < tp->vec_bytes; ) {
+    struct ibv_sge send_sge[2];
+    struct ibv_send_wr send_wr[2];
+    memset(send_wr, 0, sizeof(send_wr));
+    uint32_t send_count = 0;
+    for (uint64_t off = 0; ok && off < tp->vec_bytes; send_count++) {
         const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
             DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
-        struct ibv_sge sge;
-        struct ibv_send_wr wr, *bad = NULL;
-        memset(&wr, 0, sizeof(wr));
-        sge.addr = send_base + off;
-        sge.length = (uint32_t)len;
-        sge.lkey = r->mr->lkey;
-        wr.wr_id = seq;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.opcode = IBV_WR_SEND;
-        wr.send_flags = IBV_SEND_SIGNALED;
-        ok = ibv_post_send(r->qp, &wr, &bad) == 0;
+        send_sge[send_count].addr = send_base + off;
+        send_sge[send_count].length = (uint32_t)len;
+        send_sge[send_count].lkey = r->mr->lkey;
+        send_wr[send_count].wr_id = seq;
+        send_wr[send_count].sg_list = &send_sge[send_count];
+        send_wr[send_count].num_sge = 1;
+        send_wr[send_count].opcode = IBV_WR_SEND;
+        if (send_count != 0) send_wr[send_count - 1u].next = &send_wr[send_count];
+        off += len;
+    }
+    if (ok) {
+        send_wr[send_count - 1u].send_flags = IBV_SEND_SIGNALED;
+        struct ibv_send_wr *bad = NULL;
+        ok = ibv_post_send(r->qp, send_wr, &bad) == 0;
         if (!ok) {
             fprintf(stderr, "ds4-tp: rdma post_send: %s\n", strerror(errno));
         } else {
             r->send_outstanding++;
         }
-        off += len;
     }
 
     double deadline = 0.0;
     uint32_t peer_poll = 0;
     while (ok && r->recv_done < seq) {
         ok = tp_rdma_drain_cq(tp);
-        if (ok && (peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
+        if (ok && (++peer_poll & 0x3fffu) == 0 && tp_peer_closed(tp)) {
             fprintf(stderr, "ds4-tp: peer disconnected during RDMA gate\n");
             ok = 0;
         }
-        if (deadline == 0.0) deadline = tp_now_sec() + (double)tp->timeout_sec;
+        if (deadline == 0.0) {
+            deadline = tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
+        }
         else if (tp_now_sec() > deadline) {
             fprintf(stderr, "ds4-tp: timeout waiting gate seq %llu (recv_done %llu)\n",
                     (unsigned long long)seq, (unsigned long long)r->recv_done);
@@ -1026,7 +1090,8 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
 
     uint32_t recv_done = 0;
     int send_done = 0;
-    const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+    const double deadline =
+        tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
     uint32_t peer_poll = 0;
     while (recv_done < nwr || !send_done) {
         struct ibv_wc wc[DS4_TP_RDMA_RECV_WINDOW * 2u + 1u];
@@ -1167,7 +1232,8 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
 
         uint32_t recv_done = 0;
         int send_done = 0;
-        const double deadline = tp_now_sec() + (double)tp->timeout_sec;
+        const double deadline =
+            tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
         uint32_t peer_poll = 0;
         while (recv_done < chunks || !send_done) {
             struct ibv_wc wc[DS4_TP_RDMA_BULK_SLOTS + 1u];
@@ -1256,6 +1322,8 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         .gate_slot_step = id->gate_slot_step,
         .gates_per_token = id->gates_per_token,
     };
+    memcpy(mine.gate_slot_mask, id->gate_slot_mask,
+           sizeof(mine.gate_slot_mask));
     ds4_tp_hello_fixed theirs;
     if (!tp_write_full(tp->control_fd, &mine, sizeof(mine)) ||
         !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
@@ -1280,7 +1348,9 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         theirs.n_vocab != mine.n_vocab || theirs.quant_bits != mine.quant_bits ||
         theirs.gate_slot_start != mine.gate_slot_start ||
         theirs.gate_slot_step != mine.gate_slot_step ||
-        theirs.gates_per_token != mine.gates_per_token) {
+        theirs.gates_per_token != mine.gates_per_token ||
+        memcmp(theirs.gate_slot_mask, mine.gate_slot_mask,
+               sizeof(mine.gate_slot_mask)) != 0) {
         tp_set_err(err, errlen,
                    "tp hello: model mismatch (peer gguf=%llu id=%u layers=%u embd=%u "
                    "vocab=%u qbits=%u)",
@@ -1288,14 +1358,25 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
                    theirs.n_layer, theirs.n_embd, theirs.n_vocab, theirs.quant_bits);
         return 0;
     }
+    const uint32_t mask_count = tp_gate_mask_count(mine.gate_slot_mask);
+    const uint32_t n_slots = mine.n_layer * DS4_TP_GATES_PER_LAYER;
+    if ((mask_count != 0 && mask_count != mine.gates_per_token) ||
+        !tp_gate_mask_fits(mine.gate_slot_mask, n_slots)) {
+        tp_set_err(err, errlen,
+                   "tp hello: invalid gate schedule mask (%u bits, %u gates, %u slots)",
+                   mask_count, mine.gates_per_token, n_slots);
+        return 0;
+    }
     tp->peer_ctx = theirs.ctx_size;
     tp->n_layer = id->n_layer;
     tp->n_embd = id->n_embd;
     tp->vec_bytes = (uint64_t)id->n_embd * sizeof(float);
-    tp->n_slots = id->n_layer * DS4_TP_GATES_PER_LAYER;
+    tp->n_slots = n_slots;
     tp->gate_slot_start = id->gate_slot_start;
     tp->gate_slot_step = id->gate_slot_step;
     tp->gates_per_token = id->gates_per_token;
+    memcpy(tp->gate_slot_mask, id->gate_slot_mask,
+           sizeof(tp->gate_slot_mask));
     tp_slab_layout(tp);
     /* Transport decision: RDMA only when both sides can. */
     int want_rdma = tp->opt.transport != DS4_TP_TRANSPORT_TCP;
@@ -1328,6 +1409,12 @@ int ds4_tp_create(
     tp->timeout_sec = DS4_TP_DEFAULT_TIMEOUT_SEC;
     const char *tmo = getenv("DS4_TP_TIMEOUT_SEC");
     if (tmo) tp->timeout_sec = (uint64_t)atoi(tmo);
+    tp->gate_timeout_ms = DS4_TP_DEFAULT_GATE_TIMEOUT_MS;
+    const char *gate_tmo = getenv("DS4_TP_GATE_TIMEOUT_MS");
+    if (gate_tmo) {
+        const long value = strtol(gate_tmo, NULL, 10);
+        if (value > 0 && value <= 60000) tp->gate_timeout_ms = (uint64_t)value;
+    }
 
     int rdma_ok = 0;
 #ifdef DS4_TP_HAVE_VERBS
@@ -1377,11 +1464,16 @@ int ds4_tp_create(
             if (tp->data_fd < 0) goto fail;
         }
         tp_socket_tune(tp->data_fd);
+        if (!tp_socket_set_gate_timeout(tp->data_fd, tp->gate_timeout_ms)) {
+            tp_set_err(err, errlen, "tp data socket timeout: %s", strerror(errno));
+            goto fail;
+        }
     }
     if (listener >= 0) close(listener);
-    fprintf(stderr, "ds4-tp: %s connected, transport=%s\n",
+    fprintf(stderr, "ds4-tp: %s connected, transport=%s gate-timeout=%llums\n",
             tp->rank == 0 ? "worker" : "leader",
-            tp->rdma_active ? "rdma" : "tcp");
+            tp->rdma_active ? "rdma" : "tcp",
+            (unsigned long long)tp->gate_timeout_ms);
     *out = tp;
     return 1;
 fail:
@@ -2037,7 +2129,8 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
     ds4_engine_tp_gate_schedule(engine,
                                 &id.gate_slot_start,
                                 &id.gate_slot_step,
-                                &id.gates_per_token);
+                                &id.gates_per_token,
+                                id.gate_slot_mask);
 
     ds4_tp *tp = NULL;
     if (!ds4_tp_create(&tp, opt, &id, err, sizeof(err))) {

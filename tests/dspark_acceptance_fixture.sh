@@ -111,7 +111,7 @@ print_metadata() {
         "$REQUIRE_DIRECT" "$REQUIRE_IDENTICAL"
     printf '# baseline_command=%s -m %s --tokens %s --temp %s --top-p %s --min-p %s --seed %s --nothink -p <fixture-prompt>\n' \
         "$DS4_BIN" "$MODEL" "$TOKENS" "$TEMPERATURE" "$TOP_P" "$MIN_P" "$SEED"
-    printf '# dspark_command=DS4_DSPARK_STATS=1 %s --dspark%s%s -m %s --mtp %s --tokens %s --temp %s --top-p %s --min-p %s --seed %s --nothink -p <fixture-prompt>\n' \
+    printf '# dspark_command=DS4_DSPARK_STATS=1 %s --dspark%s%s -m %s --mtp-model %s --tokens %s --temp %s --top-p %s --min-p %s --seed %s --nothink -p <fixture-prompt>\n' \
         "$DS4_BIN" "${exact_sampling_arg:+ $exact_sampling_arg}" \
         "${CONFIDENCE:+ --dspark-confidence $CONFIDENCE}" \
         "$MODEL" "$SUPPORT" "$TOKENS" "$TEMPERATURE" "$TOP_P" "$MIN_P" "$SEED"
@@ -150,14 +150,14 @@ run_case() {
         DS4_DSPARK_STATS=1 \
         "$DS4_BIN" --dspark $exact_sampling_arg \
             --dspark-confidence "$CONFIDENCE" \
-            -m "$MODEL" --mtp "$SUPPORT" \
+            -m "$MODEL" --mtp-model "$SUPPORT" \
             --tokens "$TOKENS" --temp "$TEMPERATURE" --top-p "$TOP_P" \
             --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt" \
             >"$dspark_out" 2>"$dspark_err"
     else
         DS4_DSPARK_STATS=1 \
         "$DS4_BIN" --dspark $exact_sampling_arg \
-            -m "$MODEL" --mtp "$SUPPORT" \
+            -m "$MODEL" --mtp-model "$SUPPORT" \
             --tokens "$TOKENS" --temp "$TEMPERATURE" --top-p "$TOP_P" \
             --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt" \
             >"$dspark_out" 2>"$dspark_err"

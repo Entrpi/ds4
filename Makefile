@@ -7,6 +7,7 @@ else
 NATIVE_CPU_FLAG ?= -march=native
 endif
 SAMPLING_TEST := tests/test_sampling
+GLM53_KDA_TEST := tests/test_glm53_kda
 
 DEBUG_FLAGS ?= -g
 CFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c99
@@ -97,7 +98,7 @@ ds4-eval: ds4_eval.o ds4_help.o $(CORE_OBJS)
 ds4-agent: ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_agent.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args.o $(CORE_OBJS) $(METAL_LDLIBS)
 
-gguf-tools/quality-testing/score_official: gguf-tools/quality-testing/score_official.c ds4.h $(CORE_OBJS) rax.o ds4_gpu_args.o
+gguf-tools/quality-testing/score_official: gguf-tools/quality-testing/score_official.c ds4.h ds4_distributed.h ds4_tp.h $(CORE_OBJS) rax.o ds4_gpu_args.o
 	$(CC) $(QUALITY_CFLAGS) -I. -o $@ gguf-tools/quality-testing/score_official.c $(CORE_OBJS) rax.o ds4_gpu_args.o $(METAL_LDLIBS)
 
 tests/test_metal_session_batch.o: tests/test_metal_session_batch.c ds4.h
@@ -275,7 +276,7 @@ ds4_bench.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
 ds4_eval.o: ds4_eval.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_eval.c
 
-ds4_agent.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
+ds4_agent.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_agent.c
 
 ds4_web.o: ds4_web.c ds4_web.h
@@ -287,7 +288,7 @@ ds4_kvstore.o: ds4_kvstore.c ds4_kvstore.h ds4.h ds4_ssd.h
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
-ds4_agent_test.o: tests/ds4_agent_test.c ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
+ds4_agent_test.o: tests/ds4_agent_test.c ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_agent_test.c
 
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
@@ -322,6 +323,21 @@ ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kv
 
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
+
+tests/test_glm53_kda.o: tests/test_glm53_kda.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_glm53_kda.c
+
+ifeq ($(UNAME_S),Darwin)
+$(GLM53_KDA_TEST): tests/test_glm53_kda.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+else
+$(GLM53_KDA_TEST): tests/test_glm53_kda.o ds4_cuda.o $(MMQ_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+endif
+
+.PHONY: test-glm53-kda
+test-glm53-kda: $(GLM53_KDA_TEST)
+	./$(GLM53_KDA_TEST)
 
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu

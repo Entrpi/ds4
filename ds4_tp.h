@@ -45,14 +45,17 @@ typedef struct {
     uint32_t quant_bits;
     uint32_t ctx_size;
     /* Decode gate schedule, used to place RDMA recvs into the right slab
-     * slot: slot(seq) = start + ((seq-1) % per_token) * step.
+     * slot. A nonempty mask lists the exact slots in firing order; otherwise
+     * slot(seq) = start + ((seq-1) % per_token) * step.
      * per_token 0 falls back to the identity mapping over all slots
      * (DS4: every layer fires ATTN then FFN). GLM fires one FFN gate per
-     * sparse layer only, so its schedule skips the dense prefix and the
-     * ATTN slots. Exchanged in the hello; both sides must agree. */
+     * sparse layer in streaming mode. Hybrid GLM-5.3 uses the mask because
+     * DSA layers also fire ATTN while KDA layers do not. Exchanged in the
+     * hello; both sides must agree. */
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
+    uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
 } ds4_tp_identity;
 
 bool ds4_tp_enabled(const ds4_tp_options *opt);
