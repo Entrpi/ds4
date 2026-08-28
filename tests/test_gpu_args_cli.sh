@@ -49,6 +49,12 @@ for i in "${!BINS[@]}"; do
         "$bin" --help runtime > "$LOG" 2>&1 || true
         assert_grep "$name --help runtime mentions --mtp-exact-sampling" \
             "mtp-exact-sampling" "$LOG"
+    else
+        "$bin" --help runtime > "$LOG" 2>&1 || true
+        assert_grep "$name --help runtime mentions --mtp" "--mtp FILE" "$LOG"
+        assert_grep "$name --help runtime mentions --dspark" "--dspark" "$LOG"
+        assert_grep "$name --help runtime mentions --dspark-confidence" \
+            "--dspark-confidence" "$LOG"
     fi
     if [ "$name" = "ds4" ]; then
         "$bin" --help distributed > "$LOG" 2>&1 || true
@@ -58,7 +64,27 @@ for i in "${!BINS[@]}"; do
     fi
 done
 
-# 1b: exact DSpark sampling is parsed by every frontend that can run DSpark.
+# 1b: ds4-bench accepts the basic DSpark options before model loading.
+if [ -x ./ds4-bench ]; then
+    ./ds4-bench --dspark --dspark-confidence 0 --mtp /dev/null \
+        -m /dev/null --prompt-file /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && ! grep -q "unknown option" "$LOG"; then
+        ok "ds4-bench parses basic DSpark options"
+    else
+        fail "ds4-bench rejected basic DSpark options in option parsing"
+    fi
+
+    ./ds4-bench --dspark -m /dev/null --prompt-file /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -eq 2 ] && grep -q -- "--dspark requires --mtp FILE" "$LOG"; then
+        ok "ds4-bench requires a DSpark support model"
+    else
+        fail "ds4-bench did not reject --dspark without --mtp"
+    fi
+fi
+
+# 1c: exact DSpark sampling is parsed by every frontend that can run DSpark.
 for i in 0 1 3; do
     name=${NAMES[$i]}; bin=${BINS[$i]}
     [ -x "$bin" ] || continue

@@ -27,6 +27,7 @@
 
 typedef struct {
     const char *model_path;
+    const char *mtp_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -58,6 +59,9 @@ typedef struct {
     bool ssd_streaming_full_layers_set;
     bool cuda_tensor_parallel;
     bool show_output;
+    bool dspark;
+    bool dspark_confidence_threshold_set;
+    float dspark_confidence_threshold;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -236,6 +240,19 @@ static bench_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp")) {
+            c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark")) {
+            c.dspark = true;
+        } else if (!strcmp(arg, "--dspark-confidence")) {
+            const double v = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v < 0.0 || v > 1.0) {
+                fprintf(stderr, "ds4-bench: --dspark-confidence must be between 0 and 1\n");
+                exit(2);
+            }
+            c.dspark = true;
+            c.dspark_confidence_threshold = (float)v;
+            c.dspark_confidence_threshold_set = true;
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -337,6 +354,10 @@ static bench_config parse_options(int argc, char **argv) {
 
     if (!!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
+        exit(2);
+    }
+    if (c.dspark && !c.mtp_path) {
+        fprintf(stderr, "ds4-bench: --dspark requires --mtp FILE\n");
         exit(2);
     }
     if (c.ctx_start > c.ctx_max) {
@@ -576,6 +597,7 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
@@ -588,6 +610,9 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .dspark = cfg.dspark,
+        .dspark_confidence_threshold = cfg.dspark_confidence_threshold,
+        .dspark_confidence_threshold_set = cfg.dspark_confidence_threshold_set,
         .cuda_tensor_parallel = cfg.cuda_tensor_parallel,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
@@ -673,6 +698,20 @@ int main(int argc, char **argv) {
 
     const int eos = ds4_token_eos(engine);
     const bool distributed = cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR;
+    const bool speculative = cfg.dspark && ds4_engine_mtp_draft_tokens(engine) > 1;
+    if (cfg.dspark && !speculative) {
+        fprintf(stderr, "ds4-bench: DSpark support model did not enable speculative decoding\n");
+        if (out != stdout) fclose(out);
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return 1;
+    }
+    if (speculative) {
+        fprintf(stderr,
+                "ds4-bench: DSpark enabled with draft width %d; frontier restoration uses prefix replay\n",
+                ds4_engine_mtp_draft_tokens(engine));
+    }
     ds4_session_snapshot snap = {0};
     const uint64_t snapshot_max_bytes = bench_snapshot_max_bytes();
     bool warned_large_snapshot = false;
@@ -705,7 +744,7 @@ int main(int argc, char **argv) {
         const bool need_restore_after_generation =
             cfg.gen_tokens > 0 && frontier < cfg.ctx_max;
         bool have_snapshot = false;
-        if (need_restore_after_generation && !distributed &&
+        if (need_restore_after_generation && !distributed && !speculative &&
             getenv("DS4_BENCH_DISABLE_SNAPSHOT") == NULL) {
             const uint64_t payload_bytes = ds4_session_payload_bytes(session);
             const bool large_snapshot_forced =
@@ -732,12 +771,14 @@ int main(int argc, char **argv) {
         const double gen_t0 = bench_now_sec();
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
+        int gen_first_tokens = 0;
         int gen_done = 0;
         int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
             : NULL;
         int gen_token_count = 0;
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        bool generation_stop = false;
+        while (gen_done < cfg.gen_tokens && !generation_stop) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -750,16 +791,48 @@ int main(int argc, char **argv) {
                 break;
             }
             const double token_t0 = bench_now_sec();
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
-                rc = 1;
-                break;
+            int toks[17];
+            int ntok = 1;
+            if (speculative) {
+                ntok = ds4_session_eval_speculative_argmax(
+                    session, token, cfg.gen_tokens - gen_done, eos,
+                    toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                    err, sizeof(err));
+                if (ntok < 0) {
+                    fprintf(stderr, "ds4-bench: DSpark decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                if (ntok == 0) {
+                    fprintf(stderr, "ds4-bench: DSpark decode at frontier %d accepted no tokens\n", frontier);
+                    rc = 1;
+                    break;
+                }
+            } else {
+                toks[0] = token;
+                if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
             }
             const double token_t1 = bench_now_sec();
-            if (i == 0) gen_first_sec = token_t1 - token_t0;
-            else gen_steady_sec += token_t1 - token_t0;
-            if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
-            gen_done++;
+            int cycle_tokens = 0;
+            for (int j = 0; j < ntok && gen_done < cfg.gen_tokens; j++) {
+                if (toks[j] == eos) {
+                    generation_stop = true;
+                    break;
+                }
+                if (gen_token_buf) gen_token_buf[gen_token_count++] = toks[j];
+                gen_done++;
+                cycle_tokens++;
+            }
+            if (gen_first_tokens == 0) {
+                gen_first_sec = token_t1 - token_t0;
+                gen_first_tokens = cycle_tokens;
+            } else {
+                gen_steady_sec += token_t1 - token_t0;
+            }
         }
         const double gen_t1 = bench_now_sec();
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
@@ -795,7 +868,8 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
-        const int gen_steady_tokens = gen_done > 1 ? gen_done - 1 : 0;
+        const int gen_steady_tokens = gen_done > gen_first_tokens ?
+            gen_done - gen_first_tokens : 0;
         fprintf(out,
                 "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
                 frontier,

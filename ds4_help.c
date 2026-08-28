@@ -175,9 +175,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096.");
     if (full) {
-        if (tool != DS4_HELP_BENCH) {
-            opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
-        }
+        opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
@@ -187,6 +185,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Greedy/opportunistic default: Metal 0.6, CUDA/ROCm 0.7; exact sampling: 0.8");
             opt(fp, c, "--mtp-exact-sampling", "DFlash: preserve the ordinary temperature distribution instead of accepting target-matching greedy drafts directly.");
             opt(fp, c, "--dspark-strict", "Load DSpark support but keep target-only decode.");
+        } else if (tool == DS4_HELP_BENCH) {
+            opt(fp, c, "--dspark", "Benchmark greedy DSpark using the support GGUF passed with --mtp.");
+            opt(fp, c, "--dspark-confidence F", "DSpark confidence pruning threshold 0..1.");
         }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
