@@ -61596,6 +61596,7 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
         }
         const bool confidence_ready =
             !lazy_runtime_confidence &&
+            confidence_threshold > 0.0f &&
             markov_ok &&
             dspark_confidence_probe_ready(dw);
         if (confidence_ready) {
