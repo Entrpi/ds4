@@ -1348,7 +1348,49 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                 "ds4: ROCm attention output B WMMA failed: %s; falling back\n",
                                 cudaGetErrorString(launch_err));
                     }
-                    st = cublasGemmEx(g_cublas,
+                    st = (cublasStatus_t)-1;
+#ifdef __HIP_PLATFORM_AMD__
+                    if (g_dspark_verify_mode && n_tokens >= 5u && n_tokens <= 6u &&
+                        out_b_f16_t != NULL && out_dim == 4096u && low_dim == 8192u &&
+                        g_rocblas_ready &&
+                        g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E &&
+                        !__atomic_load_n(&g_rocblas_dspark_attention_b_solution_disabled,
+                                         __ATOMIC_RELAXED) &&
+                        ds4_rocm_gfx1151_flag("DS4_ROCM_F16_Q4_SOLUTIONS")) {
+                        const rocblas_status rst = rocblas_gemm_ex(
+                                g_rocblas,
+                                rocblas_operation_none,
+                                rocblas_operation_none,
+                                (rocblas_int)out_dim,
+                                (rocblas_int)n_tokens,
+                                (rocblas_int)low_dim,
+                                &alpha,
+                                out_b_f16_t,
+                                rocblas_datatype_f16_r,
+                                (rocblas_int)out_dim,
+                                low_h,
+                                rocblas_datatype_f16_r,
+                                (rocblas_int)low_dim,
+                                &beta0,
+                                out->ptr,
+                                rocblas_datatype_f32_r,
+                                (rocblas_int)out_dim,
+                                out->ptr,
+                                rocblas_datatype_f32_r,
+                                (rocblas_int)out_dim,
+                                rocblas_datatype_f32_r,
+                                rocblas_gemm_algo_solution_index,
+                                (rocblas_int)-401,
+                                0u);
+                        if (rst == rocblas_status_success) {
+                            st = CUBLAS_STATUS_SUCCESS;
+                        } else {
+                            __atomic_store_n(&g_rocblas_dspark_attention_b_solution_disabled,
+                                             1, __ATOMIC_RELAXED);
+                        }
+                    }
+#endif
+                    if (st != CUBLAS_STATUS_SUCCESS) st = cublasGemmEx(g_cublas,
                                       b_op,
                                       CUBLAS_OP_N,
                                       (int)out_dim,

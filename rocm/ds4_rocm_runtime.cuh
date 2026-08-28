@@ -29,6 +29,7 @@ enum {
 };
 static int g_rocblas_f16_solution_set;
 static int g_rocblas_f16_solutions_disabled;
+static int g_rocblas_dspark_attention_b_solution_disabled;
 #include "ds4_rocm_hipblaslt.cuh"
 #endif
 static int g_quality_mode;
@@ -5867,6 +5868,7 @@ extern "C" int ds4_gpu_init(void) {
             }
         }
         __atomic_store_n(&g_rocblas_f16_solutions_disabled, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_rocblas_dspark_attention_b_solution_disabled, 0, __ATOMIC_RELAXED);
         g_rocblas_ready = 1;
     }
     if (!g_hipblaslt_ready) {
@@ -5897,6 +5899,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_rocblas = NULL;
         g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_NONE;
         __atomic_store_n(&g_rocblas_f16_solutions_disabled, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_rocblas_dspark_attention_b_solution_disabled, 0, __ATOMIC_RELAXED);
     }
     if (g_hipblaslt_ready) {
         (void)hipblasLtDestroy(g_hipblaslt);

@@ -131,6 +131,16 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
     return ds4_rocm_is_gfx1151();
 }
 
+extern "C" int ds4_gpu_dspark_gfx1151_attention_b_solution_enabled(void) {
+    return ds4_rocm_is_gfx1151() &&
+           g_rocblas_ready &&
+           g_rocblas_f16_solution_set ==
+               DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E &&
+           !__atomic_load_n(&g_rocblas_dspark_attention_b_solution_disabled,
+                            __ATOMIC_RELAXED) &&
+           ds4_rocm_gfx1151_flag("DS4_ROCM_F16_Q4_SOLUTIONS");
+}
+
 #include "rocm/ds4_rocm_q8.cuh"
 
 #include "rocm/ds4_rocm_norm_rope.cuh"
