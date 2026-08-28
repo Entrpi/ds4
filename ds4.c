@@ -58412,7 +58412,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
         const bool support_model_runtime_ready =
             e->mtp_ready ||
             (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
+        bool support_uses_secondary_rocm_cache = false;
+#ifdef DS4_ROCM_BUILD
+        /* The generic range cache is already keyed by model map. Keep the
+         * resident target ranges when adding DSpark support on gfx1151. */
+        support_uses_secondary_rocm_cache =
+            e->support_kind == DS4_SUPPORT_DSPARK &&
+            ds4_gpu_dspark_gfx1151_fast_path() != 0;
+#endif
         if (support_model_runtime_ready &&
+            !support_uses_secondary_rocm_cache &&
             !ds4_gpu_set_model_map_range(e->mtp_model.map,
                                            e->mtp_model.size,
                                            e->mtp_model.tensor_data_pos,
