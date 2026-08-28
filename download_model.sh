@@ -22,6 +22,7 @@ GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
 GLM53_Q2_FILE="GLM-5.3-Flash-Q2.gguf"
 GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"
 GLM53_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
+GLM53_VISION_FILE="glm-5.3-vision-encoder.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -52,6 +53,7 @@ Usage:
   ./download_model.sh glm53-q2 [--token TOKEN]
   ./download_model.sh glm53-q4 [--token TOKEN]
   ./download_model.sh glm53-fp8 [--token TOKEN]
+  ./download_model.sh glm53-vision [--token TOKEN]
 
 Targets:
 
@@ -123,6 +125,10 @@ Targets:
        Text-only GLM 5.3 Flash native FP8 GGUF, about 305 GiB on disk. It
        preserves the released weights without requantization. DwarfStar
        inference support for this paired FP8-code/scale format is pending.
+
+  glm53-vision
+       GLM 5.3 Flash vision encoder, about 1.1 GB on disk. Load it separately
+       with --vision; this target does not update ./ds4flash.gguf.
 
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
@@ -211,6 +217,12 @@ case "$MODEL" in
     glm53-fp8)
         REPO=$GLM53_REPO
         MODEL_FILE=$GLM53_FP8_FILE
+        FORCE_HF_DOWNLOAD=1
+        LINK_MODEL=0
+        ;;
+    glm53-vision)
+        REPO=$GLM53_REPO
+        MODEL_FILE=$GLM53_VISION_FILE
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
         ;;

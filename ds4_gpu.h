@@ -2913,6 +2913,63 @@ int ds4_gpu_glm53_matmul_bf16(
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
 
+#define DS4_GLM53_VISION_LAYERS 24u
+
+typedef struct {
+    uint64_t norm1;
+    uint64_t qkv_weight;
+    uint64_t qkv_bias;
+    uint64_t q_norm;
+    uint64_t k_norm;
+    uint64_t attn_proj_weight;
+    uint64_t attn_proj_bias;
+    uint64_t norm2;
+    uint64_t gate_weight;
+    uint64_t gate_bias;
+    uint64_t up_weight;
+    uint64_t up_bias;
+    uint64_t down_weight;
+    uint64_t down_bias;
+} ds4_glm53_vision_layer_weights;
+
+typedef struct {
+    uint64_t patch_weight;
+    uint64_t patch_bias;
+    uint64_t post_norm;
+    uint64_t downsample_weight;
+    uint64_t downsample_bias;
+    uint64_t merger_proj;
+    uint64_t merger_norm;
+    uint64_t merger_norm_bias;
+    uint64_t merger_gate;
+    uint64_t merger_up;
+    uint64_t merger_down;
+    ds4_glm53_vision_layer_weights layer[DS4_GLM53_VISION_LAYERS];
+} ds4_glm53_vision_weights;
+
+/* Encode normalized, block-major image patches into 4096-wide language-model
+ * embeddings. The Metal implementation keeps every intermediate on device. */
+int ds4_gpu_glm53_vision_encode(
+        float                          *out,
+        const float                    *patches,
+        uint32_t                        grid_h,
+        uint32_t                        grid_w,
+        const void                     *model_map,
+        uint64_t                        model_size,
+        const ds4_glm53_vision_weights *weights);
+
+/* Replace token rows with projected image embeddings and repeat each row into
+ * every GLM hyperconnection stream. Must be called in an active command batch. */
+int ds4_gpu_glm53_scatter_image_hc(
+        ds4_gpu_tensor       *hc,
+        const ds4_gpu_tensor *image,
+        uint32_t              dst_row,
+        uint32_t              image_row,
+        uint32_t              rows,
+        uint32_t              total_rows,
+        uint32_t              n_embd,
+        uint32_t              n_hc);
+
 /* GLM-5.3 Kimi Delta Attention. Recurrent and convolution state stay FP32. */
 int ds4_gpu_glm53_kda_decode(
         ds4_gpu_tensor       *out,

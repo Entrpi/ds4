@@ -267,6 +267,35 @@ make cuda-spark
 Q4 does not fit one Spark, and Spark-to-Spark RDMA tensor parallelism is not
 implemented.
 
+### Vision
+
+GLM 5.3 Flash vision uses a separate 1.1 GB encoder. The text GGUF stays the
+same, and vision is enabled only when the sidecar is passed explicitly:
+
+```sh
+./download_model.sh glm53-vision
+./ds4 -m gguf/GLM-5.3-Flash-Q2.gguf \
+  --vision gguf/glm-5.3-vision-encoder.gguf
+```
+
+The published encoder SHA-256 is
+`ae23e14c6979e889051b2e4a39351abcdafb161e18e606fae4d8c40095a4bf3a`.
+
+In the interactive CLI, `/read photo.jpg` or `/read image.png` submits the
+image as a user turn. `ds4-agent` exposes the same support as its `view_image`
+tool when started with `--vision`. JPEG and PNG decoding is built in; no image
+library is required.
+
+`ds4-server` accepts ordered image blocks in OpenAI Chat, Responses, and
+Anthropic requests. HTTP images must be inline: use a PNG/JPEG data URI for
+OpenAI or base64 image source for Anthropic. File paths and remote URLs are
+rejected. A request may contain up to 16 images and the HTTP body is limited to
+64 MiB.
+
+Vision currently runs on Metal. In two-Mac tensor parallel mode, pass the same
+`--vision` file on both the coordinator and worker; the coordinator encodes the
+image and sends the projected visual tokens to the worker.
+
 ## DSpark Speculative Decoding
 
 DSpark is an auxiliary draft model released by DeepSeek for DeepSeek V4 Flash.

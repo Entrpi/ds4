@@ -40,7 +40,7 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 8u
+#define DS4_TP_PROTOCOL_VERSION 9u
 
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
 /* Once both ranks enter a Metal gate, a live exchange normally completes in
@@ -1685,6 +1685,23 @@ typedef struct {
 
 typedef struct {
     uint64_t session_id;
+    uint32_t token_count;
+    uint32_t image_count;
+} ds4_tp_multimodal_command_header;
+
+typedef struct {
+    uint32_t token_start;
+    uint32_t token_count;
+    uint32_t data_width;
+    uint32_t width;
+    uint32_t height;
+    uint32_t content_width;
+    uint32_t content_height;
+    uint8_t fingerprint[32];
+} ds4_tp_vision_wire;
+
+typedef struct {
+    uint64_t session_id;
     int32_t value;
     uint32_t reserved;
 } ds4_tp_value_command;
@@ -1746,6 +1763,63 @@ int ds4_tp_send_sync(ds4_tp *tp, uint64_t session_id,
                      const int *tokens, uint32_t n_tokens) {
     return tp_send_token_command(tp, DS4_TP_FRAME_SYNC, session_id,
                                  tokens, n_tokens);
+}
+
+int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
+                                const int *tokens, uint32_t n_tokens,
+                                const ds4_vision_span *images,
+                                uint32_t image_count) {
+    uint64_t bytes64 = sizeof(ds4_tp_multimodal_command_header) +
+                       (uint64_t)n_tokens * sizeof(int32_t);
+    if (!tp || (!tokens && n_tokens) || (!images && image_count) ||
+        tp->n_embd == 0 || bytes64 > UINT32_MAX)
+        return 0;
+    for (uint32_t i = 0; i < image_count; i++) {
+        const uint64_t values = (uint64_t)images[i].embedding.token_count *
+                                tp->n_embd;
+        if (values > UINT64_MAX / sizeof(float)) return 0;
+        const uint64_t data_bytes = values * sizeof(float);
+        const uint64_t add_bytes = sizeof(ds4_tp_vision_wire) + data_bytes;
+        if (!images[i].embedding.data || add_bytes > UINT32_MAX ||
+            bytes64 > UINT32_MAX - add_bytes)
+            return 0;
+        bytes64 += add_bytes;
+    }
+    uint8_t *payload = malloc((size_t)bytes64);
+    if (!payload) return 0;
+    ds4_tp_multimodal_command_header h = {
+        session_id, n_tokens, image_count
+    };
+    memcpy(payload, &h, sizeof(h));
+    uint8_t *p = payload + sizeof(h);
+    int32_t *wire_tokens = (int32_t *)p;
+    for (uint32_t i = 0; i < n_tokens; i++) wire_tokens[i] = tokens[i];
+    p += (uint64_t)n_tokens * sizeof(int32_t);
+    for (uint32_t i = 0; i < image_count; i++) {
+        const ds4_vision_embedding *embedding = &images[i].embedding;
+        ds4_tp_vision_wire wire = {
+            images[i].token_start,
+            embedding->token_count,
+            tp->n_embd,
+            embedding->width,
+            embedding->height,
+            embedding->content_width,
+            embedding->content_height,
+            {0},
+        };
+        memcpy(wire.fingerprint, embedding->fingerprint,
+               sizeof(wire.fingerprint));
+        memcpy(p, &wire, sizeof(wire));
+        p += sizeof(wire);
+        uint64_t data_bytes = (uint64_t)embedding->token_count *
+                              tp->n_embd * sizeof(float);
+        memcpy(p, embedding->data, (size_t)data_bytes);
+        p += data_bytes;
+    }
+    int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_SYNC_MULTIMODAL,
+                           payload, (uint32_t)bytes64);
+    free(payload);
+    return ok;
 }
 
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
@@ -1846,6 +1920,9 @@ void ds4_tp_command_free(ds4_tp_command *command) {
     if (!command) return;
     free(command->tokens);
     free(command->items);
+    for (uint32_t i = 0; i < command->n_images; i++)
+        ds4_vision_embedding_free(&command->images[i].embedding);
+    free(command->images);
     memset(command, 0, sizeof(*command));
     command->type = DS4_TP_FRAME_ERROR;
 }
@@ -1872,6 +1949,79 @@ static int tp_command_decode_tokens(ds4_tp_command *command,
     return 1;
 }
 
+static int tp_command_decode_multimodal(ds4_tp *tp,
+                                        ds4_tp_command *command,
+                                        const uint8_t *payload,
+                                        uint32_t bytes,
+                                        char *err, size_t errlen) {
+    if (bytes < sizeof(ds4_tp_multimodal_command_header)) return 0;
+    ds4_tp_multimodal_command_header h;
+    memcpy(&h, payload, sizeof(h));
+    uint64_t pos = sizeof(h);
+    uint64_t token_bytes = (uint64_t)h.token_count * sizeof(int32_t);
+    if (pos + token_bytes > bytes) return 0;
+    if (h.image_count > ((uint64_t)bytes - pos - token_bytes) /
+                        sizeof(ds4_tp_vision_wire))
+        return 0;
+    int *tokens = malloc(h.token_count ?
+                         (size_t)h.token_count * sizeof(tokens[0]) : 1u);
+    ds4_vision_span *images = h.image_count ?
+        calloc(h.image_count, sizeof(images[0])) : NULL;
+    if (!tokens || (h.image_count && !images)) {
+        free(tokens);
+        free(images);
+        tp_set_err(err, errlen, "tp: multimodal command allocation failed");
+        return -1;
+    }
+    const int32_t *wire_tokens = (const int32_t *)(payload + pos);
+    for (uint32_t i = 0; i < h.token_count; i++) tokens[i] = wire_tokens[i];
+    pos += token_bytes;
+    for (uint32_t i = 0; i < h.image_count; i++) {
+        if (pos + sizeof(ds4_tp_vision_wire) > bytes) goto malformed;
+        ds4_tp_vision_wire wire;
+        memcpy(&wire, payload + pos, sizeof(wire));
+        pos += sizeof(wire);
+        uint64_t values = (uint64_t)wire.token_count * wire.data_width;
+        if (wire.token_count == 0 || wire.data_width != tp->n_embd ||
+            wire.width == 0 ||
+            values > SIZE_MAX / sizeof(float))
+            goto malformed;
+        uint64_t data_bytes = values * sizeof(float);
+        if (data_bytes > (uint64_t)bytes - pos) goto malformed;
+        images[i].token_start = wire.token_start;
+        images[i].embedding.data = malloc((size_t)data_bytes);
+        if (!images[i].embedding.data) {
+            tp_set_err(err, errlen, "tp: image embedding allocation failed");
+            goto allocation_failed;
+        }
+        images[i].embedding.token_count = wire.token_count;
+        images[i].embedding.width = wire.width;
+        images[i].embedding.height = wire.height;
+        images[i].embedding.content_width = wire.content_width;
+        images[i].embedding.content_height = wire.content_height;
+        memcpy(images[i].embedding.fingerprint, wire.fingerprint,
+               sizeof(wire.fingerprint));
+        memcpy(images[i].embedding.data, payload + pos, (size_t)data_bytes);
+        pos += data_bytes;
+    }
+    if (pos != bytes) goto malformed;
+    command->session_id = h.session_id;
+    command->tokens = tokens;
+    command->n_tokens = h.token_count;
+    command->images = images;
+    command->n_images = h.image_count;
+    return 1;
+
+malformed:
+    tp_set_err(err, errlen, "tp: malformed multimodal sync command");
+allocation_failed:
+    for (uint32_t i = 0; i < h.image_count; i++)
+        ds4_vision_embedding_free(&images[i].embedding);
+    free(images);
+    free(tokens);
+    return 0;
+}
+
 int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
                         char *err, size_t errlen) {
     memset(command, 0, sizeof(*command));
@@ -1895,6 +2045,10 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     case DS4_TP_FRAME_SYNC:
     case DS4_TP_FRAME_VERIFY:
         ok = tp_command_decode_tokens(command, payload, bytes, err, errlen);
+        break;
+    case DS4_TP_FRAME_SYNC_MULTIMODAL:
+        ok = tp_command_decode_multimodal(tp, command, payload, bytes,
+                                          err, errlen);
         break;
     case DS4_TP_FRAME_SESSION_CREATE:
     case DS4_TP_FRAME_REWIND: {
@@ -2214,12 +2368,17 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             break;
         }
 
-        if (command.type == DS4_TP_FRAME_SYNC) {
+        if (command.type == DS4_TP_FRAME_SYNC ||
+            command.type == DS4_TP_FRAME_SYNC_MULTIMODAL) {
             prompt.len = 0;
             for (uint32_t i = 0; i < command.n_tokens; i++) {
                 ds4_tokens_push(&prompt, command.tokens[i]);
             }
-            int sync_rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+            int sync_rc = command.type == DS4_TP_FRAME_SYNC_MULTIMODAL ?
+                ds4_session_sync_multimodal(session, &prompt,
+                                            command.images, command.n_images,
+                                            err, sizeof(err)) :
+                ds4_session_sync(session, &prompt, err, sizeof(err));
             if (!ds4_tp_send_command_ack(tp, command.session_id, sync_rc)) {
                 rc = 1;
             } else if (sync_rc != 0) {

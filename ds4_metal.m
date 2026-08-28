@@ -4335,6 +4335,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_FLASH_ATTN_SOURCE", @"metal/flash_attn.metal"],
         @[@"DS4_METAL_DENSE_SOURCE",      @"metal/dense.metal"],
         @[@"DS4_METAL_GLM53_BF16_SOURCE", @"metal/glm53_bf16.metal"],
+        @[@"DS4_METAL_GLM53_VISION_SOURCE", @"metal/glm53_vision.metal"],
         @[@"DS4_METAL_GLM53_KDA_SOURCE",  @"metal/glm53_kda.metal"],
         @[@"DS4_METAL_MOE_SOURCE",        @"metal/moe.metal"],
         @[@"DS4_METAL_DSV4_HC_SOURCE",    @"metal/dsv4_hc.metal"],
@@ -43842,6 +43843,468 @@ int ds4_gpu_glm53_matmul_bf16(
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 BF16 matmul");
     }
+}
+
+typedef struct {
+    uint32_t width;
+    uint32_t rows;
+    float eps;
+} glm53_vision_rows_args;
+
+typedef struct {
+    uint32_t rows;
+    uint32_t grid_h;
+    uint32_t grid_w;
+    float eps;
+} glm53_vision_qkv_args;
+
+typedef struct {
+    uint32_t rows;
+    float scale;
+} glm53_vision_attention_args;
+
+typedef struct {
+    uint32_t dst_row;
+    uint32_t image_row;
+    uint32_t rows;
+    uint32_t total_rows;
+    uint32_t width;
+    uint32_t hc;
+} glm53_vision_scatter_args;
+
+static int glm53_vision_dispatch_rows(
+        const char           *kernel,
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              width,
+        uint32_t              rows,
+        float                 eps,
+        const char           *label) {
+    uint64_t inner = 0;
+    id<MTLBuffer> weight = glm53_gpu_weight_buffer(
+            model_map, model_size, weight_offset,
+            (uint64_t)width * sizeof(uint16_t), &inner, label);
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(kernel);
+    if (!weight || !pipeline) return 0;
+    glm53_vision_rows_args args = { width, rows, eps };
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(x)
+            offset:ds4_gpu_tensor_offset(x) atIndex:1];
+    [enc setBuffer:weight offset:(NSUInteger)inner atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(out)
+            offset:ds4_gpu_tensor_offset(out) atIndex:3];
+    [enc setThreadgroupMemoryLength:8u * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, label);
+}
+
+static int glm53_vision_dispatch_bias(
+        const char           *kernel,
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *residual,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              bias_offset,
+        uint32_t              width,
+        uint32_t              rows,
+        const char           *label) {
+    uint64_t inner = 0;
+    id<MTLBuffer> bias = glm53_gpu_weight_buffer(
+            model_map, model_size, bias_offset,
+            (uint64_t)width * sizeof(uint16_t), &inner, label);
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(kernel);
+    if (!bias || !pipeline) return 0;
+    glm53_vision_rows_args args = { width, rows, 0.0f };
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(x)
+            offset:ds4_gpu_tensor_offset(x) atIndex:1];
+    [enc setBuffer:bias offset:(NSUInteger)inner atIndex:2];
+    if (residual) {
+        [enc setBuffer:ds4_gpu_tensor_buffer(residual)
+                offset:ds4_gpu_tensor_offset(residual) atIndex:3];
+    }
+    [enc dispatchThreads:MTLSizeMake(width, rows, 1)
+         threadsPerThreadgroup:MTLSizeMake(MIN((NSUInteger)width, 256u), 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, label);
+}
+
+static int glm53_vision_dispatch_qkv(
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        const ds4_gpu_tensor *qkv,
+        const void           *model_map,
+        uint64_t              model_size,
+        const ds4_glm53_vision_layer_weights *w,
+        uint32_t              rows,
+        uint32_t              grid_h,
+        uint32_t              grid_w) {
+    uint64_t bias_inner = 0, q_inner = 0, k_inner = 0;
+    id<MTLBuffer> bias = glm53_gpu_weight_buffer(
+            model_map, model_size, w->qkv_bias, 3072u * sizeof(uint16_t),
+            &bias_inner, "vision QKV bias");
+    id<MTLBuffer> qw = glm53_gpu_weight_buffer(
+            model_map, model_size, w->q_norm, 64u * sizeof(uint16_t),
+            &q_inner, "vision Q norm");
+    id<MTLBuffer> kw = glm53_gpu_weight_buffer(
+            model_map, model_size, w->k_norm, 64u * sizeof(uint16_t),
+            &k_inner, "vision K norm");
+    id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_vision_qkv_rope");
+    if (!bias || !qw || !kw || !pipeline) return 0;
+    glm53_vision_qkv_args args = { rows, grid_h, grid_w, 1.0e-5f };
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(qkv)
+            offset:ds4_gpu_tensor_offset(qkv) atIndex:1];
+    [enc setBuffer:bias offset:(NSUInteger)bias_inner atIndex:2];
+    [enc setBuffer:qw offset:(NSUInteger)q_inner atIndex:3];
+    [enc setBuffer:kw offset:(NSUInteger)k_inner atIndex:4];
+    [enc setBuffer:ds4_gpu_tensor_buffer(q)
+            offset:ds4_gpu_tensor_offset(q) atIndex:5];
+    [enc setBuffer:ds4_gpu_tensor_buffer(k)
+            offset:ds4_gpu_tensor_offset(k) atIndex:6];
+    [enc setBuffer:ds4_gpu_tensor_buffer(v)
+            offset:ds4_gpu_tensor_offset(v) atIndex:7];
+    [enc dispatchThreadgroups:MTLSizeMake(rows, 16u, 1)
+         threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 vision QKV");
+}
+
+static int glm53_vision_dispatch_attention(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *k,
+        const ds4_gpu_tensor *v,
+        uint32_t              rows) {
+    id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_vision_attention");
+    if (!pipeline) return 0;
+    glm53_vision_attention_args args = { rows, 0.125f };
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(q)
+            offset:ds4_gpu_tensor_offset(q) atIndex:1];
+    [enc setBuffer:ds4_gpu_tensor_buffer(k)
+            offset:ds4_gpu_tensor_offset(k) atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(v)
+            offset:ds4_gpu_tensor_offset(v) atIndex:3];
+    [enc setBuffer:ds4_gpu_tensor_buffer(out)
+            offset:ds4_gpu_tensor_offset(out) atIndex:4];
+    [enc dispatchThreadgroups:MTLSizeMake(rows, 16u, 1)
+         threadsPerThreadgroup:MTLSizeMake(32u, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 vision attention");
+}
+
+static int glm53_vision_dispatch_swiglu_bias(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *up,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_bias_offset,
+        uint64_t              up_bias_offset,
+        uint32_t              width,
+        uint32_t              rows) {
+    uint64_t gate_inner = 0, up_inner = 0;
+    id<MTLBuffer> gate_bias = glm53_gpu_weight_buffer(
+            model_map, model_size, gate_bias_offset,
+            (uint64_t)width * sizeof(uint16_t), &gate_inner,
+            "vision gate bias");
+    id<MTLBuffer> up_bias = glm53_gpu_weight_buffer(
+            model_map, model_size, up_bias_offset,
+            (uint64_t)width * sizeof(uint16_t), &up_inner,
+            "vision up bias");
+    id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_vision_swiglu_bias");
+    if (!gate_bias || !up_bias || !pipeline) return 0;
+    glm53_vision_rows_args args = { width, rows, 0.0f };
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(gate)
+            offset:ds4_gpu_tensor_offset(gate) atIndex:1];
+    [enc setBuffer:gate_bias offset:(NSUInteger)gate_inner atIndex:2];
+    [enc setBuffer:ds4_gpu_tensor_buffer(up)
+            offset:ds4_gpu_tensor_offset(up) atIndex:3];
+    [enc setBuffer:up_bias offset:(NSUInteger)up_inner atIndex:4];
+    [enc setBuffer:ds4_gpu_tensor_buffer(out)
+            offset:ds4_gpu_tensor_offset(out) atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(width, rows, 1)
+         threadsPerThreadgroup:MTLSizeMake(MIN((NSUInteger)width, 256u), 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 vision SwiGLU");
+}
+
+static int glm53_vision_dispatch_reorder(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t              rows) {
+    id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_vision_downsample_reorder");
+    if (!pipeline) return 0;
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBuffer:ds4_gpu_tensor_buffer(x)
+            offset:ds4_gpu_tensor_offset(x) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(out)
+            offset:ds4_gpu_tensor_offset(out) atIndex:1];
+    [enc dispatchThreads:MTLSizeMake(4096u, rows, 1)
+         threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 vision downsample reorder");
+}
+
+static int glm53_vision_dispatch_layernorm_gelu(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              bias_offset,
+        uint32_t              rows) {
+    uint64_t weight_inner = 0, bias_inner = 0;
+    id<MTLBuffer> weight = glm53_gpu_weight_buffer(
+            model_map, model_size, weight_offset, 4096u * sizeof(uint16_t),
+            &weight_inner, "vision merger norm");
+    id<MTLBuffer> bias = glm53_gpu_weight_buffer(
+            model_map, model_size, bias_offset, 4096u * sizeof(uint16_t),
+            &bias_inner, "vision merger norm bias");
+    id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_vision_layernorm_gelu");
+    if (!weight || !bias || !pipeline) return 0;
+    glm53_vision_rows_args args = { 4096u, rows, 1.0e-5f };
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(x)
+            offset:ds4_gpu_tensor_offset(x) atIndex:1];
+    [enc setBuffer:weight offset:(NSUInteger)weight_inner atIndex:2];
+    [enc setBuffer:bias offset:(NSUInteger)bias_inner atIndex:3];
+    [enc setBuffer:ds4_gpu_tensor_buffer(out)
+            offset:ds4_gpu_tensor_offset(out) atIndex:4];
+    [enc setThreadgroupMemoryLength:8u * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 vision merger norm");
+}
+
+int ds4_gpu_glm53_vision_encode(
+        float                          *out,
+        const float                    *patches,
+        uint32_t                        grid_h,
+        uint32_t                        grid_w,
+        const void                     *model_map,
+        uint64_t                        model_size,
+        const ds4_glm53_vision_weights *weights) {
+    if (!out || !patches || !model_map || !weights || grid_h == 0 || grid_w == 0 ||
+        (grid_h & 1u) != 0 || (grid_w & 1u) != 0 ||
+        grid_h > UINT32_MAX / grid_w || ds4_gpu_commands_active()) {
+        fprintf(stderr, "ds4: invalid GLM-5.3 vision encoder input\n");
+        return 0;
+    }
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    const uint32_t rows = grid_h * grid_w;
+    const uint32_t merged_rows = rows / 4u;
+    const uint64_t row1024 = (uint64_t)rows * 1024u;
+    const uint64_t row3072 = (uint64_t)rows * 3072u;
+    const uint64_t row4096 = (uint64_t)rows * 4096u;
+    const uint64_t merged10240 = (uint64_t)merged_rows * 10240u;
+    if (row4096 > SIZE_MAX / sizeof(float) ||
+        merged10240 > SIZE_MAX / sizeof(float)) return 0;
+
+    ds4_gpu_tensor *patch = NULL, *a = NULL, *b = NULL, *qkv = NULL;
+    ds4_gpu_tensor *q = NULL, *k = NULL, *v = NULL, *attn = NULL;
+    ds4_gpu_tensor *gate = NULL, *up = NULL, *mid = NULL;
+    int ok = 0;
+#define VISION_ALLOC(name_, count_) do { \
+        name_ = ds4_gpu_tensor_alloc((count_) * sizeof(float)); \
+        if (!(name_)) goto cleanup; \
+    } while (0)
+    VISION_ALLOC(patch, (uint64_t)rows * 1176u);
+    VISION_ALLOC(a, row1024);
+    VISION_ALLOC(b, row1024);
+    VISION_ALLOC(qkv, row3072);
+    VISION_ALLOC(q, row1024);
+    VISION_ALLOC(k, row1024);
+    VISION_ALLOC(v, row1024);
+    VISION_ALLOC(attn, row1024);
+    VISION_ALLOC(gate, row4096);
+    VISION_ALLOC(up, row4096);
+    VISION_ALLOC(mid, row4096);
+#undef VISION_ALLOC
+    if (!ds4_gpu_tensor_write(patch, 0, patches,
+                              (uint64_t)rows * 1176u * sizeof(float))) goto cleanup;
+    if (!ds4_gpu_begin_commands()) goto cleanup;
+    ok = ds4_gpu_glm53_matmul_bf16(a, model_map, model_size,
+                                   weights->patch_weight,
+                                   1176u, 1024u, patch, rows);
+    if (ok) ok = glm53_vision_dispatch_bias(
+            "kernel_glm53_vision_add_bias", a, NULL, model_map, model_size,
+            weights->patch_bias, 1024u, rows, "vision patch bias");
+
+    ds4_gpu_tensor *cur = a;
+    ds4_gpu_tensor *tmp = b;
+    for (uint32_t il = 0; ok && il < DS4_GLM53_VISION_LAYERS; il++) {
+        const ds4_glm53_vision_layer_weights *w = &weights->layer[il];
+        ok = glm53_vision_dispatch_rows(
+                "kernel_glm53_vision_rms_bf16", tmp, cur,
+                model_map, model_size, w->norm1, 1024u, rows, 1.0e-5f,
+                "vision norm1");
+        if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+                qkv, model_map, model_size, w->qkv_weight,
+                1024u, 3072u, tmp, rows);
+        if (ok) ok = glm53_vision_dispatch_qkv(
+                q, k, v, qkv, model_map, model_size, w, rows, grid_h, grid_w);
+        if (ok) ok = glm53_vision_dispatch_attention(attn, q, k, v, rows);
+        if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+                tmp, model_map, model_size, w->attn_proj_weight,
+                1024u, 1024u, attn, rows);
+        if (ok) ok = glm53_vision_dispatch_bias(
+                "kernel_glm53_vision_bias_residual", tmp, cur,
+                model_map, model_size, w->attn_proj_bias,
+                1024u, rows, "vision attention bias");
+        ds4_gpu_tensor *swap = cur; cur = tmp; tmp = swap;
+
+        if (ok) ok = glm53_vision_dispatch_rows(
+                "kernel_glm53_vision_rms_bf16", tmp, cur,
+                model_map, model_size, w->norm2, 1024u, rows, 1.0e-5f,
+                "vision norm2");
+        if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+                gate, model_map, model_size, w->gate_weight,
+                1024u, 4096u, tmp, rows);
+        if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+                up, model_map, model_size, w->up_weight,
+                1024u, 4096u, tmp, rows);
+        if (ok) ok = glm53_vision_dispatch_swiglu_bias(
+                mid, gate, up, model_map, model_size,
+                w->gate_bias, w->up_bias, 4096u, rows);
+        if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+                tmp, model_map, model_size, w->down_weight,
+                4096u, 1024u, mid, rows);
+        if (ok) ok = glm53_vision_dispatch_bias(
+                "kernel_glm53_vision_bias_residual", tmp, cur,
+                model_map, model_size, w->down_bias,
+                1024u, rows, "vision down bias");
+        swap = cur; cur = tmp; tmp = swap;
+    }
+    if (ok) ok = glm53_vision_dispatch_rows(
+            "kernel_glm53_vision_rms_bf16", tmp, cur,
+            model_map, model_size, weights->post_norm,
+            1024u, rows, 1.0e-5f, "vision post norm");
+    if (ok) ok = glm53_vision_dispatch_reorder(cur, tmp, merged_rows);
+    if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+            tmp, model_map, model_size, weights->downsample_weight,
+            4096u, 4096u, cur, merged_rows);
+    if (ok) ok = glm53_vision_dispatch_bias(
+            "kernel_glm53_vision_add_bias", tmp, NULL,
+            model_map, model_size, weights->downsample_bias,
+            4096u, merged_rows, "vision downsample bias");
+    if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+            cur, model_map, model_size, weights->merger_proj,
+            4096u, 4096u, tmp, merged_rows);
+    if (ok) ok = glm53_vision_dispatch_layernorm_gelu(
+            tmp, cur, model_map, model_size,
+            weights->merger_norm, weights->merger_norm_bias, merged_rows);
+    if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+            gate, model_map, model_size, weights->merger_gate,
+            4096u, 10240u, tmp, merged_rows);
+    if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+            up, model_map, model_size, weights->merger_up,
+            4096u, 10240u, tmp, merged_rows);
+    if (ok) ok = ds4_gpu_swiglu_tensor(
+            mid, gate, up, merged_rows * 10240u, 10.0f, 1.0f);
+    if (ok) ok = ds4_gpu_glm53_matmul_bf16(
+            cur, model_map, model_size, weights->merger_down,
+            10240u, 4096u, mid, merged_rows);
+    if (ok) ok = ds4_gpu_end_commands();
+    else (void)ds4_gpu_end_commands();
+    if (ok) ok = ds4_gpu_tensor_read(
+            cur, 0, out, (uint64_t)merged_rows * 4096u * sizeof(float));
+
+cleanup:
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(attn);
+    ds4_gpu_tensor_free(v);
+    ds4_gpu_tensor_free(k);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(qkv);
+    ds4_gpu_tensor_free(b);
+    ds4_gpu_tensor_free(a);
+    ds4_gpu_tensor_free(patch);
+    return ok;
+}
+
+int ds4_gpu_glm53_scatter_image_hc(
+        ds4_gpu_tensor       *hc,
+        const ds4_gpu_tensor *image,
+        uint32_t              dst_row,
+        uint32_t              image_row,
+        uint32_t              rows,
+        uint32_t              total_rows,
+        uint32_t              n_embd,
+        uint32_t              n_hc) {
+    if (!hc || !image || rows == 0 || n_embd == 0 || n_hc == 0 ||
+        dst_row > total_rows || rows > total_rows - dst_row ||
+        !ds4_gpu_commands_active()) return 0;
+    id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_vision_scatter_hc");
+    if (!pipeline) return 0;
+    glm53_vision_scatter_args args = {
+        dst_row, image_row, rows, total_rows, n_embd, n_hc
+    };
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
+    if (!enc) return 0;
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:ds4_gpu_tensor_buffer(hc)
+            offset:ds4_gpu_tensor_offset(hc) atIndex:1];
+    [enc setBuffer:ds4_gpu_tensor_buffer(image)
+            offset:ds4_gpu_tensor_offset(image) atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(n_embd, rows * n_hc, 1)
+         threadsPerThreadgroup:MTLSizeMake(MIN((NSUInteger)n_embd, 256u), 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 vision scatter");
 }
 
 typedef struct {

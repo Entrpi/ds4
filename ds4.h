@@ -127,6 +127,7 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *vision_path;
     ds4_backend backend;
     int n_threads;
     int context_size;
@@ -172,6 +173,21 @@ typedef struct {
     ds4_distributed_options distributed;
     ds4_tp_options tp;
 } ds4_engine_options;
+
+typedef struct {
+    float *data;
+    uint32_t token_count;
+    uint32_t width;
+    uint32_t height;
+    uint32_t content_width;
+    uint32_t content_height;
+    uint8_t fingerprint[32];
+} ds4_vision_embedding;
+
+typedef struct {
+    uint32_t token_start;
+    ds4_vision_embedding embedding;
+} ds4_vision_span;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
 typedef void (*ds4_generation_done_fn)(void *ud);
@@ -238,6 +254,37 @@ uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);
 uint64_t ds4_engine_model_bytes(ds4_engine *e);
+bool ds4_engine_has_vision(ds4_engine *e);
+int ds4_engine_vision_encode_file(ds4_engine *e,
+                                  const char *path,
+                                  ds4_vision_embedding *out,
+                                  char *error,
+                                  size_t error_cap);
+int ds4_engine_vision_encode_memory(ds4_engine *e,
+                                    const uint8_t *encoded,
+                                    size_t encoded_len,
+                                    ds4_vision_embedding *out,
+                                    char *error,
+                                    size_t error_cap);
+void ds4_vision_embedding_free(ds4_vision_embedding *embedding);
+int ds4_prompt_append_vision(ds4_engine *e,
+                             ds4_tokens *tokens,
+                             ds4_vision_span *span,
+                             ds4_vision_embedding *embedding,
+                             char *error,
+                             size_t error_cap);
+/* Append one user or tool message whose text parts alternate with images.
+ * text_parts must contain image_count + 1 entries. On success ownership of
+ * each embedding is transferred to the corresponding output span. */
+int ds4_chat_append_multimodal_message(ds4_engine *e,
+                                       ds4_tokens *tokens,
+                                       const char *role,
+                                       const char *const *text_parts,
+                                       ds4_vision_embedding *embeddings,
+                                       size_t image_count,
+                                       ds4_vision_span *spans,
+                                       char *error,
+                                       size_t error_cap);
 int ds4_engine_tp_vocab_split(ds4_engine *e);
 bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
                                         uint32_t layer,
@@ -367,6 +414,12 @@ typedef enum {
  * state is refilled from scratch. */
 #define DS4_SESSION_SYNC_INTERRUPTED 2
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+int ds4_session_sync_multimodal(ds4_session *s,
+                                const ds4_tokens *prompt,
+                                const ds4_vision_span *images,
+                                size_t image_count,
+                                char *err,
+                                size_t errlen);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,

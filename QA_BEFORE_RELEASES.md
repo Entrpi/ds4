@@ -540,6 +540,42 @@ block. A GLM 5.2 pass does not cover these paths.
   `nonexact_logits=0`. Finally run the fused D2R kernels under CUDA memcheck;
   an argmax-only comparison or coherent text does not replace these gates.
 
+### GLM 5.3 Vision
+
+Vision is a separate Metal sidecar and has its own release gate. Text-only GLM
+success does not exercise image preprocessing, the vision graph, multimodal
+prompt spans, or image-aware KV identity.
+
+- Download `glm53-vision` and verify
+  `glm-5.3-vision-encoder.gguf` has SHA-256
+  `ae23e14c6979e889051b2e4a39351abcdafb161e18e606fae4d8c40095a4bf3a`.
+- Build `tests/test_glm53_vision_engine` and
+  `tests/test_glm53_vision_prompt`. Run them with the release Q2 text GGUF, the
+  vision sidecar, and a fixed PNG. The prompt test must generate a visual
+  answer, reuse an unchanged image without repeated prefill, and rebuild when
+  only the image fingerprint changes.
+- Run the decoder over RGB, RGBA, grayscale, and palette PNG, baseline and
+  progressive JPEG, EXIF orientation, truncated files, wrong CRCs, huge
+  dimensions, and decompression-bomb fixtures under ASan and UBSan. Invalid
+  files must fail without a sanitizer report or large allocation.
+- In `./ds4`, submit one PNG and one JPEG with `/read`, then continue each chat
+  with a text turn. Repeat once with `--mtp`; verification after image prefill
+  must complete without a GLM MTP failure.
+- In `ds4-agent`, require `view_image` to inspect a real file and use the
+  resulting multimodal tool observation in a later read/edit/test tool loop.
+- Through `ds4-server`, test OpenAI Chat data URIs, Responses `input_image`,
+  and Anthropic base64 image blocks. Include two images in one message and an
+  image in a later turn. Local paths, `file:` URLs, remote URLs, malformed
+  base64, unsupported media, more than 16 images, and bodies over 64 MiB must
+  return 4xx without reading local files or making network requests.
+- Run Q4 across `mac-m5max-us` and `mac-m5max-it` over explicit TB5 RDMA with
+  `--vision` on both ranks. The leader must encode once, both ranks must keep
+  matching multimodal KV state, and the answer must remain correct. Record
+  image encode, prefill, first-token, and decode timing separately.
+- Build CPU, CUDA, and ROCm targets warning-free after vision changes. Until a
+  backend implements the encoder, passing `--vision` there must reject before
+  inference rather than silently ignoring the image.
+
 ## 7. SSD Streaming
 
 SSD streaming is a capacity path, so test both correctness and user experience.

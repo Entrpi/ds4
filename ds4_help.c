@@ -147,6 +147,9 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
+    if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
+        opt(fp, c, "--vision FILE", "GLM 5.3 vision encoder GGUF.");
+    }
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, rocm, or cpu.");
@@ -295,7 +298,7 @@ static void print_cli_commands(FILE *fp, const help_colors *c) {
     opt(fp, c, "/think, /think-max, /nothink", "Switch thinking mode.");
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
-    opt(fp, c, "/read FILE", "Read FILE and submit it as the next user message.");
+    opt(fp, c, "/read FILE", "Submit a text file, PNG, or JPEG as the next user message.");
     opt(fp, c, "/quit, /exit", "Leave the prompt.");
     opt(fp, c, "Ctrl+C", "Stop current generation and return to ds4>.");
     fputc('\n', fp);
