@@ -495,10 +495,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     }
     if (n_tok > 1) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-        const char *tiny_q8_mmvq = getenv("DS4_ROCM_DSPARK_Q8_MMVQ");
-        if (!g_quality_mode && n_tok <= 4u &&
+        if (!g_quality_mode &&
+            g_dspark_verify_mode && n_tok <= 6u &&
             in_dim <= INT_MAX && out_dim <= INT_MAX &&
-            tiny_q8_mmvq && tiny_q8_mmvq[0] != '0' &&
+            ds4_rocm_gfx1151_flag("DS4_ROCM_DSPARK_Q8_MMVQ") &&
             ds4_mmq_init(0) == 0 &&
             ds4_mmq_q8_0_dense_vec(
                 wptr, (const float *)x->ptr, (float *)out->ptr,
@@ -1040,7 +1040,9 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
         const float alpha = 1.0f;
         const float beta = 0.0f;
 #ifdef __HIP_PLATFORM_AMD__
-        if (n_tok == 4u && g_rocblas_ready &&
+        if ((n_tok == 4u ||
+             (g_dspark_verify_mode && n_tok <= 6u)) &&
+            g_rocblas_ready &&
             ds4_rocm_gfx1151_flag("DS4_ROCM_F16_Q4_SOLUTIONS")) {
             int32_t solution = 0;
             if (in_dim == 4096u &&

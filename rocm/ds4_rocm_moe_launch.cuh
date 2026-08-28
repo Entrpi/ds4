@@ -1765,10 +1765,10 @@ static int routed_moe_launch(
             } else if (split_ptr_down_done) {
                 /* The split pointer-table path writes the final token row. */
             } else if (use_iq2_q2_float_down) {
-                const char *mmvq_down =
-                    getenv("DS4_ROCM_DSPARK_Q2_DOWN_MMVQ");
-                if (!g_quality_mode && n_tokens <= 4u &&
-                    mmvq_down && mmvq_down[0] != '0' &&
+                if (!g_quality_mode &&
+                    g_dspark_verify_mode && n_tokens <= 6u &&
+                    ds4_rocm_gfx1151_flag(
+                        "DS4_ROCM_DSPARK_Q2_DOWN_MMVQ") &&
                     ds4_mmq_init(0) == 0 &&
                     ds4_mmq_q2_K_moe_down_sum6_vec(
                         down_w,

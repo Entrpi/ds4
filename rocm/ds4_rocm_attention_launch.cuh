@@ -1454,11 +1454,10 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 rank);
         if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a unpack launch")) return 0;
     } else {
-        const char *grouped_mmvq =
-            getenv("DS4_ROCM_DSPARK_ATTN_A_MMVQ");
-        if (!g_quality_mode && n_tokens == 4u &&
+        if (!g_quality_mode &&
+            g_dspark_verify_mode && n_tokens <= 6u &&
             group_dim == 4096u && rank == 1024u && n_groups == 8u &&
-            grouped_mmvq && grouped_mmvq[0] != '0' &&
+            ds4_rocm_gfx1151_flag("DS4_ROCM_DSPARK_ATTN_A_MMVQ") &&
             ds4_mmq_init(0) == 0) {
             const uint64_t heads_count =
                 (uint64_t)n_groups * n_tokens * group_dim;

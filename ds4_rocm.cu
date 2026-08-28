@@ -41,6 +41,12 @@
 
 #include "ds4_gpu.h"
 
+static thread_local bool g_dspark_verify_mode;
+
+extern "C" void ds4_gpu_set_dspark_verify_mode(bool enabled) {
+    g_dspark_verify_mode = enabled;
+}
+
 extern "C" int ds4_mmq_init(int device);
 extern "C" int ds4_mmq_iq2_xxs_moe_pair(
     const void *W_a, const void *W_b, const float *X_f32,
@@ -120,6 +126,10 @@ __device__ __constant__ static const int8_t cuda_mxfp4_values_x2[16] = {
 #include "rocm/ds4_rocm_runtime.cuh"
 
 #include "rocm/ds4_rocm_common.cuh"
+
+extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
+    return ds4_rocm_is_gfx1151();
+}
 
 #include "rocm/ds4_rocm_q8.cuh"
 

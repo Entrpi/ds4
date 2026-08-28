@@ -2415,6 +2415,10 @@ int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
 
 int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected);
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled);
+#ifdef DS4_ROCM_BUILD
+int ds4_gpu_dspark_gfx1151_fast_path(void);
+void ds4_gpu_set_dspark_verify_mode(bool enabled);
+#endif
 
 int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
         ds4_gpu_tensor       *out_hc,
