@@ -8379,8 +8379,11 @@ static bool agent_tool_observation_build(agent_worker *w,
         memset(spans, 0, obs->image_count * sizeof(spans[0]));
     }
     ds4_tokens_copy(tokens, &w->transcript);
+    /* GLM grounds image tokens in user turns; keep text-only observations in
+     * the native tool-response role used by the rest of the agent protocol. */
     bool ok = ds4_chat_append_multimodal_message(
-        w->engine, tokens, "tool", parts, images, obs->image_count, spans,
+        w->engine, tokens, obs->image_count ? "user" : "tool",
+        parts, images, obs->image_count, spans,
         err, err_len) != 0;
     free(parts);
     free(images);

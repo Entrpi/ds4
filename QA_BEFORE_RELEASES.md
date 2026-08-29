@@ -582,7 +582,16 @@ prompt spans, or image-aware KV identity.
   diagrams, readable text, spatial questions, and unrelated-image controls.
   Compare complete answers with the official GLM-5.3-Flash vision service and
   repeat through CLI, server, and `ds4-agent`. A valid decoder, expected image
-  token count, or plausible but ungrounded prose does not pass this gate.
+  token count, or plausible but ungrounded prose does not pass this gate. With
+  a local vision-enabled server running, require:
+
+  ```sh
+  python3 tests/run_glm53_vision_quality.py
+  ```
+
+  to report `6/6 passed`. For agent tests, expose only the raster fixtures;
+  source SVGs or expected-answer files beside them let the agent bypass vision
+  with text tools.
 - Run the decoder over RGB, RGBA, grayscale, and palette PNG, baseline and
   progressive JPEG, EXIF orientation, truncated files, wrong CRCs, huge
   dimensions, and decompression-bomb fixtures under ASan and UBSan. Invalid
@@ -591,7 +600,11 @@ prompt spans, or image-aware KV identity.
   with a text turn. Repeat once with `--mtp`; verification after image prefill
   must complete without a GLM MTP failure.
 - In `ds4-agent`, require `view_image` to inspect a real file and use the
-  resulting multimodal tool observation in a later read/edit/test tool loop.
+  resulting multimodal observation in a later read/edit/test tool loop. Image
+  observations must enter as user-role multimodal turns; GLM loses grounding
+  when several images are packed into a tool-response role. Run the five-image
+  fixture in one turn so the prompt exceeds 4K, and require the same facts as
+  the official Z.AI control. Text-only tool observations must remain tool-role.
 - Through `ds4-server`, test OpenAI Chat data URIs, Responses `input_image`,
   and Anthropic base64 image blocks. Include two images in one message and an
   image in a later turn. Local paths, `file:` URLs, remote URLs, malformed
