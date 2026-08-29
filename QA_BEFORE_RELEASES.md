@@ -450,6 +450,27 @@ block. A GLM 5.2 pass does not cover these paths.
   It covers BF16 projections, pool-4 state construction and expansion, grouped
   scorer arithmetic and causal visibility, and recurrent KDA prefill versus
   sequential decode.
+- Treat session construction as the attention-memory admission point. Every
+  owned DSA cache and indexer pool/tail, every KDA recurrent state, and the
+  complete supported prefill workspace must allocate before a request is
+  accepted. A first prefill must not grow a per-layer cache. Check both a
+  4,096-token session and a long session in the memory report.
+- Keep GLM-5.3 in absorbed MLA form: attend densely over the shared compact
+  latent cache through token 4,096, then use the pool-4 sparse selector. Do not
+  restore the 2.75 GiB expanded per-head K/V cache as a presumed quality fix.
+  The complete Q2 fixture on the compact Metal graph scored NLL `0.458177271`,
+  first-token agreement `90/100`, and average greedy prefix `7.390`, matching
+  the accepted release band. Fresh Z.AI FP8 long-context controls also favored
+  compact attention: weighted NLL was `0.539823254` versus `0.820997888` for
+  expanded K/V over 24 synthetic cases, and `0.808160860` versus `0.820309487`
+  over 12 natural source-context cases. Extending dense attention to 16K made
+  the natural set worse at `0.825709092`, so keep the 4K crossover.
+- At 100K on an M5 Max, require the compact Q2 plan to remain near 94.09 GiB:
+  89.87 GiB model, 1.11 GiB compact history, and 3.11 GiB fixed graph buffers.
+  An 8,192-token one-shot control on the same graph reached 479.09 prefill and
+  29.89 steady decode t/s. Repeat the continuation fixture after changing the
+  compact cache type, absorbed projections, FlashAttention staging, or the 4K
+  crossover; numerical similarity to the old expanded graph is not the gate.
 - On this 128 GB M3 Max, run the resident Q2 through the generic non-NAX Metal
   path. Repeat the 4,096-4,100 boundary, official-continuation, MTP, snapshot,
   server-session, and continued-prefill gates used on M5. Record the different
@@ -547,13 +568,18 @@ success does not exercise image preprocessing, the vision graph, multimodal
 prompt spans, or image-aware KV identity.
 
 - Download `glm53-vision` and verify
-  `glm-5.3-vision-encoder.gguf` has SHA-256
+  `GLM-5.3-Flash-Vision-Encoder.gguf` has SHA-256
   `ae23e14c6979e889051b2e4a39351abcdafb161e18e606fae4d8c40095a4bf3a`.
 - Build `tests/test_glm53_vision_engine` and
   `tests/test_glm53_vision_prompt`. Run them with the release Q2 text GGUF, the
   vision sidecar, and a fixed PNG. The prompt test must generate a visual
   answer, reuse an unchanged image without repeated prefill, and rebuild when
   only the image fingerprint changes.
+- Run a fixed model-level vision fixture containing photographs, screenshots,
+  diagrams, readable text, spatial questions, and unrelated-image controls.
+  Compare complete answers with the official GLM-5.3-Flash vision service and
+  repeat through CLI, server, and `ds4-agent`. A valid decoder, expected image
+  token count, or plausible but ungrounded prose does not pass this gate.
 - Run the decoder over RGB, RGBA, grayscale, and palette PNG, baseline and
   progressive JPEG, EXIF orientation, truncated files, wrong CRCs, huge
   dimensions, and decompression-bomb fixtures under ASan and UBSan. Invalid
@@ -886,6 +912,7 @@ claims across different models or contexts.
 | Mac Studio M3 Ultra 512 GB, Metal | Flash q4, 12,018-token prompt | 448.82 t/s | 26.62 t/s |
 | Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.2 IQ2_XXS, 4,096-token prefill and 256-token teacher-forced decode | about 214 t/s | about 16.7 t/s |
 | MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, resident short prompt | 86.68 t/s | 34.45 t/s; 41.97 t/s greedy MTP |
+| MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, 8,192-token compact-attention prompt | 479.09 t/s | 29.89 t/s steady |
 | Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.3 Flash Q2, short prompt | 29.06 t/s | 32.70 t/s |
 | MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, 24,988/49,948-token long prompts | 424.80 / 421.75 t/s | 29.50 / 28.10 t/s |
 | Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.3 Flash Q2, 10,819-token prompt | 468.97 t/s | 22.85 t/s |

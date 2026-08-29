@@ -3995,7 +3995,7 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_causal_impl(
         args.n_selected == 0u ||
         args.cache_f16 == 0u ||
         args.kv_lora_dim != 512u ||
-        args.qk_rope != 64u) {
+        (args.qk_rope != 0u && args.qk_rope != 64u)) {
         return;
     }
 
@@ -4040,7 +4040,7 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_causal_impl(
     }
 
     float corr_dims[2] = {0.0f, 0.0f};
-    if (args.ext_factor != 0.0f) {
+    if (args.qk_rope != 0u && args.ext_factor != 0.0f) {
         glm_rope_yarn_corr_dims((int)args.qk_rope,
                                 (int)args.n_ctx_orig,
                                 args.freq_base,

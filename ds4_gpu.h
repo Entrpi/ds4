@@ -1738,6 +1738,21 @@ int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
         float                 beta_fast,
         float                 beta_slow);
 
+/* Dense causal MLA over the shared compact latent cache. qk_low and lora_out
+ * are [token, head, kv_lora_dim]; the F16 cache is shared by all heads. */
+int ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
+        ds4_gpu_tensor       *lora_out,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        uint32_t              q_row0,
+        uint32_t              n_q,
+        uint32_t              n_kv,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_dim);
+
 int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
         ds4_gpu_tensor       *lora_out,
         const ds4_gpu_tensor *q,

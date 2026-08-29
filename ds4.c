@@ -6094,7 +6094,7 @@ static void config_validate_model(const ds4_model *m) {
     config_validate_deepseek4_model(m);
 }
 
-#ifndef DS4_NO_GPU
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
 static ds4_tensor *vision_required_tensor(
         const ds4_model *m,
         const char      *name,
@@ -36502,9 +36502,9 @@ static uint32_t glm_graph_compact_cache_is_f16(void) {
 
 static bool glm_graph_expanded_kv_cache_enabled(bool ssd_streaming) {
     (void)ssd_streaming;
-    /* GLM-5.3 starts with the exact full-attention path at short context.
-     * Beyond that window its pool-4 sparse selector reads the compact cache. */
-    return ds4_model_is_glm53();
+    /* Absorbed MLA keeps the shared latent cache through the dense prefix,
+     * then reuses it for sparse DSA without materializing per-head K/V. */
+    return false;
 }
 
 static bool glm_graph_layer_uses_full_indexer(uint32_t il) {
@@ -36754,6 +36754,24 @@ static uint32_t glm_graph_compact_cache_initial_cap(
     return cap;
 }
 
+static uint32_t glm_graph_batch_row_cap(
+        uint32_t full_attention_cap,
+        uint32_t indexed_prefill_cap,
+        bool     expanded_kv) {
+    if (ds4_model_is_glm53()) {
+        uint32_t cap = full_attention_cap;
+        if (cap > DS4_GLM53_PREFILL_CHUNK_TOKENS) {
+            cap = DS4_GLM53_PREFILL_CHUNK_TOKENS;
+        }
+        if (indexed_prefill_cap != 0 && cap > indexed_prefill_cap) {
+            cap = indexed_prefill_cap;
+        }
+        return cap != 0 ? cap : 1u;
+    }
+    return expanded_kv || indexed_prefill_cap == 0 ?
+        full_attention_cap : indexed_prefill_cap;
+}
+
 static uint64_t glm_graph_compact_cache_bytes_for_cap(
         uint32_t normal_layers,
         uint32_t indexer_layers,
@@ -36835,10 +36853,15 @@ static uint64_t glm_graph_workspace_bytes_for_cap(
                                                    compact_cap) :
             0;
     const uint64_t batch_rows =
-        expanded_kv || indexed_rows == 0 ? full_attention_cap : indexed_rows;
-    const uint64_t indexer_top_k = ds4_model_is_glm53() ?
-        glm53_graph_indexer_selected_limit() :
-        glm_graph_indexer_top_k_limit();
+        glm_graph_batch_row_cap(full_attention_cap,
+                                (uint32_t)indexed_rows,
+                                expanded_kv);
+    const uint64_t indexer_top_k =
+        ds4_model_is_glm53() && !expanded_kv ?
+            full_attention_cap :
+        ds4_model_is_glm53() ?
+            glm53_graph_indexer_selected_limit() :
+            glm_graph_indexer_top_k_limit();
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_KEY_MLA;
     const uint64_t q_nope =
         DS4_N_KEY_MLA > DS4_N_ROT ? (uint64_t)DS4_N_KEY_MLA - DS4_N_ROT : 0;
@@ -36945,26 +36968,26 @@ static uint64_t glm_graph_workspace_bytes_for_cap(
     bytes = glm_graph_workspace_add_bytes(bytes,
                                           batch_rows * ffn_mid_elems,
                                           sizeof(float));
-    if (ds4_model_is_glm53() && indexed_rows != 0) {
+    if (ds4_model_is_glm53() && batch_rows != 0) {
         const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
         const uint64_t hc_mix =
             2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
         const uint64_t kda_projection =
             (uint64_t)DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
         bytes = glm_graph_workspace_add_bytes(bytes,
-                                              indexed_rows * 4u * hc_dim,
+                                              batch_rows * 4u * hc_dim,
                                               sizeof(float));
         bytes = glm_graph_workspace_add_bytes(bytes,
-                                              indexed_rows * 2u * hc_mix,
+                                              batch_rows * 2u * hc_mix,
                                               sizeof(float));
         bytes = glm_graph_workspace_add_bytes(bytes,
-                                              indexed_rows * 6u * kda_projection,
+                                              batch_rows * 6u * kda_projection,
                                               sizeof(float));
         bytes = glm_graph_workspace_add_bytes(bytes,
-                                              indexed_rows * DS4_N_KDA_HEAD_DIM,
+                                              batch_rows * DS4_N_KDA_HEAD_DIM,
                                               sizeof(float));
         bytes = glm_graph_workspace_add_bytes(bytes,
-                                              indexed_rows * DS4_N_KDA_HEAD,
+                                              batch_rows * DS4_N_KDA_HEAD,
                                               sizeof(float));
     }
     if (indexed_rows != 0) {
@@ -37001,7 +37024,7 @@ static ds4_context_memory glm_graph_context_memory_estimate_for_compact_cap_slic
             glm_graph_indexed_prefill_chunk_tokens(work_ctx, compact_cap) :
             0;
     const uint32_t batch_rows =
-        expanded_kv || indexed_rows == 0 ? work_ctx : indexed_rows;
+        glm_graph_batch_row_cap(work_ctx, indexed_rows, expanded_kv);
 
     m.prefill_cap = batch_rows;
     m.raw_cap = expanded_kv ? work_ctx : 0;
@@ -39779,6 +39802,67 @@ static int generate_raw_swa_cpu(
     return 0;
 }
 
+#if !defined(DS4_NO_GPU) || defined(DS4_TEST_HOOKS)
+static double glm_graph_bytes_to_gib(uint64_t bytes) {
+    return (double)bytes / (1024.0 * 1024.0 * 1024.0);
+}
+
+static bool glm_graph_memory_guard_disabled(void) {
+    const char *env = getenv("DS4_GLM_MEMORY_GUARD");
+    if (!env || !env[0]) return false;
+    return strcmp(env, "0") == 0 ||
+           strcasecmp(env, "false") == 0 ||
+           strcasecmp(env, "off") == 0 ||
+           strcasecmp(env, "no") == 0;
+}
+
+static double glm_graph_memory_guard_default_reserve_gib(
+        uint64_t budget_base,
+        uint64_t model_bytes,
+        bool     glm53) {
+    const double base_gib = glm_graph_bytes_to_gib(budget_base);
+    const double model_gib = glm_graph_bytes_to_gib(model_bytes);
+    if (base_gib >= 480.0 &&
+        base_gib <= 640.0 &&
+        model_gib >= base_gib * 0.80) {
+        return 24.0;
+    }
+    if (glm53 &&
+        base_gib >= 120.0 &&
+        base_gib <= 160.0 &&
+        model_gib >= 70.0) {
+        /* Preserve the proven 110 GiB resident-Q2 budget on 128 GiB hosts
+         * without imposing that reference-machine limit on larger Macs. */
+        return 18.0;
+    }
+    return 32.0;
+}
+
+static uint64_t glm_graph_memory_guard_budget_bytes(
+        uint64_t budget_base,
+        uint64_t wired_limit,
+        double   fraction,
+        double   reserve_gib) {
+    const uint64_t fraction_budget =
+        (uint64_t)((double)budget_base * fraction);
+    const uint64_t reserve_bytes =
+        (uint64_t)(reserve_gib * 1024.0 * 1024.0 * 1024.0);
+    const uint64_t reserve_budget =
+        reserve_bytes >= budget_base ? 0 : budget_base - reserve_bytes;
+    uint64_t budget = fraction_budget;
+    if (reserve_bytes != 0 && reserve_budget < budget) budget = reserve_budget;
+    if (wired_limit != 0) {
+        /* An explicitly raised iogpu.wired_limit_mb is the user granting
+         * the GPU that much wired memory; it overrides the heuristics. */
+        const uint64_t margin = 2ull * 1024ull * 1024ull * 1024ull;
+        const uint64_t wired_budget =
+            wired_limit > margin ? wired_limit - margin : wired_limit;
+        if (wired_budget > budget) budget = wired_budget;
+    }
+    return budget;
+}
+#endif
+
 #ifndef DS4_NO_GPU
 typedef struct ds4_glm_gpu_graph {
     uint32_t ctx_size;
@@ -39876,9 +39960,10 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *batch_routed_down;
     ds4_gpu_tensor *batch_ffn_out;
     bool batch_routed_mid_is_f16;
+    uint32_t batch_cap;
 
-    /* GLM-5.3 layer-major prefill workspace. It is allocated lazily and
-     * bounded to the current prefill chunk instead of the full context. */
+    /* GLM-5.3 layer-major prefill workspace. It is allocated at graph
+     * creation for the full supported prefill chunk. */
     uint32_t glm53_prefill_cap;
     ds4_gpu_tensor *batch_hc_cur;
     ds4_gpu_tensor *batch_hc_next;
@@ -40042,21 +40127,8 @@ static uint32_t glm_graph_model_context_limit(void) {
     return (uint32_t)DS4_ROPE_ORIG_CTX;
 }
 
-static double glm_graph_bytes_to_gib(uint64_t bytes) {
-    return (double)bytes / (1024.0 * 1024.0 * 1024.0);
-}
-
 static uint64_t glm_graph_saturating_add_u64(uint64_t a, uint64_t b) {
     return a > UINT64_MAX - b ? UINT64_MAX : a + b;
-}
-
-static bool glm_graph_env_disabled(const char *name) {
-    const char *env = getenv(name);
-    if (!env || !env[0]) return false;
-    return strcmp(env, "0") == 0 ||
-           strcasecmp(env, "false") == 0 ||
-           strcasecmp(env, "off") == 0 ||
-           strcasecmp(env, "no") == 0;
 }
 
 static double glm_graph_env_double(
@@ -40182,19 +40254,6 @@ static uint64_t glm_graph_model_bytes_for_guard(
     return active_bytes != 0 ? active_bytes : model->size;
 }
 
-static double glm_graph_memory_guard_default_reserve_gib(
-        uint64_t budget_base,
-        uint64_t model_bytes) {
-    const double base_gib = glm_graph_bytes_to_gib(budget_base);
-    const double model_gib = glm_graph_bytes_to_gib(model_bytes);
-    if (base_gib >= 480.0 &&
-        base_gib <= 640.0 &&
-        model_gib >= base_gib * 0.80) {
-        return 24.0;
-    }
-    return 32.0;
-}
-
 static bool glm_graph_memory_guard_for_compact_cap(
         const ds4_model   *model,
         const ds4_weights *weights,
@@ -40209,10 +40268,7 @@ static bool glm_graph_memory_guard_for_compact_cap(
         uint64_t           transient_extra_bytes,
         const char        *phase) {
     if (!model) return true;
-    if (!ds4_model_is_glm53() &&
-        glm_graph_env_disabled("DS4_GLM_MEMORY_GUARD")) {
-        return true;
-    }
+    if (glm_graph_memory_guard_disabled()) return true;
 
     const uint64_t host_bytes = glm_graph_host_memory_bytes();
     uint64_t budget_base = host_bytes;
@@ -40253,17 +40309,8 @@ static bool glm_graph_memory_guard_for_compact_cap(
     const double fraction =
         glm_graph_env_double("DS4_GLM_MEMORY_GUARD_FRACTION", 0.99, 0.50, 1.00);
     double default_reserve_gib =
-        glm_graph_memory_guard_default_reserve_gib(budget_base, model_bytes);
-    if (ds4_model_is_glm53()) {
-        const double base_gib = glm_graph_bytes_to_gib(budget_base);
-        const double model_gib = glm_graph_bytes_to_gib(model_bytes);
-        if (base_gib >= 120.0 && base_gib <= 160.0 && model_gib >= 70.0) {
-            /* A 128 GiB host is a supported resident-Q2 target. The fixed
-             * 110 GiB GLM-5.3 ceiling below is the effective safety limit;
-             * a 32 GiB reserve would reject the model map by itself. */
-            default_reserve_gib = 12.0;
-        }
-    }
+        glm_graph_memory_guard_default_reserve_gib(
+                budget_base, model_bytes, ds4_model_is_glm53());
 #ifdef DS4_ROCM_BUILD
     if (load_slice && !ssd_streaming) {
         /* The original fixed reserve protects Metal's shared host/GPU heap.
@@ -40283,26 +40330,8 @@ static bool glm_graph_memory_guard_for_compact_cap(
                              default_reserve_gib,
                              0.0,
                              1024.0);
-    const uint64_t fraction_budget = (uint64_t)((double)budget_base * fraction);
-    const uint64_t reserve_bytes =
-        (uint64_t)(reserve_gib * 1024.0 * 1024.0 * 1024.0);
-    const uint64_t reserve_budget =
-        reserve_bytes >= budget_base ? 0 : budget_base - reserve_bytes;
-    uint64_t budget = fraction_budget;
-    if (reserve_bytes != 0 && reserve_budget < budget) budget = reserve_budget;
-    if (wired_limit != 0) {
-        /* An explicitly raised iogpu.wired_limit_mb is the user granting
-         * the GPU that much wired memory; it overrides the heuristics
-         * (keep a small margin for non-model GPU allocations). */
-        const uint64_t margin = 2ull * 1024ull * 1024ull * 1024ull;
-        const uint64_t wired_budget =
-            wired_limit > margin ? wired_limit - margin : wired_limit;
-        if (wired_budget > budget) budget = wired_budget;
-    }
-    if (ds4_model_is_glm53()) {
-        const uint64_t glm53_max = 110ull * 1024ull * 1024ull * 1024ull;
-        if (budget > glm53_max) budget = glm53_max;
-    }
+    const uint64_t budget = glm_graph_memory_guard_budget_bytes(
+            budget_base, wired_limit, fraction, reserve_gib);
 
     if (required <= budget) {
         const char *report = getenv("DS4_GLM_MEMORY_GUARD_REPORT");
@@ -40372,15 +40401,9 @@ static bool glm_graph_memory_guard_for_compact_cap(
             fraction,
             reserve_gib,
             glm_graph_bytes_to_gib(transient_extra_bytes));
-    if (ds4_model_is_glm53()) {
-        fprintf(stderr,
-                "ds4:   GLM-5.3 has a fixed 110 GiB per-rank ceiling; use a "
-                "smaller --ctx, tensor parallelism, or SSD streaming\n");
-    } else {
-        fprintf(stderr,
-                "ds4:   set DS4_GLM_MEMORY_GUARD=0 to bypass, use a smaller --ctx, "
-                "or use SSD streaming\n");
-    }
+    fprintf(stderr,
+            "ds4:   set DS4_GLM_MEMORY_GUARD=0 to bypass, use a smaller --ctx, "
+            "tensor parallelism, or SSD streaming\n");
     return false;
 }
 
@@ -40683,17 +40706,26 @@ static bool glm53_graph_use_indexed_prefill(
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     return g && g->glm53 && g->indexed_prefill_cap != 0;
 #else
-    (void)g;
-    return false;
+    return g && g->glm53 && g->indexed_prefill_cap != 0 &&
+           !g->full_kv_cache;
 #endif
 }
 
+static uint32_t glm_graph_dense_compact_attention_limit(
+        const ds4_glm_gpu_graph *g) {
+    /* GLM-5.3 attends densely through its normal 4K work window. Above it,
+     * the pool-4 selector supplies the sparse history. */
+    if (g && g->glm53 && !g->full_kv_cache) return g->ctx_cap;
+    return glm_graph_indexer_top_k_limit();
+}
+
 static uint32_t glm_graph_limit_indexed_prefill_chunk(
+        const ds4_glm_gpu_graph *g,
         uint32_t pos,
         uint32_t chunk) {
-    const uint32_t top_k = glm_graph_indexer_top_k_limit();
-    if (pos < top_k) {
-        const uint32_t bridge = top_k - pos;
+    const uint32_t dense_limit = glm_graph_dense_compact_attention_limit(g);
+    if (pos < dense_limit) {
+        const uint32_t bridge = dense_limit - pos;
         if (bridge != 0 && chunk > bridge) chunk = bridge;
     }
     return chunk;
@@ -41524,7 +41556,7 @@ static bool glm_graph_verify_ws_init(ds4_glm_gpu_graph *g) {
             const ds4_gpu_tensor *orig = g->verify_ws_orig[i];
             if (!orig) continue;
             const uint32_t cap = (i >= 9 && i <= 11) ?
-                g->indexed_prefill_cap : g->ctx_cap;
+                g->indexed_prefill_cap : g->batch_cap;
             const uint64_t orig_bytes = ds4_gpu_tensor_bytes(orig);
             if (cap == 0 || orig_bytes % cap != 0 ||
                 orig_bytes / cap > UINT64_MAX / 2u) {
@@ -41802,6 +41834,10 @@ static bool glm_graph_warm_compact_indexer_store(
     return ok;
 }
 
+static bool glm53_graph_prefill_workspace_ensure(
+        ds4_glm_gpu_graph *g,
+        uint32_t           rows);
+
 static bool glm_graph_alloc_slice(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -41900,10 +41936,13 @@ static bool glm_graph_alloc_slice(
     const uint32_t indexer_top_k = glm_graph_indexer_top_k_limit();
     const uint32_t indexer_selected_limit = g->glm53 ?
         glm53_graph_indexer_selected_limit() : indexer_top_k;
+    const uint32_t dense_indexer_selected_limit =
+        g->glm53 && !g->full_kv_cache ?
+            g->ctx_cap : indexer_selected_limit;
     const uint32_t indexer_selected_pools = g->glm53 ?
         indexer_top_k / DS4_GLM53_INDEX_POOL_SIZE : 0u;
     const uint64_t indexer_selected_bytes =
-        (uint64_t)indexer_selected_limit * sizeof(uint32_t);
+        (uint64_t)dense_indexer_selected_limit * sizeof(uint32_t);
     const uint64_t indexer_pool_selected_bytes =
         (uint64_t)indexer_selected_pools * sizeof(uint32_t);
     const uint64_t qk_low_bytes =
@@ -41935,9 +41974,10 @@ static bool glm_graph_alloc_slice(
         (uint64_t)DS4_GLM53_INDEX_POOL_SIZE * DS4_N_INDEXER_HEAD_DIM *
         sizeof(float);
     const uint64_t batch_rows =
-        g->full_kv_cache || g->indexed_prefill_cap == 0 ?
-            g->ctx_cap :
-            g->indexed_prefill_cap;
+        glm_graph_batch_row_cap(g->ctx_cap,
+                                g->indexed_prefill_cap,
+                                g->full_kv_cache);
+    g->batch_cap = (uint32_t)batch_rows;
     const uint64_t indexed_batch_rows = g->indexed_prefill_cap;
     const uint64_t indexed_score_rows = g->indexed_prefill_score_cap;
     const uint64_t batch_indexer_q_bytes = indexed_batch_rows * indexer_q_bytes;
@@ -42232,6 +42272,14 @@ static bool glm_graph_alloc_slice(
                 }
             }
         }
+    }
+    if (g->glm53 &&
+        !glm53_graph_prefill_workspace_ensure(g, g->batch_cap)) {
+        fprintf(stderr,
+                "ds4: GLM graph could not allocate the static GLM-5.3 "
+                "prefill workspace\n");
+        glm_graph_free(g);
+        return false;
     }
     glm_graph_ws_init(g);
     return true;
@@ -46878,6 +46926,7 @@ static bool glm_graph_forward_tokens(
                                                DS4_N_EMBD,
                                                DS4_N_HC) != 0;
         }
+#if defined(__APPLE__)
         for (size_t i = 0; ok && i < vision_overlay.count; i++) {
             const glm_vision_overlay_segment *segment =
                     &vision_overlay.segments[i];
@@ -46891,6 +46940,7 @@ static bool glm_graph_forward_tokens(
                     DS4_N_EMBD,
                     DS4_N_HC) != 0;
         }
+#endif
         if (trace) {
             const double ms = (now_sec() - t0) * 1000.0;
             if (trace_all || ms >= trace_slow_ms || !ok) {
@@ -47885,13 +47935,14 @@ static bool glm_graph_forward_indexed_tokens(
     }
     const uint32_t n_rows = pos0 + n_tokens;
     const uint32_t indexer_top_k = glm_graph_indexer_top_k_limit();
-    if (pos0 < indexer_top_k && n_rows > indexer_top_k) {
+    const uint32_t dense_limit = glm_graph_dense_compact_attention_limit(g);
+    if (pos0 < dense_limit && n_rows > dense_limit) {
         return false;
     }
-    const uint32_t indexed_selected_count = n_rows <= indexer_top_k ?
+    const uint32_t indexed_selected_count = n_rows <= dense_limit ?
         n_rows :
         (g->glm53 ? glm53_graph_indexer_selected_limit() : indexer_top_k);
-    const bool use_causal_range_select = n_rows <= indexer_top_k;
+    const bool use_causal_range_select = n_rows <= dense_limit;
     const bool trace = glm_graph_indexed_prefill_trace_enabled();
     const bool trace_all = trace && glm_graph_indexed_prefill_trace_all();
     const double trace_slow_ms = trace ?
@@ -48509,13 +48560,8 @@ static bool glm_graph_forward_indexed_tokens(
             }
             if (ok) {
                 if (use_causal_range_select) {
-                    ok = ds4_gpu_glm_fill_selected_range_batch_tensor(
-                                 g->batch_indexer_selected,
-                                 n_tokens,
-                                 pos0,
-                                 indexed_selected_count,
-                                 g->compact_cache_cap) != 0;
-                    DS4_GLM_PROFILE_INDEXED_STAGE("glm_indexed_attn", "indexer_range");
+                    /* The causal kernel consumes the implicit [0, visible)
+                     * range directly; no selected-row buffer is needed. */
                 } else if (use_scalar_indexer) {
                     const float indexer_scale =
                         1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
@@ -48768,17 +48814,36 @@ static bool glm_graph_forward_indexed_tokens(
                                         (uint64_t)t0 * DS4_N_HEAD * DS4_N_KV_LORA * sizeof(float),
                                         (uint64_t)slice * DS4_N_HEAD * DS4_N_KV_LORA * sizeof(float)) :
                     NULL;
-                ds4_gpu_tensor *selected_view =
+                ds4_gpu_tensor *selected_view = use_causal_range_select ? NULL :
                     ds4_gpu_tensor_view(last_indexer_selected,
                                         (uint64_t)t0 * last_indexer_selected_count * sizeof(uint32_t),
                                         (uint64_t)slice * last_indexer_selected_count * sizeof(uint32_t));
-                ok = q_view && qk_low_view && heads_view && selected_view &&
+                ok = q_view && qk_low_view && heads_view &&
+                     (use_causal_range_select || selected_view) &&
                      (!use_split_value_proj || attn_lora_view);
                 if (!ok) {
                     fprintf(stderr, "ds4: GLM sliced indexed prefill failed to create attention views at layer %u token %u\n", il, t0);
                 }
                 if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ATTN_CORE)) { /* ablate */ } else if (ok && use_split_value_proj) {
                     int rc = 0;
+#if defined(__APPLE__)
+                    if (use_causal_range_select &&
+                        glm_graph_use_flash_attention_prefill(slice) &&
+                        !tp_attn_head_split) {
+                        rc = ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
+                                attn_lora_view,
+                                qk_low_view,
+                                g->layer_kv_lora_cache[il],
+                                pos0 + t0,
+                                slice,
+                                last_indexer_selected_count,
+                                g->compact_cache_cap,
+                                glm_graph_compact_cache_is_f16(),
+                                DS4_N_HEAD,
+                                DS4_N_KV_LORA,
+                                (uint32_t)g->q_nope);
+                    } else
+#endif
                     if (use_causal_range_select) {
                         rc = ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
                                 attn_lora_view,
@@ -49484,7 +49549,7 @@ static bool glm_graph_prefill_range(
             } else {
                 chunk = 1;
             }
-            chunk = glm_graph_limit_indexed_prefill_chunk(pos, chunk);
+            chunk = glm_graph_limit_indexed_prefill_chunk(g, pos, chunk);
             float *dst_logits = done + chunk == n_tokens ? logits_out : NULL;
             const bool use_indexed =
                 glm53_graph_use_indexed_prefill(g) ||
@@ -49569,7 +49634,7 @@ static bool glm_graph_prefill_range(
             } else if (glm_graph_indexed_prefill_batch_ready(g, pos)) {
                 chunk = remaining;
                 if (chunk > g->indexed_prefill_cap) chunk = g->indexed_prefill_cap;
-                chunk = glm_graph_limit_indexed_prefill_chunk(pos, chunk);
+                chunk = glm_graph_limit_indexed_prefill_chunk(g, pos, chunk);
                 if (chunk == 0) chunk = 1;
                 float *dst_logits = (done + chunk == n_tokens) ? logits_out : NULL;
                 if (!glm_graph_forward_indexed_tokens(g,
@@ -49624,7 +49689,9 @@ static bool glm_graph_prefill_range(
                 if (use_indexed_batch) {
                     uint32_t chunk = n_tokens - done;
                     if (chunk > g->indexed_prefill_cap) chunk = g->indexed_prefill_cap;
-                    chunk = glm_graph_limit_indexed_prefill_chunk(cur_pos, chunk);
+                    chunk = glm_graph_limit_indexed_prefill_chunk(g,
+                                                                   cur_pos,
+                                                                   chunk);
                     float *dst_logits = (done + chunk == n_tokens) ? logits_out : NULL;
                     if (!glm_graph_forward_indexed_tokens(g,
                                                           model,
@@ -50341,7 +50408,9 @@ static bool glm_graph_forward_token(
         if (use_indexed_attention) {
             if (ok && glm_graph_layer_uses_full_indexer(il)) {
                 const uint32_t visible = pos + 1u;
-                if (ok && visible <= indexer_top_k) {
+                const uint32_t dense_limit =
+                    glm_graph_dense_compact_attention_limit(g);
+                if (ok && visible <= dense_limit) {
                     if (last_indexer_selected != g->indexer_selected ||
                         last_indexer_selected_count != visible) {
                         ok = ds4_gpu_glm_fill_selected_range_tensor(
@@ -58812,7 +58881,9 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         const double reserve_gib = glm_graph_env_double(
                 "DS4_GLM_MEMORY_GUARD_RESERVE_GB",
                 glm_graph_memory_guard_default_reserve_gib(
-                        recommended, active_model_bytes),
+                        recommended,
+                        active_model_bytes,
+                        ds4_model_is_glm53()),
                 0.0,
                 1024.0);
         const uint64_t fraction_budget =
@@ -60483,6 +60554,21 @@ int ds4_test_tensor_to_entry(const char *name, int name_len) {
     fake.name.ptr = name;
     fake.name.len = (uint64_t)(name_len > 0 ? name_len : 0);
     return tensor_to_entry(&fake, DS4_N_LAYER);
+}
+
+uint64_t ds4_test_glm_memory_guard_default_budget(
+        uint64_t host_bytes,
+        uint64_t model_bytes,
+        bool     glm53) {
+    const double reserve_gib =
+        glm_graph_memory_guard_default_reserve_gib(
+                host_bytes, model_bytes, glm53);
+    return glm_graph_memory_guard_budget_bytes(
+            host_bytes, 0, 0.99, reserve_gib);
+}
+
+int ds4_test_glm_memory_guard_disabled(void) {
+    return glm_graph_memory_guard_disabled() ? 1 : 0;
 }
 
 static int ds4_test_make_engine(
@@ -63033,7 +63119,7 @@ static int ds4_session_glm_spec_cycle_impl(
     }
     if (!verified && !g->glm53) {
         if (!glm_graph_indexed_prefill_batch_ready(g, pos) ||
-            glm_graph_limit_indexed_prefill_chunk(pos, 2u) < 2u ||
+            glm_graph_limit_indexed_prefill_chunk(g, pos, 2u) < 2u ||
             !glm_graph_forward_indexed_tokens(g, &e->model, &e->weights,
                                               toks, NULL, pos, 2,
                                               s->glm_mtp_hc, s->logits,
@@ -63496,7 +63582,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             } else if (glm_graph_indexed_prefill_batch_ready(g, pos)) {
                 chunk = remaining;
                 if (chunk > g->indexed_prefill_cap) chunk = g->indexed_prefill_cap;
-                chunk = glm_graph_limit_indexed_prefill_chunk(pos, chunk);
+                chunk = glm_graph_limit_indexed_prefill_chunk(&s->glm_graph,
+                                                               pos,
+                                                               chunk);
                 if (chunk == 0) chunk = 1;
                 float *chunk_logits = (output_logits && done + chunk == n_tokens) ? logits : NULL;
                 ok = glm_graph_forward_indexed_tokens(g,
@@ -64208,7 +64296,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     if (chunk > s->glm_graph.indexed_prefill_cap) {
                         chunk = s->glm_graph.indexed_prefill_cap;
                     }
-                    chunk = glm_graph_limit_indexed_prefill_chunk(pos, chunk);
+                    chunk = glm_graph_limit_indexed_prefill_chunk(&s->glm_graph,
+                                                                   pos,
+                                                                   chunk);
                 } else if (pos < s->glm_graph.ctx_cap) {
                     const uint32_t dense_left = s->glm_graph.ctx_cap - pos;
                     if (chunk > dense_left) chunk = dense_left;
@@ -64499,7 +64589,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 if (chunk > s->glm_graph.indexed_prefill_cap) {
                     chunk = s->glm_graph.indexed_prefill_cap;
                 }
-                chunk = glm_graph_limit_indexed_prefill_chunk(pos, chunk);
+                chunk = glm_graph_limit_indexed_prefill_chunk(&s->glm_graph,
+                                                               pos,
+                                                               chunk);
                 if (chunk == 0) chunk = 1;
                 float *chunk_logits =
                     (i + (int)chunk >= prompt->len) ? s->logits : NULL;
@@ -64683,7 +64775,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     if (chunk > s->glm_graph.indexed_prefill_cap) {
                         chunk = s->glm_graph.indexed_prefill_cap;
                     }
-                    chunk = glm_graph_limit_indexed_prefill_chunk((uint32_t)i, chunk);
+                    chunk = glm_graph_limit_indexed_prefill_chunk(&s->glm_graph,
+                                                                   (uint32_t)i,
+                                                                   chunk);
                     float *chunk_logits =
                         (i + (int)chunk >= prompt->len) ? s->logits : NULL;
                     if (sync_trace) {
@@ -66048,8 +66142,9 @@ static bool glm53_graph_native_session_batch_supported(
     if (!items[0].session) return false;
     ds4_glm_gpu_graph *first = &items[0].session->glm_graph;
     if (!first->glm53 || first->ssd_streaming || first->placement ||
-        !first->full_kv_cache ||
         !first->has_token_embd || !first->has_output_head ||
+        (!first->full_kv_cache &&
+         (first->compact_cache_cap == 0 || !first->batch_qk_low)) ||
         (uint32_t)count > first->ctx_cap) {
         return false;
     }
@@ -66058,13 +66153,13 @@ static bool glm53_graph_native_session_batch_supported(
         ds4_glm_gpu_graph *g = &s->glm_graph;
         const uint32_t pos = (uint32_t)s->checkpoint.len;
         if (!g->glm53 || g->ssd_streaming || g->placement ||
-            !g->full_kv_cache ||
+            g->full_kv_cache != first->full_kv_cache ||
             g->compact_cache_cap != first->compact_cache_cap ||
             g->layer_start != first->layer_start ||
             g->layer_end != first->layer_end ||
             g->tp_world != first->tp_world ||
             g->tp_rank != first->tp_rank ||
-            pos >= g->ctx_cap) {
+            pos >= glm_graph_dense_compact_attention_limit(g)) {
             return false;
         }
     }
@@ -66209,7 +66304,8 @@ static bool glm53_graph_encode_dsa_session_batch(
                                               batch->q_dim,
                                               batch->batch_q_rank_norm,
                                               rows);
-    if (ok) ok = ds4_gpu_glm_k_b_project_typed_tensor(
+    if (ok && batch->full_kv_cache) {
+        ok = ds4_gpu_glm_k_b_project_typed_tensor(
             batch->batch_k_nope,
             batch->batch_kv_norm,
             model->map,
@@ -66220,13 +66316,16 @@ static bool glm53_graph_encode_dsa_session_batch(
             DS4_N_KV_LORA,
             (uint32_t)batch->q_nope,
             DS4_N_HEAD) != 0;
-    if (ok) ok = glm_graph_matmul_q8_0_tensor(batch->batch_value,
-                                              model,
-                                              l->attn_v_b->abs_offset,
-                                              DS4_N_KV_LORA,
-                                              batch->heads_dim,
-                                              batch->batch_kv_norm,
-                                              rows);
+    }
+    if (ok && batch->full_kv_cache) {
+        ok = glm_graph_matmul_q8_0_tensor(batch->batch_value,
+                                         model,
+                                         l->attn_v_b->abs_offset,
+                                         DS4_N_KV_LORA,
+                                         batch->heads_dim,
+                                         batch->batch_kv_norm,
+                                         rows);
+    }
     const bool mirror_compact = batch->compact_cache_cap != 0;
     const bool mirror_indexer =
         mirror_compact && glm_graph_layer_uses_full_indexer(il);
@@ -66260,13 +66359,20 @@ static bool glm53_graph_encode_dsa_session_batch(
         ds4_gpu_tensor *kv_raw = glm_graph_tensor_row_view_strided(
                 batch->batch_kv_raw, (uint32_t)i,
                 batch->kv_raw_dim, kv_raw_dim);
-        ds4_gpu_tensor *k_nope = glm_graph_tensor_row_view_strided(
-                batch->batch_k_nope, (uint32_t)i,
-                (uint64_t)DS4_N_HEAD * batch->q_nope,
-                (uint64_t)DS4_N_HEAD * batch->q_nope);
-        ds4_gpu_tensor *value = glm_graph_tensor_row_view_strided(
-                batch->batch_value, (uint32_t)i,
-                batch->heads_dim, batch->heads_dim);
+        ds4_gpu_tensor *k_nope = batch->full_kv_cache ?
+            glm_graph_tensor_row_view_strided(
+                    batch->batch_k_nope, (uint32_t)i,
+                    (uint64_t)DS4_N_HEAD * batch->q_nope,
+                    (uint64_t)DS4_N_HEAD * batch->q_nope) : NULL;
+        ds4_gpu_tensor *value = batch->full_kv_cache ?
+            glm_graph_tensor_row_view_strided(
+                    batch->batch_value, (uint32_t)i,
+                    batch->heads_dim, batch->heads_dim) : NULL;
+        ds4_gpu_tensor *qk_low = !batch->full_kv_cache ?
+            glm_graph_tensor_row_view_strided(
+                    batch->batch_qk_low, (uint32_t)i,
+                    (uint64_t)DS4_N_HEAD * DS4_N_KV_LORA,
+                    (uint64_t)DS4_N_HEAD * DS4_N_KV_LORA) : NULL;
         ds4_gpu_tensor *kv_norm = mirror_compact ?
             glm_graph_tensor_row_view_strided(
                 batch->batch_kv_norm, (uint32_t)i,
@@ -66282,7 +66388,8 @@ static bool glm53_graph_encode_dsa_session_batch(
         ds4_gpu_tensor *heads = glm_graph_tensor_row_view_strided(
                 batch->batch_heads, (uint32_t)i,
                 batch->heads_dim, batch->heads_dim);
-        ok = q && kv_raw && k_nope && value && heads &&
+        ok = q && kv_raw && heads &&
+             (batch->full_kv_cache ? (k_nope && value) : qk_low != NULL) &&
              (!mirror_compact || kv_norm) &&
              (!mirror_indexer || (indexer_k && indexer_gate));
         if (ok && mirror_indexer) {
@@ -66319,46 +66426,90 @@ static bool glm53_graph_encode_dsa_session_batch(
                     DS4_N_ROT,
                     glm_graph_compact_cache_is_f16()) != 0;
         }
-        if (ok) ok = ds4_gpu_glm_build_kv_cache_tensor(
-                g->layer_key_cache[il],
-                g->layer_value_cache[il],
-                kv_raw,
-                k_nope,
-                value,
-                pos,
-                1,
-                g->ctx_cap,
-                DS4_N_HEAD,
-                kv_raw_dim,
-                DS4_N_KV_LORA,
-                (uint32_t)g->q_nope,
-                DS4_N_ROT,
-                DS4_N_VALUE_MLA,
-                0,
-                rope_base,
-                rope_scale,
-                0.0f,
-                1.0f,
-                DS4_ROPE_YARN_BETA_FAST,
-                DS4_ROPE_YARN_BETA_SLOW,
-                true) != 0;
-        if (ok) ok = ds4_gpu_glm_attention_full_tensor(
-                heads,
-                q,
-                g->layer_key_cache[il],
-                g->layer_value_cache[il],
-                pos,
-                1,
-                pos + 1u,
-                g->ctx_cap,
-                DS4_N_HEAD,
-                DS4_N_KEY_MLA,
-                DS4_N_VALUE_MLA,
-                true) != 0;
+        if (ok && !g->full_kv_cache) {
+            const uint32_t visible = pos + 1u;
+            ok = ds4_gpu_glm_fill_selected_range_tensor(
+                    g->indexer_selected, visible) != 0;
+            if (ok) ok = ds4_gpu_glm_qk_lowrank_typed_tensor(
+                    qk_low,
+                    q,
+                    model->map,
+                    model->size,
+                    l->attn_k_b->abs_offset,
+                    l->attn_k_b->type,
+                    DS4_N_HEAD,
+                    DS4_N_KV_LORA,
+                    (uint32_t)g->q_nope,
+                    DS4_N_KEY_MLA) != 0;
+            if (ok) ok = ds4_gpu_glm_attention_indexed_decode_typed_tensor(
+                    heads,
+                    q,
+                    qk_low,
+                    g->layer_kv_lora_cache[il],
+                    g->layer_k_rope_cache[il],
+                    model->map,
+                    model->size,
+                    l->attn_v_b->abs_offset,
+                    l->attn_v_b->type,
+                    g->indexer_selected,
+                    visible,
+                    g->compact_cache_cap,
+                    glm_graph_compact_cache_is_f16(),
+                    DS4_N_HEAD,
+                    DS4_N_KV_LORA,
+                    (uint32_t)g->q_nope,
+                    DS4_N_ROT,
+                    DS4_N_VALUE_MLA,
+                    0,
+                    rope_base,
+                    rope_scale,
+                    0.0f,
+                    1.0f,
+                    DS4_ROPE_YARN_BETA_FAST,
+                    DS4_ROPE_YARN_BETA_SLOW) != 0;
+        } else {
+            if (ok) ok = ds4_gpu_glm_build_kv_cache_tensor(
+                    g->layer_key_cache[il],
+                    g->layer_value_cache[il],
+                    kv_raw,
+                    k_nope,
+                    value,
+                    pos,
+                    1,
+                    g->ctx_cap,
+                    DS4_N_HEAD,
+                    kv_raw_dim,
+                    DS4_N_KV_LORA,
+                    (uint32_t)g->q_nope,
+                    DS4_N_ROT,
+                    DS4_N_VALUE_MLA,
+                    0,
+                    rope_base,
+                    rope_scale,
+                    0.0f,
+                    1.0f,
+                    DS4_ROPE_YARN_BETA_FAST,
+                    DS4_ROPE_YARN_BETA_SLOW,
+                    true) != 0;
+            if (ok) ok = ds4_gpu_glm_attention_full_tensor(
+                    heads,
+                    q,
+                    g->layer_key_cache[il],
+                    g->layer_value_cache[il],
+                    pos,
+                    1,
+                    pos + 1u,
+                    g->ctx_cap,
+                    DS4_N_HEAD,
+                    DS4_N_KEY_MLA,
+                    DS4_N_VALUE_MLA,
+                    true) != 0;
+        }
         ds4_gpu_tensor_free(heads);
         ds4_gpu_tensor_free(indexer_gate);
         ds4_gpu_tensor_free(indexer_k);
         ds4_gpu_tensor_free(kv_norm);
+        ds4_gpu_tensor_free(qk_low);
         ds4_gpu_tensor_free(value);
         ds4_gpu_tensor_free(k_nope);
         ds4_gpu_tensor_free(kv_raw);

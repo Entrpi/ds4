@@ -275,7 +275,7 @@ same, and vision is enabled only when the sidecar is passed explicitly:
 ```sh
 ./download_model.sh glm53-vision
 ./ds4 -m gguf/GLM-5.3-Flash-Q2.gguf \
-  --vision gguf/glm-5.3-vision-encoder.gguf
+  --vision gguf/GLM-5.3-Flash-Vision-Encoder.gguf
 ```
 
 The published encoder SHA-256 is

@@ -27091,7 +27091,10 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
         uint32_t               n_kv,
         uint32_t               window,
         uint32_t               n_head,
-        uint32_t               head_dim) {
+        uint32_t               head_dim,
+        bool                   raw_kv_f16,
+        bool                   has_sinks,
+        float                  scale) {
     if (!cbp || !*cbp) return 0;
     id<MTLCommandBuffer> cb = *cbp;
     if (head_dim != 512 || n_head == 0 || n_q == 0 || n_kv == 0) {
@@ -27102,12 +27105,13 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
     id<MTLBuffer> rawbuf = ds4_gpu_tensor_buffer(raw_kv);
     id<MTLBuffer> headsbuf = ds4_gpu_tensor_buffer(heads);
     const uint64_t q_bytes = (uint64_t)n_q * n_head * head_dim * sizeof(float);
-    const uint64_t raw_bytes = (uint64_t)n_kv * head_dim * sizeof(float);
-    if (!qbuf || !rawbuf || !headsbuf || !sinks_buf ||
+    const uint64_t raw_bytes = (uint64_t)n_kv * head_dim *
+                               (raw_kv_f16 ? sizeof(uint16_t) : sizeof(float));
+    if (!qbuf || !rawbuf || !headsbuf || (has_sinks && !sinks_buf) ||
         ds4_gpu_tensor_bytes(q) < q_bytes ||
         ds4_gpu_tensor_bytes(raw_kv) < raw_bytes ||
         ds4_gpu_tensor_bytes(heads) < q_bytes) {
-        fprintf(stderr, "ds4: Metal prefill raw DS4 non-vector FlashAttention received undersized buffers\n");
+        fprintf(stderr, "ds4: Metal prefill shared-KV FlashAttention received undersized buffers\n");
         return 0;
     }
 
@@ -27212,18 +27216,19 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
         ds4_gpu_get_flash_attn_blk_pipeline((int32_t)nqptg, (int32_t)ncpsg);
     id<MTLComputePipelineState> attn_pipeline =
         ds4_gpu_get_flash_attn_pipeline("kernel_flash_attn_ext_f16_dk512_dv512",
-                                          true, true, false, false, has_kvpad, bc_mask,
+                                          true, has_sinks, false, false, has_kvpad, bc_mask,
                                           (int32_t)head_dim,
                                           (int32_t)head_dim,
                                           (int32_t)nsg);
     if (!blk_pipeline || !attn_pipeline) return 0;
 
-    if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
-                                         rawbuf,
-                                         ds4_gpu_tensor_offset(raw_kv),
-                                         g_flash_attn_kv_buffer,
-                                         0,
-                                         n_kv * head_dim)) {
+    if (!ds4_gpu_encode_copy_to_f16_1d(cb,
+                                        rawbuf,
+                                        ds4_gpu_tensor_offset(raw_kv),
+                                        raw_kv_f16,
+                                        g_flash_attn_kv_buffer,
+                                        0,
+                                        n_kv * head_dim)) {
         return 0;
     }
     DS4_METAL_PROFILE_FLASH_ATTN_STAGE("copy_raw");
@@ -27312,7 +27317,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
         .ne1 = (int32_t)n_head,
         .ne2 = (int32_t)n_q,
         .ne3 = 1,
-        .scale = 1.0f / sqrtf((float)head_dim),
+        .scale = scale,
         .max_bias = 0.0f,
         .m0 = 0.0f,
         .m1 = 0.0f,
@@ -27332,7 +27337,9 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
     [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
     [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:3];
     [enc setBuffer:mask_buffer offset:0 atIndex:4];
-    [enc setBuffer:sinks_buf offset:sinks_offset atIndex:5];
+    [enc setBuffer:has_sinks ? sinks_buf : qbuf
+             offset:has_sinks ? sinks_offset : ds4_gpu_tensor_offset(q)
+            atIndex:5];
     [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:6];
     [enc setBuffer:blk_buffer offset:0 atIndex:7];
     [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:8];
@@ -27378,7 +27385,10 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads(
                                                                          n_kv,
                                                                          window,
                                                                          n_head,
-                                                                         head_dim);
+                                                                         head_dim,
+                                                                         false,
+                                                                         true,
+                                                                         1.0f / sqrtf((float)head_dim));
     }
     const uint32_t n_tokens = n_q;
 
@@ -28485,6 +28495,57 @@ int ds4_gpu_attention_prefill_raw_heads_tensor(
                                                               window,
                                                               n_head,
                                                               head_dim);
+}
+
+int ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
+        ds4_gpu_tensor       *lora_out,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        uint32_t              q_row0,
+        uint32_t              n_q,
+        uint32_t              n_kv,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_dim) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!lora_out || !qk_low || !kv_lora_cache ||
+        n_q == 0 || n_kv == 0 || n_kv > cache_cap ||
+        q_row0 >= n_kv || n_q > n_kv - q_row0 ||
+        !cache_f16 || n_head == 0 || kv_lora_dim != 512u || qk_dim == 0) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        if (!ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
+                &cb,
+                lora_out,
+                nil,
+                0,
+                qk_low,
+                kv_lora_cache,
+                q_row0,
+                n_q,
+                n_kv,
+                0,
+                n_head,
+                kv_lora_dim,
+                true,
+                false,
+                1.0f / sqrtf((float)qk_dim))) {
+            return 0;
+        }
+        if (!ds4_gpu_finish_command_buffer(
+                cb, owned, "GLM dense compact prefill attention")) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 int ds4_gpu_attention_decode_raw_batch_heads_tensor(
@@ -35573,10 +35634,10 @@ int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
         n_tokens == 0 || n_selected == 0 || cache_cap == 0 || n_selected > cache_cap ||
         pos0 > n_selected || n_tokens > n_selected - pos0 ||
         n_head == 0 || kv_lora_dim != 512u ||
-        qk_nope == 0 || qk_rope != 64u ||
+        qk_nope == 0 || (qk_rope != 0u && qk_rope != 64u) ||
         qk_dim < qk_nope || !cache_f16 ||
-        !isfinite(freq_base) || freq_base <= 0.0f ||
-        !isfinite(freq_scale) || freq_scale <= 0.0f ||
+        (qk_rope != 0u && (!isfinite(freq_base) || freq_base <= 0.0f)) ||
+        (qk_rope != 0u && (!isfinite(freq_scale) || freq_scale <= 0.0f)) ||
         !isfinite(ext_factor) || !isfinite(attn_factor) ||
         !isfinite(beta_fast) || !isfinite(beta_slow)) {
         return 0;
