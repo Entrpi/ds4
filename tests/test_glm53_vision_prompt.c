@@ -1,6 +1,8 @@
 #include "ds4.h"
 
+#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct {
@@ -36,6 +38,9 @@ int main(int argc, char **argv) {
     ds4_vision_span span = {0};
     ds4_tokens prompt = {0};
     ds4_session *session = NULL;
+    float *image_logits = NULL;
+    float *zero_image_logits = NULL;
+    float *image_embedding_data = NULL;
     int rc = 1;
 
     if (!ds4_engine_vision_encode_file(engine, argv[3], &embedding,
@@ -64,6 +69,23 @@ int main(int argc, char **argv) {
                  "unchanged image unexpectedly repeated prefill");
         goto done;
     }
+    const int n_vocab = ds4_engine_vocab_size(engine);
+    const size_t image_embedding_elems =
+        (size_t)span.embedding.token_count *
+        (size_t)ds4_engine_embd_dim(engine);
+    image_logits = malloc((size_t)n_vocab * sizeof(*image_logits));
+    zero_image_logits = malloc((size_t)n_vocab * sizeof(*zero_image_logits));
+    image_embedding_data = malloc(image_embedding_elems *
+                                  sizeof(*image_embedding_data));
+    if (!image_logits || !zero_image_logits || !image_embedding_data ||
+        ds4_session_copy_logits(session, image_logits, n_vocab) != n_vocab) {
+        snprintf(error, sizeof(error), "unable to save image-conditioned logits");
+        goto done;
+    }
+    memcpy(image_embedding_data, span.embedding.data,
+           image_embedding_elems * sizeof(*image_embedding_data));
+    memset(span.embedding.data, 0,
+           image_embedding_elems * sizeof(*span.embedding.data));
     span.embedding.fingerprint[0] ^= 1u;
     if (ds4_session_sync_multimodal(session, &prompt, &span, 1,
                                     error, sizeof(error)) != 0) goto done;
@@ -73,6 +95,25 @@ int main(int argc, char **argv) {
                  "changed image fingerprint did not rebuild prompt state");
         goto done;
     }
+    if (ds4_session_copy_logits(session, zero_image_logits, n_vocab) != n_vocab) {
+        snprintf(error, sizeof(error), "unable to save zero-image logits");
+        goto done;
+    }
+    float max_delta = 0.0f;
+    for (int i = 0; i < n_vocab; i++) {
+        float delta = fabsf(image_logits[i] - zero_image_logits[i]);
+        if (delta > max_delta) max_delta = delta;
+    }
+    if (!(max_delta > 1.0e-4f)) {
+        snprintf(error, sizeof(error),
+                 "visual embedding did not affect output logits");
+        goto done;
+    }
+    memcpy(span.embedding.data, image_embedding_data,
+           image_embedding_elems * sizeof(*image_embedding_data));
+    span.embedding.fingerprint[0] ^= 1u;
+    if (ds4_session_sync_multimodal(session, &prompt, &span, 1,
+                                    error, sizeof(error)) != 0) goto done;
     ds4_session_set_progress(session, NULL, NULL);
     for (int i = 0; i < 48; i++) {
         int token = ds4_session_argmax(session);
@@ -91,6 +132,9 @@ int main(int argc, char **argv) {
 
 done:
     if (rc != 0) fprintf(stderr, "vision prompt failed: %s\n", error);
+    free(image_embedding_data);
+    free(zero_image_logits);
+    free(image_logits);
     ds4_session_free(session);
     ds4_tokens_free(&prompt);
     ds4_vision_embedding_free(&span.embedding);
