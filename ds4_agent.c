@@ -7228,6 +7228,8 @@ static void test_agent_tp_cache_payload_rebuild_policy(void) {
     AGENT_TEST_ASSERT(agent_kv_payload_requires_rebuild(&w, 1));
 }
 
+static void test_agent_terminal_wrap_output_is_deferred(void);
+
 static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
     test_agent_edit_upto_requires_tail_after_newline_strip();
@@ -7246,6 +7248,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_glm_stream_greedy_sampling_boundaries();
     test_agent_dsml_stream_tool_call_chunked();
     test_agent_glm_tool_parser_rejects_missing_value();
+    test_agent_terminal_wrap_output_is_deferred();
 }
 #endif
 
@@ -10124,6 +10127,7 @@ typedef struct {
     int reserved_rows;
     bool output_cursor_saved;
     bool output_at_scroll_boundary;
+    agent_input_buf deferred_output;
     double last_prompt_redraw_time;
     char cpr_buf[32];
     size_t cpr_len;
@@ -10136,6 +10140,10 @@ typedef struct {
 static void editor_queue_bytes(agent_editor *ed, const char *buf, size_t len);
 static void editor_hide(agent_editor *ed);
 static void editor_show(agent_editor *ed);
+static bool editor_write_scroll_output_preserve_prompt(agent_editor *ed,
+                                                       const char *text,
+                                                       size_t len,
+                                                       bool settle_boundary);
 
 typedef enum {
     CPR_INVALID,
@@ -10692,6 +10700,8 @@ static int editor_start(agent_editor *ed, const char *prompt,
 /* Stop the live editor and restore stdin flags. */
 static void editor_stop(agent_editor *ed) {
     if (!ed->active) return;
+    if (ed->deferred_output.len)
+        editor_write_scroll_output_preserve_prompt(ed, NULL, 0, true);
     /* ds4-agent treats linenoise as a live input widget, not as persistent
      * command scrollback.  Clear it before shutdown so submitting a line and
      * immediately reopening the editor does not leave the accepted
@@ -10812,23 +10822,95 @@ static bool editor_prompt_redraw_due(agent_editor *ed) {
     return false;
 }
 
-static void editor_write_scroll_output_preserve_prompt(agent_editor *ed,
+static bool editor_write_scroll_output_preserve_prompt(agent_editor *ed,
                                                        const char *text,
-                                                       size_t len) {
+                                                       size_t len,
+                                                       bool settle_boundary) {
     static const char sync_start[] = "\x1b[?2026h";
     static const char sync_end[] = "\x1b[?2026l";
-    if (!len) return;
+    agent_input_buf_append(&ed->deferred_output, text, len);
+    if (!ed->deferred_output.len) return false;
+
+    agent_editor predicted = *ed;
+    editor_note_output(&predicted, ed->deferred_output.ptr,
+                       ed->deferred_output.len);
+    bool at_boundary = predicted.output_line_open && predicted.output_col == 0;
+    /* DECSC/DECRC does not reliably preserve pending auto-wrap.  Keep a chunk
+     * that ends at the margin until the next content can trigger the wrap in
+     * the same terminal write. */
+    if (at_boundary && !settle_boundary) return false;
 
     write_all(STDOUT_FILENO, sync_start, sizeof(sync_start) - 1);
     editor_restore_output_cursor(ed);
-    editor_write_terminal_text(text, len);
-    editor_note_output(ed, text, len);
+    editor_write_terminal_text(ed->deferred_output.ptr,
+                               ed->deferred_output.len);
+    editor_note_output(ed, ed->deferred_output.ptr,
+                       ed->deferred_output.len);
+    if (at_boundary) {
+        /* ESC 7/8 does not preserve a terminal's pending auto-wrap flag.  At
+         * the end of a turn, settle it explicitly before saving the cursor. */
+        write_all(STDOUT_FILENO, "\r\n", 2);
+        ed->output_col = 0;
+        ed->output_line_open = false;
+    }
+    agent_input_buf_free(&ed->deferred_output);
     editor_save_output_cursor(ed);
     write_all(STDOUT_FILENO, "\x1b[0m", 4);
     editor_move_to_prompt_cursor(ed);
     write_all(STDOUT_FILENO, sync_end, sizeof(sync_end) - 1);
     ed->output_at_scroll_boundary = true;
+    return true;
 }
+
+#ifdef DS4_AGENT_TEST
+static void test_agent_terminal_wrap_output_is_deferred(void) {
+    FILE *sink = tmpfile();
+    AGENT_TEST_ASSERT(sink != NULL);
+    if (!sink) return;
+    int saved_stdout = dup(STDOUT_FILENO);
+    AGENT_TEST_ASSERT(saved_stdout >= 0);
+    if (saved_stdout < 0) {
+        fclose(sink);
+        return;
+    }
+    AGENT_TEST_ASSERT(dup2(fileno(sink), STDOUT_FILENO) >= 0);
+
+    agent_editor ed = {
+        .active = true,
+        .scroll_region = true,
+        .output_bottom = 22,
+        .prompt_row = 23,
+        .output_cursor_saved = true,
+    };
+    ed.edit.cols = 80;
+    char line[80];
+    memset(line, 'x', sizeof(line));
+
+    AGENT_TEST_ASSERT(!editor_write_scroll_output_preserve_prompt(
+        &ed, line, sizeof(line), false));
+    AGENT_TEST_ASSERT(ed.deferred_output.len == sizeof(line));
+    AGENT_TEST_ASSERT(ed.output_col == 0);
+    AGENT_TEST_ASSERT(!ed.output_line_open);
+
+    AGENT_TEST_ASSERT(editor_write_scroll_output_preserve_prompt(
+        &ed, "y", 1, false));
+    AGENT_TEST_ASSERT(ed.deferred_output.len == 0);
+    AGENT_TEST_ASSERT(ed.output_col == 1);
+    AGENT_TEST_ASSERT(ed.output_line_open);
+
+    ed.output_col = 0;
+    ed.output_line_open = false;
+    AGENT_TEST_ASSERT(editor_write_scroll_output_preserve_prompt(
+        &ed, line, sizeof(line), true));
+    AGENT_TEST_ASSERT(ed.deferred_output.len == 0);
+    AGENT_TEST_ASSERT(ed.output_col == 0);
+    AGENT_TEST_ASSERT(!ed.output_line_open);
+
+    AGENT_TEST_ASSERT(dup2(saved_stdout, STDOUT_FILENO) >= 0);
+    close(saved_stdout);
+    fclose(sink);
+}
+#endif
 
 /* Serialize async model/tool output with linenoise.  This is the central
  * terminal contract.  In scroll-region mode the live prompt stays painted:
@@ -10838,11 +10920,12 @@ static void editor_write_scroll_output_preserve_prompt(agent_editor *ed,
 static void editor_write_async(agent_editor *ed, const char *text, size_t len,
                                const char *prompt, const char *status,
                                bool force_show) {
-    if (ed->scroll_region && ed->active && !ed->hidden && len) {
+    if (ed->scroll_region && ed->active && !ed->hidden &&
+        (len || ed->deferred_output.len)) {
         bool prompt_changed = strcmp(ed->prompt, prompt) != 0;
         bool status_changed = strcmp(ed->status, status ? status : "") != 0;
 
-        editor_write_scroll_output_preserve_prompt(ed, text, len);
+        editor_write_scroll_output_preserve_prompt(ed, text, len, force_show);
         if (prompt_changed) editor_update_prompt(ed, prompt);
         if (status_changed) editor_update_status(ed, status);
         if ((force_show || editor_prompt_redraw_due(ed)) &&
@@ -11416,7 +11499,7 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
         build_prompt_text(&st, prompt, sizeof(prompt));
         int footer_cols = editor.edit.cols > 0 ? (int)editor.edit.cols : 80;
         build_footer_text(&st, &queue, footer_cols, statusline, sizeof(statusline));
-        if (out && out_len) {
+        if ((out && out_len) || editor.deferred_output.len) {
             bool force_show = st.state == AGENT_WORKER_IDLE ||
                               st.state == AGENT_WORKER_ERROR ||
                               st.state == AGENT_WORKER_STOPPED;
