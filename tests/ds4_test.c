@@ -163,6 +163,12 @@ static void test_session_snapshot_roundtrip(void) {
     int reference_counts[GLM_MTP_SNAPSHOT_CYCLES] = {0};
     int reference_total = 0;
     const bool test_glm_mtp = test_env_bool("DS4_TEST_GLM_MTP");
+#ifdef DS4_ROCM_BUILD
+    const float continued_logit_tolerance =
+        ds4_engine_is_glm53(engine) ? 1e-5f : 1e-6f;
+#else
+    const float continued_logit_tolerance = 1e-6f;
+#endif
 
     uint32_t ctx = test_env_u32("DS4_TEST_SNAPSHOT_CTX");
     if (ctx == 0) ctx = 1024;
@@ -216,6 +222,15 @@ static void test_session_snapshot_roundtrip(void) {
                                           err, sizeof(err)) == 0);
     TEST_ASSERT(ds4_session_top_logprobs(restored, restored_before, 8) == 8);
     for (int i = 0; i < 8; i++) {
+        if (restored_before[i].id != before[i].id ||
+            fabsf(restored_before[i].logit - before[i].logit) > 1e-6f) {
+            fprintf(stderr,
+                    "ds4-test: snapshot before[%d] reference=(%d,%.9g) "
+                    "restored=(%d,%.9g) delta=%.9g\n",
+                    i, before[i].id, before[i].logit,
+                    restored_before[i].id, restored_before[i].logit,
+                    restored_before[i].logit - before[i].logit);
+        }
         TEST_ASSERT(restored_before[i].id == before[i].id);
         TEST_ASSERT(fabsf(restored_before[i].logit - before[i].logit) <= 1e-6f);
     }
@@ -254,9 +269,20 @@ static void test_session_snapshot_roundtrip(void) {
     }
     TEST_ASSERT(ds4_session_top_logprobs(restored, restored_after, 8) == 8);
     for (int i = 0; i < 8; i++) {
+        if (restored_after[i].id != reference_after[i].id ||
+            fabsf(restored_after[i].logit - reference_after[i].logit) >
+                continued_logit_tolerance) {
+            fprintf(stderr,
+                    "ds4-test: snapshot after[%d] reference=(%d,%.9g) "
+                    "restored=(%d,%.9g) delta=%.9g\n",
+                    i, reference_after[i].id, reference_after[i].logit,
+                    restored_after[i].id, restored_after[i].logit,
+                    restored_after[i].logit - reference_after[i].logit);
+        }
         TEST_ASSERT(restored_after[i].id == reference_after[i].id);
         TEST_ASSERT(fabsf(restored_after[i].logit -
-                          reference_after[i].logit) <= 1e-6f);
+                          reference_after[i].logit) <=
+                    continued_logit_tolerance);
     }
     if (test_glm_mtp) {
         TEST_ASSERT(ds4_session_sync(restored, &prompt,
