@@ -5,6 +5,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
+
+static double wall_seconds(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
 
 int main(int argc, char **argv) {
     if (argc != 5 && argc != 6) {
@@ -25,11 +32,35 @@ int main(int argc, char **argv) {
     if (ds4_engine_open(&engine, &options) != 0) return 1;
     char error[256] = {0};
     ds4_vision_embedding embedding = {0};
-    if (!ds4_engine_vision_encode_file(engine, argv[3], &embedding,
-                                       error, sizeof(error))) {
-        fprintf(stderr, "vision encode failed: %s\n", error);
-        ds4_engine_close(engine);
-        return 1;
+    unsigned repeats = 1u;
+    const char *repeat_env = getenv("DS4_TEST_VISION_REPEATS");
+    if (repeat_env && repeat_env[0]) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(repeat_env, &end, 10);
+        if (!end || *end != '\0' || parsed == 0ul || parsed > 100ul) {
+            fprintf(stderr, "invalid DS4_TEST_VISION_REPEATS: %s\n",
+                    repeat_env);
+            ds4_engine_close(engine);
+            return 2;
+        }
+        repeats = (unsigned)parsed;
+    }
+    for (unsigned i = 0; i < repeats; i++) {
+        ds4_vision_embedding next = {0};
+        const double start = wall_seconds();
+        if (!ds4_engine_vision_encode_file(engine, argv[3], &next,
+                                           error, sizeof(error))) {
+            fprintf(stderr, "vision encode failed: %s\n", error);
+            ds4_vision_embedding_free(&embedding);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        if (repeats > 1u) {
+            fprintf(stderr, "vision encode %u/%u: %.3f s\n",
+                    i + 1u, repeats, wall_seconds() - start);
+        }
+        ds4_vision_embedding_free(&embedding);
+        embedding = next;
     }
     FILE *fp = fopen(argv[4], "wb");
     if (!fp) {

@@ -346,6 +346,7 @@ struct cuda_model_range {
     uint64_t registered_bytes;
     int host_registered;
     int arena_allocated;
+    int borrowed;
 };
 
 struct cuda_model_arena {
@@ -2536,7 +2537,7 @@ static void cuda_model_range_release_all(void) {
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
-        } else if (r.device_ptr && !r.arena_allocated) {
+        } else if (r.device_ptr && !r.arena_allocated && !r.borrowed) {
             (void)cudaFree(r.device_ptr);
         }
     }
@@ -3802,6 +3803,27 @@ extern "C" int ds4_gpu_set_aux_model_map_range(
         return 0;
     }
     if (cuda_model_range_is_cached(model_map, map_offset, map_size)) return 1;
+
+    int current_device = 0;
+    int integrated = 0;
+    int pageable = 0;
+    if (getenv("DS4_CUDA_AUX_FORCE_COPY") == NULL &&
+        cudaGetDevice(&current_device) == cudaSuccess &&
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated,
+                               current_device) ==
+            cudaSuccess &&
+        cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess,
+                               current_device) == cudaSuccess &&
+        integrated && pageable) {
+        g_model_ranges.push_back({
+                model_map, map_offset, map_size,
+                (char *)model_map + map_offset,
+                NULL, NULL, 0, 0, 0, 1});
+        fprintf(stderr,
+                "ds4: CUDA directly mapped %.2f GiB auxiliary model\n",
+                (double)map_size / 1073741824.0);
+        return 1;
+    }
 
     void *device = NULL;
     cudaError_t err = cudaMalloc(&device, (size_t)map_size);
