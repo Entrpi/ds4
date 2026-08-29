@@ -15454,14 +15454,9 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 #define DS4_GPU_ATTN_COMP_CACHE_F16 0
 #endif
 
-/* GLM's compact-cache kernels take the format explicitly. CUDA supports the
- * same F16 storage as Metal; ROCm retains F32 pending equivalent validation. */
-#if defined(__APPLE__) || \
-    (!defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD))
+/* All GPU backends store GLM's persistent compact cache in F16. Producers
+ * retain F32 staging, and the kernels receive the storage format explicitly. */
 #define DS4_GPU_GLM_COMPACT_CACHE_F16 1
-#else
-#define DS4_GPU_GLM_COMPACT_CACHE_F16 0
-#endif
 
 /* =========================================================================
  * Metal Release Graph State.
@@ -42602,29 +42597,39 @@ static bool glm53_graph_kda_attention_rows(
         return false;
     }
     const uint32_t projection = DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
+    const char *failed_stage = "Q projection";
+    const ds4_tensor *failed_weight = l->kda_q;
     bool ok = glm53_graph_matmul_rows(g->batch_kda_q, model, l->kda_q,
                                       DS4_N_EMBD, projection,
                                       g->batch_attn_norm, rows);
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_q_ready", g->batch_kda_q,
             (uint64_t)rows * projection, il, pos0);
+    if (ok) failed_stage = "K projection";
+    if (ok) failed_weight = l->kda_k;
     if (ok) ok = glm53_graph_matmul_rows(g->batch_kda_k, model, l->kda_k,
                                          DS4_N_EMBD, projection,
                                          g->batch_attn_norm, rows);
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_k_ready", g->batch_kda_k,
             (uint64_t)rows * projection, il, pos0);
+    if (ok) failed_stage = "V projection";
+    if (ok) failed_weight = l->kda_v;
     if (ok) ok = glm53_graph_matmul_rows(g->batch_kda_v, model, l->kda_v,
                                          DS4_N_EMBD, projection,
                                          g->batch_attn_norm, rows);
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_v_ready", g->batch_kda_v,
             (uint64_t)rows * projection, il, pos0);
+    if (ok) failed_stage = "decay low-rank projection";
+    if (ok) failed_weight = l->kda_f_a;
     if (ok) ok = glm53_graph_matmul_rows(g->batch_kda_lowrank, model,
                                          l->kda_f_a,
                                          DS4_N_EMBD,
                                          DS4_N_KDA_HEAD_DIM,
                                          g->batch_attn_norm, rows);
+    if (ok) failed_stage = "decay gate projection";
+    if (ok) failed_weight = l->kda_f_b;
     if (ok) ok = glm53_graph_matmul_rows(g->batch_kda_raw_gate, model,
                                          l->kda_f_b,
                                          DS4_N_KDA_HEAD_DIM,
@@ -42633,6 +42638,8 @@ static bool glm53_graph_kda_attention_rows(
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_raw_gate_ready", g->batch_kda_raw_gate,
             (uint64_t)rows * projection, il, pos0);
+    if (ok) failed_stage = "beta projection";
+    if (ok) failed_weight = l->kda_beta;
     if (ok) ok = glm53_graph_matmul_rows(g->batch_kda_raw_beta, model,
                                          l->kda_beta,
                                          DS4_N_EMBD,
@@ -42641,11 +42648,15 @@ static bool glm53_graph_kda_attention_rows(
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_raw_beta_ready", g->batch_kda_raw_beta,
             (uint64_t)rows * DS4_N_KDA_HEAD, il, pos0);
+    if (ok) failed_stage = "output-gate low-rank projection";
+    if (ok) failed_weight = l->kda_g_a;
     if (ok) ok = glm53_graph_matmul_rows(g->batch_kda_lowrank, model,
                                          l->kda_g_a,
                                          DS4_N_EMBD,
                                          DS4_N_KDA_HEAD_DIM,
                                          g->batch_attn_norm, rows);
+    if (ok) failed_stage = "output-gate projection";
+    if (ok) failed_weight = l->kda_g_b;
     if (ok) ok = glm53_graph_matmul_rows(g->batch_kda_output_gate, model,
                                          l->kda_g_b,
                                          DS4_N_KDA_HEAD_DIM,
@@ -42654,6 +42665,8 @@ static bool glm53_graph_kda_attention_rows(
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_output_gate_ready", g->batch_kda_output_gate,
             (uint64_t)rows * projection, il, pos0);
+    if (ok) failed_stage = "KDA recurrence";
+    if (ok) failed_weight = NULL;
     if (ok) ok = ds4_gpu_glm53_kda_prefill(
             g->batch_kda_out,
             g->layer_kda_conv_state[il],
@@ -42679,12 +42692,29 @@ static bool glm53_graph_kda_attention_rows(
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_out_ready", g->batch_kda_out,
             (uint64_t)rows * projection, il, pos0);
+    if (ok) failed_stage = "output projection";
+    if (ok) failed_weight = l->kda_output;
     if (ok) ok = glm53_graph_matmul_rows(attn_out, model, l->kda_output,
                                          projection, DS4_N_EMBD,
                                          g->batch_kda_out, rows);
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_attn_out_ready", attn_out,
             (uint64_t)rows * DS4_N_EMBD, il, pos0);
+    if (!ok) {
+        if (failed_weight) {
+            fprintf(stderr,
+                    "ds4: GLM-5.3 KDA failed at layer %u stage '%s' on "
+                    "tensor %.*s (%s; pos %u, rows %u)\n",
+                    il, failed_stage, (int)failed_weight->name.len,
+                    failed_weight->name.ptr,
+                    tensor_type_name(failed_weight->type), pos0, rows);
+        } else {
+            fprintf(stderr,
+                    "ds4: GLM-5.3 KDA failed at layer %u stage '%s' "
+                    "(pos %u, rows %u)\n",
+                    il, failed_stage, pos0, rows);
+        }
+    }
     return ok;
 }
 
@@ -45384,17 +45414,32 @@ static bool glm_graph_encode_ffn_batch(
                                    DS4_N_EXPERT,
                                    g->batch_ffn_norm,
                                    n_tokens) != 0;
-    if (ok) ok = ds4_gpu_glm_router_select_batch_tensor(g->batch_router_selected,
-                                                        g->batch_router_weights,
-                                                        g->batch_router_probs,
-                                                        model->map,
-                                                        model->size,
-                                                        l->ffn_exp_probs_b->abs_offset,
-                                                        g->batch_router_logits,
-                                                        DS4_N_EXPERT,
-                                                        DS4_N_EXPERT_USED,
-                                                        DS4_EXPERT_WEIGHT_SCALE,
-                                                        n_tokens) != 0;
+    if (!ok) {
+        fprintf(stderr,
+                "ds4: GLM sparse FFN router projection failed at layer %u "
+                "(pos %u, tokens %u)\n",
+                il, pos0, n_tokens);
+    }
+    if (ok) {
+        ok = ds4_gpu_glm_router_select_batch_tensor(g->batch_router_selected,
+                                                    g->batch_router_weights,
+                                                    g->batch_router_probs,
+                                                    model->map,
+                                                    model->size,
+                                                    l->ffn_exp_probs_b->abs_offset,
+                                                    g->batch_router_logits,
+                                                    DS4_N_EXPERT,
+                                                    DS4_N_EXPERT_USED,
+                                                    DS4_EXPERT_WEIGHT_SCALE,
+                                                    n_tokens) != 0;
+        if (!ok) {
+            fprintf(stderr,
+                    "ds4: GLM sparse FFN router selection failed at layer %u "
+                    "(pos %u, tokens %u, experts %u, selected %u, scale %.6g)\n",
+                    il, pos0, n_tokens, DS4_N_EXPERT,
+                    DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE);
+        }
+    }
     if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
                                                   stage_sync,
                                                   "glm_ffn",
@@ -50595,6 +50640,7 @@ static bool glm_graph_forward_token(
                                                       pos);
             }
             DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "kv_path");
+            DS4_GLM_FT_STAGE("DSA indexed attention");
             if (ok && (decode_ablate & DS4_GLM_ABLATE_ATTN_CORE)) {
                 /* Skip the indexed attention kernels; zero heads so the
                  * rest of the layer stays finite (timing-only). */

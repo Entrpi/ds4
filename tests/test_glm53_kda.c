@@ -9,6 +9,37 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 
+#ifdef DS4_ROCM_BUILD
+typedef struct {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t scales[12];
+    uint8_t qs[128];
+} test_block_q4_K;
+
+typedef struct {
+    uint16_t d;
+    int8_t qs[32];
+} test_block_q8_0;
+
+extern int ds4_gpu_matmul_q4_K_tensor(
+    ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+    uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+    const ds4_gpu_tensor *x, uint64_t n_rows);
+
+extern int ds4_gpu_glm_attention_indexed_decode_tensor(
+    ds4_gpu_tensor *heads, const ds4_gpu_tensor *q,
+    const ds4_gpu_tensor *qk_low, const ds4_gpu_tensor *kv_lora_cache,
+    const ds4_gpu_tensor *k_rope_cache, const void *model_map,
+    uint64_t model_size, uint64_t value_weight_offset,
+    const ds4_gpu_tensor *selected, uint32_t n_selected,
+    uint32_t cache_cap, bool cache_f16, uint32_t n_head,
+    uint32_t kv_lora_dim, uint32_t qk_nope, uint32_t qk_rope,
+    uint32_t value_dim, uint32_t n_ctx_orig, float freq_base,
+    float freq_scale, float ext_factor, float attn_factor,
+    float beta_fast, float beta_slow);
+#endif
+
 bool ds4_log_is_tty(FILE *fp) {
     (void)fp;
     return false;
@@ -59,6 +90,11 @@ int main(void) {
         BF16_IN = 64,
         BF16_OUT = 64,
         BF16_ROWS = 16,
+        Q4_OFFSET = 49152,
+        Q4_IN = 256,
+        Q4_OUT = 37,
+        Q4_ROWS = 3,
+        Q8_OFFSET = 60000,
         MODEL_BYTES = 65536,
     };
 
@@ -143,6 +179,51 @@ int main(void) {
     for (uint32_t i = 0; i < BF16_ROWS * BF16_OUT; i++)
         require_close("BF16 prefill matmul", bf16_actual[i], bf16_expected[i], 2e-4f);
 
+#ifdef DS4_ROCM_BUILD
+    test_block_q4_K *q4_weights = (test_block_q4_K *)(model + Q4_OFFSET);
+    for (uint32_t o = 0; o < Q4_OUT; o++) {
+        test_block_q4_K *block = q4_weights + o;
+        const uint8_t q = (uint8_t)(1u + o % 15u);
+        block->d = 0x3c00u;
+        block->dmin = 0u;
+        for (uint32_t group = 0; group < 4u; group++) {
+            block->scales[group] = 1u;
+            block->scales[group + 4u] = 0u;
+        }
+        for (uint32_t group = 4u; group < 8u; group++)
+            block->scales[group + 4u] = 1u;
+        for (uint32_t i = 0; i < sizeof(block->qs); i++)
+            block->qs[i] = (uint8_t)(q | (q << 4u));
+    }
+    float q4_input[Q4_ROWS * Q4_IN];
+    const float q4_row_values[Q4_ROWS] = {1.0f, -0.5f, 0.25f};
+    for (uint32_t row = 0; row < Q4_ROWS; row++)
+        for (uint32_t i = 0; i < Q4_IN; i++)
+            q4_input[row * Q4_IN + i] = q4_row_values[row];
+    ds4_gpu_tensor *q4_x = ds4_gpu_tensor_alloc(sizeof(q4_input));
+    ds4_gpu_tensor *q4_out =
+        ds4_gpu_tensor_alloc((uint64_t)Q4_ROWS * Q4_OUT * sizeof(float));
+    require_ok(q4_x && q4_out, "Q4_K tensor allocation");
+    require_ok(ds4_gpu_tensor_write(q4_x, 0, q4_input, sizeof(q4_input)),
+               "Q4_K input write");
+    require_ok(ds4_gpu_matmul_q4_K_tensor(
+        q4_out, model, MODEL_BYTES, Q4_OFFSET,
+        Q4_IN, Q4_OUT, q4_x, Q4_ROWS), "Q4_K dense matmul");
+    float q4_actual[Q4_ROWS * Q4_OUT];
+    require_ok(ds4_gpu_tensor_read(q4_out, 0, q4_actual, sizeof(q4_actual)),
+               "Q4_K output read");
+    for (uint32_t row = 0; row < Q4_ROWS; row++) {
+        for (uint32_t o = 0; o < Q4_OUT; o++) {
+            const float expected =
+                256.0f * (float)(1u + o % 15u) * q4_row_values[row];
+            require_close("Q4_K dense matmul",
+                          q4_actual[row * Q4_OUT + o], expected, 1e-3f);
+        }
+    }
+    ds4_gpu_tensor_free(q4_out);
+    ds4_gpu_tensor_free(q4_x);
+#endif
+
     enum { COMPACT_LORA = 512, COMPACT_TOKENS = 2, COMPACT_CAP = 4 };
     float compact_norm[COMPACT_TOKENS * COMPACT_LORA];
     float compact_raw[COMPACT_TOKENS * COMPACT_LORA];
@@ -156,9 +237,16 @@ int main(void) {
         ds4_gpu_tensor_alloc(sizeof(compact_raw));
     ds4_gpu_tensor *compact_cache_gpu = ds4_gpu_tensor_alloc(
         (uint64_t)COMPACT_CAP * COMPACT_LORA * sizeof(float));
-    ds4_gpu_tensor *zero_rope_cache_gpu = ds4_gpu_tensor_alloc(1u);
-    require_ok(compact_norm_gpu && compact_raw_gpu && compact_cache_gpu &&
-               zero_rope_cache_gpu, "zero-RoPE compact tensor allocation");
+    ds4_gpu_tensor *zero_rope_cache_gpu = NULL;
+#ifndef DS4_ROCM_BUILD
+    zero_rope_cache_gpu = ds4_gpu_tensor_alloc(1u);
+#endif
+    require_ok(compact_norm_gpu && compact_raw_gpu && compact_cache_gpu
+#ifndef DS4_ROCM_BUILD
+               && zero_rope_cache_gpu
+#endif
+               ,
+               "zero-RoPE compact tensor allocation");
     require_ok(ds4_gpu_tensor_write(compact_norm_gpu, 0, compact_norm,
                                     sizeof(compact_norm)),
                "zero-RoPE compact norm write");
@@ -186,6 +274,67 @@ int main(void) {
     ds4_gpu_tensor_free(compact_cache_gpu);
     ds4_gpu_tensor_free(compact_raw_gpu);
     ds4_gpu_tensor_free(compact_norm_gpu);
+
+#ifdef DS4_ROCM_BUILD
+    enum {
+        ATTN_LORA = 32,
+        ATTN_NOPE = 1,
+        ATTN_HEADS = 1,
+        ATTN_VALUE = 1,
+        ATTN_SELECTED = 2,
+        ATTN_CAP = 3,
+    };
+    test_block_q8_0 *value_weight =
+        (test_block_q8_0 *)(model + Q8_OFFSET);
+    value_weight->d = 0x3c00u;
+    for (uint32_t i = 0; i < ATTN_LORA; i++) value_weight->qs[i] = 1;
+    float attn_q[ATTN_HEADS * ATTN_NOPE] = {0.0f};
+    float attn_low[ATTN_HEADS * ATTN_LORA] = {0.0f};
+    float attn_cache[ATTN_CAP * ATTN_LORA];
+    for (uint32_t row = 0; row < ATTN_CAP; row++) {
+        for (uint32_t i = 0; i < ATTN_LORA; i++) {
+            attn_cache[row * ATTN_LORA + i] = 1.0f + 2.0f * (float)row;
+        }
+    }
+    int32_t attn_selected[ATTN_SELECTED] = {0, 1};
+    ds4_gpu_tensor *attn_heads_gpu =
+        ds4_gpu_tensor_alloc(ATTN_HEADS * ATTN_VALUE * sizeof(float));
+    ds4_gpu_tensor *attn_q_gpu = ds4_gpu_tensor_alloc(sizeof(attn_q));
+    ds4_gpu_tensor *attn_low_gpu = ds4_gpu_tensor_alloc(sizeof(attn_low));
+    ds4_gpu_tensor *attn_cache_gpu = ds4_gpu_tensor_alloc(sizeof(attn_cache));
+    ds4_gpu_tensor *attn_selected_gpu =
+        ds4_gpu_tensor_alloc(sizeof(attn_selected));
+    require_ok(attn_heads_gpu && attn_q_gpu && attn_low_gpu &&
+               attn_cache_gpu && attn_selected_gpu,
+               "zero-RoPE indexed attention allocation");
+    require_ok(ds4_gpu_tensor_write(attn_q_gpu, 0, attn_q, sizeof(attn_q)),
+               "zero-RoPE attention Q write");
+    require_ok(ds4_gpu_tensor_write(attn_low_gpu, 0, attn_low,
+                                    sizeof(attn_low)),
+               "zero-RoPE attention low-rank Q write");
+    require_ok(ds4_gpu_tensor_write(attn_cache_gpu, 0, attn_cache,
+                                    sizeof(attn_cache)),
+               "zero-RoPE attention cache write");
+    require_ok(ds4_gpu_tensor_write(attn_selected_gpu, 0, attn_selected,
+                                    sizeof(attn_selected)),
+               "zero-RoPE attention selection write");
+    require_ok(ds4_gpu_glm_attention_indexed_decode_tensor(
+        attn_heads_gpu, attn_q_gpu, attn_low_gpu, attn_cache_gpu, NULL,
+        model, MODEL_BYTES, Q8_OFFSET, attn_selected_gpu,
+        ATTN_SELECTED, ATTN_CAP, false, ATTN_HEADS, ATTN_LORA,
+        ATTN_NOPE, 0, ATTN_VALUE, 0, 0.0f, 0.0f, 0.0f, 1.0f,
+        0.0f, 0.0f), "GLM-5.3 zero-RoPE indexed decode attention");
+    float attn_actual = 0.0f;
+    require_ok(ds4_gpu_tensor_read(attn_heads_gpu, 0, &attn_actual,
+                                    sizeof(attn_actual)),
+               "zero-RoPE attention output read");
+    require_close("zero-RoPE indexed attention", attn_actual, 64.0f, 1e-4f);
+    ds4_gpu_tensor_free(attn_selected_gpu);
+    ds4_gpu_tensor_free(attn_cache_gpu);
+    ds4_gpu_tensor_free(attn_low_gpu);
+    ds4_gpu_tensor_free(attn_q_gpu);
+    ds4_gpu_tensor_free(attn_heads_gpu);
+#endif
 
     enum { POOL = 4, POOL_TOKENS = 11, POOL_CAP = 16, POOL_COUNT = 4 };
     float pool_raw[POOL_TOKENS * D];

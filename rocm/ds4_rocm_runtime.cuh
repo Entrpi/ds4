@@ -25,6 +25,7 @@ static int g_glm_model;
 
 enum {
     DS4_ROCM_N_EXPERT = 256u,
+    DS4_ROCM_GLM53_N_EXPERT = 288u,
     DS4_ROCM_MAX_N_EXPERT = 384u,
     DS4_ROCM_N_EXPERT_USED = 8u,
     DS4_ROCM_STREAM_READ_WORKERS = DS4_ROCM_N_EXPERT_USED * 3u,
@@ -4510,7 +4511,6 @@ static int cuda_stream_selected_apply(
         const char **down_w) {
     if (g_ssd_streaming_mode &&
         !g_stream_selected_cache.loaded &&
-        getenv("DS4_ROCM_DISABLE_STREAMING_SPLIT_SELECTED") != NULL &&
         cuda_stream_selected_pending_matches(model_map,
                                              layer,
                                              n_total_expert,
