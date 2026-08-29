@@ -340,10 +340,11 @@ or backend fallback selection changes.
   retrying indefinitely.
 - Verify unsupported combinations explicitly. GLM 5.2, GLM 5.3 after the
   4,096-token sparse boundary, DSpark support models, quality/reference modes,
-  steering, and CPU-router modes must use their established exact fallback or
-  reject the combination before evaluation. GLM 5.3 below the boundary and
-  supported SSD-streaming configurations have native batching and must pass
-  their model-specific oracle instead of being forced off.
+  and CPU-router modes must use their established exact fallback or reject the
+  combination before evaluation. GLM 5.3 below the boundary, including
+  directional steering, and supported SSD-streaming configurations have native
+  batching and must pass their model-specific oracle instead of being forced
+  off.
 
 ## 5. Metal PRO Path
 
@@ -498,6 +499,28 @@ block. A GLM 5.2 pass does not cover these paths.
 - Run ordinary greedy decode, opportunistic MTP, and `--mtp-exact-sampling`.
   Greedy MTP must preserve the accepted continuation and provide a measured
   gain; the current short Q2 control improved from 34.21 to 41.97 t/s.
+- After directional-steering changes, verify that a zero `45 x 4096` GLM vector
+  is output-identical to the unsteered CLI for both FFN and attention hooks. A
+  46-row file must be rejected with the expected 737,280-byte size. Build a
+  `/path/to/glm53-direction.f32` test vector with the command in
+  `dir-steering/README.md`, then run it through ordinary decode, `--mtp`, and a
+  two-session `ds4-server` smoke. Run the native batch oracle with:
+
+  ```sh
+  DS4_TEST_MODEL=/path/to/GLM-5.3-Flash-Q2.gguf \
+  DS4_TEST_SESSION_COUNT=4 DS4_TEST_LOGIT_TOLERANCE=0.001 \
+  DS4_TEST_DIRECTIONAL_STEERING_FILE=/path/to/glm53-direction.f32 \
+  DS4_TEST_DIRECTIONAL_STEERING_FFN=1 \
+  DS4_TEST_DIRECTIONAL_STEERING_ATTN=0.25 \
+  make test-metal-session-batch
+  ```
+
+  It must cover native decode and mixed prefill/decode without changing any
+  selected token. Repeat a short physical TP run over RDMA with the same file
+  and scales on both ranks. On CUDA and ROCm release targets, require a
+  warning-free build and one short steered GLM 5.3 Q2 prompt. Finally rerun a
+  held-out target/control sweep; an effective edit that makes control answers
+  repetitive or incoherent does not pass.
 - Run the two- and four-session GLM 5.3 server oracle below token 4096 on one
   M5 and physical TP. For both native single-M5 and TP paths, set
   `DS4_TEST_LOGIT_TOLERANCE=0.001`: row-batched reductions may differ from the

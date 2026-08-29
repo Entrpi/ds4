@@ -1690,8 +1690,9 @@ CUDA.
 
 ## Steering
 
-This project supports steering with single-vector activation directions; see the
-`dir-steering` directory for more information. This follows the core idea of the
+DeepSeek V4 Flash and GLM 5.3 Flash support steering with single-vector
+activation directions; see the `dir-steering` directory for examples,
+model-specific shapes, and build instructions. This follows the core idea of the
 [Refusal in Language Models Is Mediated by a Single Direction](https://arxiv.org/abs/2406.11717)
 paper. You can use it to make the model more or less verbose, less likely to
 answer programming questions if it is a chatbot for your car rental web site,
