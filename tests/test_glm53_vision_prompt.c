@@ -19,6 +19,15 @@ static void count_progress(void *ud, const char *event, int current, int total) 
     counter->total = total;
 }
 
+static float max_logit_delta(const float *a, const float *b, int count) {
+    float max_delta = 0.0f;
+    for (int i = 0; i < count; i++) {
+        float delta = fabsf(a[i] - b[i]);
+        if (delta > max_delta) max_delta = delta;
+    }
+    return max_delta;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s MAIN.gguf VISION.gguf IMAGE\n", argv[0]);
@@ -28,7 +37,7 @@ int main(int argc, char **argv) {
     options.model_path = argv[1];
     options.vision_path = argv[2];
     options.backend = DS4_BACKEND_METAL;
-    options.context_size = 2048;
+    options.context_size = 4096;
     options.quality = true;
 
     ds4_engine *engine = NULL;
@@ -39,7 +48,9 @@ int main(int argc, char **argv) {
     ds4_tokens prompt = {0};
     ds4_session *session = NULL;
     float *image_logits = NULL;
+    float *replayed_image_logits = NULL;
     float *zero_image_logits = NULL;
+    float *restored_image_logits = NULL;
     float *image_embedding_data = NULL;
     int rc = 1;
 
@@ -53,7 +64,7 @@ int main(int argc, char **argv) {
                       "\nDescribe the image briefly and state its dominant colors.",
                       &prompt);
     ds4_chat_append_assistant_prefix(engine, &prompt, DS4_THINK_NONE);
-    if (ds4_session_create(&session, engine, 2048) != 0) {
+    if (ds4_session_create(&session, engine, 4096) != 0) {
         snprintf(error, sizeof(error), "session creation failed");
         goto done;
     }
@@ -74,14 +85,38 @@ int main(int argc, char **argv) {
         (size_t)span.embedding.token_count *
         (size_t)ds4_engine_embd_dim(engine);
     image_logits = malloc((size_t)n_vocab * sizeof(*image_logits));
+    replayed_image_logits = malloc((size_t)n_vocab *
+                                   sizeof(*replayed_image_logits));
     zero_image_logits = malloc((size_t)n_vocab * sizeof(*zero_image_logits));
+    restored_image_logits = malloc((size_t)n_vocab *
+                                   sizeof(*restored_image_logits));
     image_embedding_data = malloc(image_embedding_elems *
                                   sizeof(*image_embedding_data));
-    if (!image_logits || !zero_image_logits || !image_embedding_data ||
+    if (!image_logits || !replayed_image_logits || !zero_image_logits ||
+        !restored_image_logits || !image_embedding_data ||
         ds4_session_copy_logits(session, image_logits, n_vocab) != n_vocab) {
         snprintf(error, sizeof(error), "unable to save image-conditioned logits");
         goto done;
     }
+
+    ds4_session_invalidate(session);
+    if (ds4_session_sync_multimodal(session, &prompt, &span, 1,
+                                    error, sizeof(error)) != 0 ||
+        ds4_session_copy_logits(session, replayed_image_logits, n_vocab) !=
+            n_vocab) {
+        snprintf(error, sizeof(error),
+                 "unable to replay image-conditioned prompt");
+        goto done;
+    }
+    const float replayed_max_delta =
+        max_logit_delta(image_logits, replayed_image_logits, n_vocab);
+    if (replayed_max_delta > 1.0e-6f) {
+        snprintf(error, sizeof(error),
+                 "replayed image-conditioned logits changed (max %.9g)",
+                 replayed_max_delta);
+        goto done;
+    }
+
     memcpy(image_embedding_data, span.embedding.data,
            image_embedding_elems * sizeof(*image_embedding_data));
     memset(span.embedding.data, 0,
@@ -99,11 +134,8 @@ int main(int argc, char **argv) {
         snprintf(error, sizeof(error), "unable to save zero-image logits");
         goto done;
     }
-    float max_delta = 0.0f;
-    for (int i = 0; i < n_vocab; i++) {
-        float delta = fabsf(image_logits[i] - zero_image_logits[i]);
-        if (delta > max_delta) max_delta = delta;
-    }
+    const float max_delta =
+        max_logit_delta(image_logits, zero_image_logits, n_vocab);
     if (!(max_delta > 1.0e-4f)) {
         snprintf(error, sizeof(error),
                  "visual embedding did not affect output logits");
@@ -114,6 +146,20 @@ int main(int argc, char **argv) {
     span.embedding.fingerprint[0] ^= 1u;
     if (ds4_session_sync_multimodal(session, &prompt, &span, 1,
                                     error, sizeof(error)) != 0) goto done;
+    if (ds4_session_copy_logits(session, restored_image_logits, n_vocab) !=
+        n_vocab) {
+        snprintf(error, sizeof(error),
+                 "unable to save restored image-conditioned logits");
+        goto done;
+    }
+    const float restored_max_delta =
+        max_logit_delta(image_logits, restored_image_logits, n_vocab);
+    if (restored_max_delta > 1.0e-6f) {
+        snprintf(error, sizeof(error),
+                 "restored image-conditioned logits changed (max %.9g)",
+                 restored_max_delta);
+        goto done;
+    }
     ds4_session_set_progress(session, NULL, NULL);
     for (int i = 0; i < 48; i++) {
         int token = ds4_session_argmax(session);
@@ -133,7 +179,9 @@ int main(int argc, char **argv) {
 done:
     if (rc != 0) fprintf(stderr, "vision prompt failed: %s\n", error);
     free(image_embedding_data);
+    free(restored_image_logits);
     free(zero_image_logits);
+    free(replayed_image_logits);
     free(image_logits);
     ds4_session_free(session);
     ds4_tokens_free(&prompt);

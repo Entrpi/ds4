@@ -576,8 +576,12 @@ prompt spans, or image-aware KV identity.
   answer, reuse an unchanged image without repeated prefill, and rebuild when
   only the image fingerprint changes. It must also hold image-token positions
   fixed, replace the visual embedding with zeros, and observe changed output
-  logits. This catches a compact-prefill path that processes placeholders but
-  silently ignores the image data.
+  logits. Use a 4,096-token test session so a large screenshot plus the output
+  cannot hit the old 2,048-token test ceiling. After explicit session
+  invalidation, and again after restoring the zeroed embedding, require the
+  complete image-conditioned logits to match the original within `1e-6`.
+  This catches a compact-prefill path that processes placeholders but silently
+  ignores the image data, as well as incomplete multimodal state rebuilds.
 - Run a fixed model-level vision fixture containing photographs, screenshots,
   diagrams, readable text, spatial questions, and unrelated-image controls.
   Compare complete answers with the official GLM-5.3-Flash vision service and
