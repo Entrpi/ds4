@@ -6173,6 +6173,25 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
     return 1;
 }
 
+extern "C" int ds4_gpu_set_aux_model_map_range(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t map_offset,
+        uint64_t map_size) {
+    if (!model_map || model_size == 0 || map_size == 0 ||
+        map_offset > model_size || map_size > model_size - map_offset) {
+        return 0;
+    }
+    if (cuda_model_range_is_cached(model_map, map_offset, map_size)) return 1;
+    if (!cuda_model_range_copy_uncached(model_map, map_offset, map_size,
+                                        "GLM-5.3 vision encoder")) {
+        return 0;
+    }
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "mapped %.2f GiB auxiliary model\n",
+            (double)map_size / 1073741824.0);
+    return 1;
+}
+
 extern "C" int ds4_gpu_set_model_map_spans(
         const void *model_map,
         uint64_t model_size,

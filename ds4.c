@@ -6094,7 +6094,7 @@ static void config_validate_model(const ds4_model *m) {
     config_validate_deepseek4_model(m);
 }
 
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+#ifndef DS4_NO_GPU
 static ds4_tensor *vision_required_tensor(
         const ds4_model *m,
         const char      *name,
@@ -46971,7 +46971,6 @@ static bool glm_graph_forward_tokens(
                                                DS4_N_EMBD,
                                                DS4_N_HC) != 0;
         }
-#if defined(__APPLE__)
         for (size_t i = 0; ok && i < vision_overlay.count; i++) {
             const glm_vision_overlay_segment *segment =
                     &vision_overlay.segments[i];
@@ -46985,7 +46984,6 @@ static bool glm_graph_forward_tokens(
                     DS4_N_EMBD,
                     DS4_N_HC) != 0;
         }
-#endif
         if (trace) {
             const double ms = (now_sec() - t0) * 1000.0;
             if (trace_all || ms >= trace_slow_ms || !ok) {
@@ -48223,7 +48221,6 @@ static bool glm_graph_forward_indexed_tokens(
                                                DS4_N_EMBD,
                                                DS4_N_HC) != 0;
         }
-#if defined(__APPLE__)
         for (size_t i = 0; ok && i < vision_overlay.count; i++) {
             const glm_vision_overlay_segment *segment =
                     &vision_overlay.segments[i];
@@ -48237,7 +48234,6 @@ static bool glm_graph_forward_indexed_tokens(
                     DS4_N_EMBD,
                     DS4_N_HC) != 0;
         }
-#endif
         if (trace) {
             const double ms = (now_sec() - t0) * 1000.0;
             if (trace_all || ms >= trace_slow_ms || !ok) {
@@ -60912,18 +60908,28 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->distributed = opt->distributed;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     if (opt->vision_path && opt->vision_path[0]) {
-        if (opt->backend != DS4_BACKEND_METAL) {
-            fprintf(stderr, "ds4: GLM-5.3 vision currently requires --metal\n");
+        if (opt->backend != DS4_BACKEND_METAL &&
+            opt->backend != DS4_BACKEND_CUDA) {
+            fprintf(stderr,
+                    "ds4: GLM-5.3 vision requires --metal, --cuda, or --rocm\n");
             free(e);
             *out = NULL;
             return 1;
         }
-#if !defined(__APPLE__) || defined(DS4_NO_GPU)
-        fprintf(stderr, "ds4: this build does not include the Metal vision backend\n");
+#ifdef DS4_NO_GPU
+        fprintf(stderr, "ds4: this build does not include a GPU vision backend\n");
         free(e);
         *out = NULL;
         return 1;
 #endif
+        if (opt->backend == DS4_BACKEND_CUDA && gpu_cfg &&
+            gpu_cfg->n_gpus > 1) {
+            fprintf(stderr,
+                    "ds4: GLM-5.3 CUDA/ROCm vision currently requires one GPU\n");
+            free(e);
+            *out = NULL;
+            return 1;
+        }
     }
     e->prefill_chunk =
         ds4_effective_prefill_chunk(opt->cuda_tensor_parallel,
@@ -61017,8 +61023,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-#if !defined(__APPLE__) || defined(DS4_NO_GPU)
-        fprintf(stderr, "ds4: this build does not include the Metal vision backend\n");
+#ifdef DS4_NO_GPU
+        fprintf(stderr, "ds4: this build does not include a GPU vision backend\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -61785,22 +61791,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        if (e->vision_ready &&
-            !ds4_gpu_set_model_map_range(
-                    e->vision_model.map,
-                    e->vision_model.size,
-                    e->vision_model.tensor_data_pos,
-                    e->vision_model.size - e->vision_model.tensor_data_pos,
-                    e->vision_model.max_tensor_bytes)) {
-            fprintf(stderr,
-                    "ds4: Metal failed to map the GLM-5.3 vision encoder\n");
-            free(load_offsets);
-            free(load_sizes);
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
-        }
-        if (e->vision_ready) e->vision_map_ready = true;
         if (tp_shard) {
             model_warm_weights_sharded(&e->model, &e->weights,
                                        tp_shard_rank);
@@ -61862,6 +61852,30 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 return 1;
             }
             (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+        }
+        if (e->vision_ready) {
+#if defined(__APPLE__)
+            e->vision_map_ready = ds4_gpu_set_model_map_range(
+                    e->vision_model.map,
+                    e->vision_model.size,
+                    e->vision_model.tensor_data_pos,
+                    e->vision_model.size - e->vision_model.tensor_data_pos,
+                    e->vision_model.max_tensor_bytes) != 0;
+#else
+            e->vision_map_ready = ds4_gpu_set_aux_model_map_range(
+                    e->vision_model.map,
+                    e->vision_model.size,
+                    e->vision_model.tensor_data_pos,
+                    e->vision_model.size - e->vision_model.tensor_data_pos) != 0;
+#endif
+            if (!e->vision_map_ready) {
+                fprintf(stderr,
+                        "ds4: %s failed to map the GLM-5.3 vision encoder\n",
+                        ds4_backend_name(e->backend));
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
@@ -62160,20 +62174,31 @@ static int ds4_engine_vision_encode_image(
         return 0;
     }
     memset(out, 0, sizeof(*out));
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#ifndef DS4_NO_GPU
     if (!e->metal_ready) {
         e->metal_ready = ds4_gpu_init() != 0;
     }
     if (e->metal_ready && !e->vision_map_ready) {
+#if defined(__APPLE__)
         e->vision_map_ready = ds4_gpu_set_model_map_range(
                 e->vision_model.map,
                 e->vision_model.size,
                 e->vision_model.tensor_data_pos,
                 e->vision_model.size - e->vision_model.tensor_data_pos,
                 e->vision_model.max_tensor_bytes) != 0;
+#else
+        e->vision_map_ready = ds4_gpu_set_aux_model_map_range(
+                e->vision_model.map,
+                e->vision_model.size,
+                e->vision_model.tensor_data_pos,
+                e->vision_model.size - e->vision_model.tensor_data_pos) != 0;
+#endif
     }
     if (!e->metal_ready || !e->vision_map_ready) {
-        if (error && error_cap) snprintf(error, error_cap, "unable to map vision weights on Metal");
+        if (error && error_cap) {
+            snprintf(error, error_cap, "unable to map vision weights on %s",
+                     ds4_backend_name(e->backend));
+        }
         return 0;
     }
 #endif
@@ -62187,7 +62212,7 @@ static int ds4_engine_vision_encode_image(
         if (error && error_cap) snprintf(error, error_cap, "unable to allocate vision output");
         return 0;
     }
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+#ifndef DS4_NO_GPU
     int ok = ds4_gpu_glm53_vision_encode(
             embedding, patches.patches, patches.grid_height, patches.grid_width,
             e->vision_model.map, e->vision_model.size, &e->vision_weights);

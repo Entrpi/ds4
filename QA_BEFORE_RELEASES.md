@@ -563,9 +563,9 @@ block. A GLM 5.2 pass does not cover these paths.
 
 ### GLM 5.3 Vision
 
-Vision is a separate Metal sidecar and has its own release gate. Text-only GLM
-success does not exercise image preprocessing, the vision graph, multimodal
-prompt spans, or image-aware KV identity.
+Vision is a separate sidecar on Metal, single-GPU CUDA, and ROCm, and has its
+own release gate. Text-only GLM success does not exercise image preprocessing,
+the vision graph, multimodal prompt spans, or image-aware KV identity.
 
 - Download `glm53-vision` and verify
   `GLM-5.3-Flash-Vision-Encoder.gguf` has SHA-256
@@ -582,6 +582,11 @@ prompt spans, or image-aware KV identity.
   complete image-conditioned logits to match the original within `1e-6`.
   This catches a compact-prefill path that processes placeholders but silently
   ignores the image data, as well as incomplete multimodal state rebuilds.
+- Keep one accepted Metal embedding from a fixed image and compare CUDA and
+  ROCm output with `tests/compare_glm53_vision_embeddings.py`. Require finite
+  output, cosine similarity at least `0.995`, mean absolute error at most
+  `0.001`, and maximum absolute error at most `0.06`. This permits normal BF16
+  GEMM ordering differences but rejects a changed vision graph.
 - Run a fixed model-level vision fixture containing photographs, screenshots,
   diagrams, readable text, spatial questions, and unrelated-image controls.
   Compare complete answers with the official GLM-5.3-Flash vision service and
@@ -618,9 +623,9 @@ prompt spans, or image-aware KV identity.
   `--vision` on both ranks. The leader must encode once, both ranks must keep
   matching multimodal KV state, and the answer must remain correct. Record
   image encode, prefill, first-token, and decode timing separately.
-- Build CPU, CUDA, and ROCm targets warning-free after vision changes. Until a
-  backend implements the encoder, passing `--vision` there must reject before
-  inference rather than silently ignoring the image.
+- Build CPU, CUDA, and ROCm targets warning-free after vision changes. Run the
+  encoder comparison, prompt replay test, and six-case server fixture on one
+  DGX Spark and on `strixhalo`; ROCm Q2 must use bounded SSD streaming.
 
 ## 7. SSD Streaming
 

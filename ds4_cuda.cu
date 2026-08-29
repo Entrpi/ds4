@@ -688,32 +688,42 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
-    if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
-    if (g_model_hmm_direct &&
+    const uint64_t end = offset + bytes;
+    if (end < offset) return NULL;
+    auto exact = g_model_range_by_offset.find(offset);
+    if (exact != g_model_range_by_offset.end()) {
+        const cuda_model_range &r = g_model_ranges[exact->second];
+        if (r.host_base == model_map && bytes <= r.bytes) return r.device_ptr;
+    }
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base == model_map && offset >= r.offset &&
+            end <= r.offset + r.bytes) {
+            return r.device_ptr + (offset - r.offset);
+        }
+        if (r.host_base == model_map && r.host_registered &&
+            r.registered_base && r.registered_device_base) {
+            const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
+            const uintptr_t h1 = h0 + bytes;
+            const uintptr_t r0 = (uintptr_t)r.registered_base;
+            const uintptr_t r1 = r0 + r.registered_bytes;
+            if (h1 >= h0 && h0 >= r0 && h1 <= r1) {
+                return r.registered_device_base + (h0 - r0);
+            }
+        }
+    }
+
+    if (model_map == g_model_host_base &&
+        (g_model_device_owned || g_model_registered)) {
+        return cuda_model_ptr(model_map, offset);
+    }
+    if (model_map == g_model_host_base && g_model_hmm_direct &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
         getenv("DS4_CUDA_WEIGHT_PRELOAD") == NULL) {
         return cuda_model_ptr(model_map, offset);
     }
     const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
-    if (direct_env && direct_env[0]) return cuda_model_ptr(model_map, offset);
-
-    const uint64_t end = offset + bytes;
-    auto exact = g_model_range_by_offset.find(offset);
-    if (exact != g_model_range_by_offset.end()) {
-        const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && end >= offset && bytes <= r.bytes) return r.device_ptr;
-    }
-    for (const cuda_model_range &r : g_model_ranges) {
-        if (r.host_base == model_map && offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
-            return r.device_ptr + (offset - r.offset);
-        }
-        if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
-            const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
-            const uintptr_t h1 = h0 + bytes;
-            const uintptr_t r0 = (uintptr_t)r.registered_base;
-            const uintptr_t r1 = r0 + r.registered_bytes;
-            if (h1 >= h0 && h0 >= r0 && h1 <= r1) return r.registered_device_base + (h0 - r0);
-        }
+    if (model_map == g_model_host_base && direct_env && direct_env[0]) {
+        return cuda_model_ptr(model_map, offset);
     }
 
     if (getenv("DS4_CUDA_NO_FD_CACHE") == NULL) {
@@ -1293,7 +1303,8 @@ static const char *cuda_resolve_weight_ptr(const void *model_map,
 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
-    if (g_model_device_owned || g_model_registered) return 1;
+    if (model_map == g_model_host_base &&
+        (g_model_device_owned || g_model_registered)) return 1;
 
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
@@ -3778,6 +3789,53 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
         !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
         (void)cuda_model_prefetch_range(model_map, model_size, map_offset, map_size);
     }
+    return 1;
+}
+
+extern "C" int ds4_gpu_set_aux_model_map_range(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t map_offset,
+        uint64_t map_size) {
+    if (!model_map || model_size == 0 || map_size == 0 ||
+        map_offset > model_size || map_size > model_size - map_offset) {
+        return 0;
+    }
+    if (cuda_model_range_is_cached(model_map, map_offset, map_size)) return 1;
+
+    void *device = NULL;
+    cudaError_t err = cudaMalloc(&device, (size_t)map_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA vision map allocation failed (%.2f GiB): %s\n",
+                (double)map_size / 1073741824.0,
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    const uint64_t chunk = 64ull * 1024ull * 1024ull;
+    const char *source = (const char *)model_map + map_offset;
+    for (uint64_t copied = 0; copied < map_size; copied += chunk) {
+        const uint64_t bytes = map_size - copied < chunk ?
+                               map_size - copied : chunk;
+        err = cudaMemcpy((char *)device + copied, source + copied,
+                         (size_t)bytes, cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA vision map copy failed at %.2f/%.2f GiB: %s\n",
+                    (double)copied / 1073741824.0,
+                    (double)map_size / 1073741824.0,
+                    cudaGetErrorString(err));
+            (void)cudaFree(device);
+            (void)cudaGetLastError();
+            return 0;
+        }
+    }
+    g_model_ranges.push_back({model_map, map_offset, map_size,
+                              (char *)device, NULL, NULL, 0, 0, 0});
+    g_model_range_bytes += map_size;
+    fprintf(stderr, "ds4: CUDA mapped %.2f GiB auxiliary model\n",
+            (double)map_size / 1073741824.0);
     return 1;
 }
 
@@ -32408,3 +32466,6 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
     return 0;
 }
 #pragma GCC diagnostic pop
+
+#define DS4_GLM53_VISION_STREAM cuda_decode_stream()
+#include "ds4_glm53_vision_gpu.cuh"

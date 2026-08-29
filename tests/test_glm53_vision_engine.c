@@ -14,7 +14,11 @@ int main(int argc, char **argv) {
     ds4_engine_options options = {0};
     options.model_path = argv[1];
     options.vision_path = argv[2];
+#ifdef __APPLE__
     options.backend = DS4_BACKEND_METAL;
+#else
+    options.backend = DS4_BACKEND_CUDA;
+#endif
     options.inspect_only = true;
 
     ds4_engine *engine = NULL;

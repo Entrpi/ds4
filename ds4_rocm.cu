@@ -146,6 +146,8 @@ __device__ __constant__ static const int8_t cuda_mxfp4_values_x2[16] = {
 
 #include "rocm/ds4_rocm_current_api_compat.cuh"
 
+#include "ds4_glm53_vision_gpu.cuh"
+
 /* Tensor-parallel gates are Metal-only; stubs keep shared graph code
  * linkable (TP option validation rejects non-Metal backends). */
 extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
