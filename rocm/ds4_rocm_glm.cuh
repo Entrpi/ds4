@@ -1592,6 +1592,7 @@ __global__ static void glm_attention_indexed_lora_kernel(
         __syncthreads();
     }
     const float max_score = red[0];
+    __syncthreads();
     if (!isfinite(max_score)) {
         float *out = lora_out + ((uint64_t)token * n_head + head) * kv_lora_dim;
         for (uint32_t j = threadIdx.x; j < kv_lora_dim; j += blockDim.x) {

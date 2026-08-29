@@ -448,8 +448,8 @@ block. A GLM 5.2 pass does not cover these paths.
 - Build and run the focused primitive test:
   `make tests/test_glm53_kda && ./tests/test_glm53_kda`.
   It covers BF16 projections, pool-4 state construction and expansion, grouped
-  scorer arithmetic and causal visibility, and recurrent KDA prefill versus
-  sequential decode.
+  scorer arithmetic and causal visibility, recurrent KDA prefill versus
+  sequential decode, and exact repeated causal-attention output on ROCm.
 - Treat session construction as the attention-memory admission point. Every
   owned DSA cache and indexer pool/tail, every KDA recurrent state, and the
   complete supported prefill workspace must allocate before a request is

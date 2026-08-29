@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 
 #include "ds4.h"
@@ -334,6 +335,82 @@ int main(void) {
     ds4_gpu_tensor_free(attn_low_gpu);
     ds4_gpu_tensor_free(attn_q_gpu);
     ds4_gpu_tensor_free(attn_heads_gpu);
+
+    enum {
+        BATCH_ATTN_TOKENS = 128,
+        BATCH_ATTN_HEADS = 64,
+        BATCH_ATTN_LORA = 32,
+        BATCH_ATTN_NOPE = 1,
+        BATCH_ATTN_REPEATS = 16,
+    };
+    const uint64_t batch_q_count =
+        (uint64_t)BATCH_ATTN_TOKENS * BATCH_ATTN_HEADS * BATCH_ATTN_NOPE;
+    const uint64_t batch_lora_count =
+        (uint64_t)BATCH_ATTN_TOKENS * BATCH_ATTN_HEADS * BATCH_ATTN_LORA;
+    const uint64_t batch_cache_count =
+        (uint64_t)BATCH_ATTN_TOKENS * BATCH_ATTN_LORA;
+    float *batch_q = calloc((size_t)batch_q_count, sizeof(*batch_q));
+    float *batch_low = malloc((size_t)batch_lora_count * sizeof(*batch_low));
+    float *batch_cache = malloc((size_t)batch_cache_count * sizeof(*batch_cache));
+    float *batch_expected = malloc((size_t)batch_lora_count * sizeof(*batch_expected));
+    float *batch_actual = malloc((size_t)batch_lora_count * sizeof(*batch_actual));
+    require_ok(batch_q && batch_low && batch_cache &&
+               batch_expected && batch_actual,
+               "indexed attention determinism host allocation");
+    for (uint64_t i = 0; i < batch_lora_count; i++) {
+        batch_low[i] = 0.001f * (float)((int)(i % 127u) - 63);
+    }
+    for (uint64_t i = 0; i < batch_cache_count; i++) {
+        batch_cache[i] = 0.002f * (float)((int)(i % 113u) - 56);
+    }
+    ds4_gpu_tensor *batch_out_gpu =
+        ds4_gpu_tensor_alloc(batch_lora_count * sizeof(float));
+    ds4_gpu_tensor *batch_q_gpu =
+        ds4_gpu_tensor_alloc(batch_q_count * sizeof(float));
+    ds4_gpu_tensor *batch_low_gpu =
+        ds4_gpu_tensor_alloc(batch_lora_count * sizeof(float));
+    ds4_gpu_tensor *batch_cache_gpu =
+        ds4_gpu_tensor_alloc(batch_cache_count * sizeof(float));
+    require_ok(batch_out_gpu && batch_q_gpu && batch_low_gpu && batch_cache_gpu,
+               "indexed attention determinism GPU allocation");
+    require_ok(ds4_gpu_tensor_write(batch_q_gpu, 0, batch_q,
+                                    batch_q_count * sizeof(float)),
+               "indexed attention determinism Q write");
+    require_ok(ds4_gpu_tensor_write(batch_low_gpu, 0, batch_low,
+                                    batch_lora_count * sizeof(float)),
+               "indexed attention determinism low-rank Q write");
+    require_ok(ds4_gpu_tensor_write(batch_cache_gpu, 0, batch_cache,
+                                    batch_cache_count * sizeof(float)),
+               "indexed attention determinism cache write");
+    for (uint32_t repeat = 0; repeat < BATCH_ATTN_REPEATS; repeat++) {
+        require_ok(ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
+            batch_out_gpu, batch_q_gpu, batch_low_gpu, batch_cache_gpu, NULL,
+            BATCH_ATTN_TOKENS, 0, BATCH_ATTN_TOKENS, BATCH_ATTN_TOKENS,
+            false, BATCH_ATTN_HEADS, BATCH_ATTN_LORA, BATCH_ATTN_NOPE, 0,
+            0, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f),
+            "indexed attention determinism launch");
+        require_ok(ds4_gpu_tensor_read(batch_out_gpu, 0, batch_actual,
+                                       batch_lora_count * sizeof(float)),
+                   "indexed attention determinism output read");
+        if (repeat == 0) {
+            memcpy(batch_expected, batch_actual,
+                   (size_t)batch_lora_count * sizeof(float));
+        } else if (memcmp(batch_expected, batch_actual,
+                          (size_t)batch_lora_count * sizeof(float)) != 0) {
+            fprintf(stderr,
+                    "indexed attention changed on repeat %u\n", repeat);
+            return 1;
+        }
+    }
+    ds4_gpu_tensor_free(batch_cache_gpu);
+    ds4_gpu_tensor_free(batch_low_gpu);
+    ds4_gpu_tensor_free(batch_q_gpu);
+    ds4_gpu_tensor_free(batch_out_gpu);
+    free(batch_actual);
+    free(batch_expected);
+    free(batch_cache);
+    free(batch_low);
+    free(batch_q);
 #endif
 
     enum { POOL = 4, POOL_TOKENS = 11, POOL_CAP = 16, POOL_COUNT = 4 };
