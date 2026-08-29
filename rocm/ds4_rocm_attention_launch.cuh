@@ -1350,11 +1350,11 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                     }
                     st = (cublasStatus_t)-1;
 #ifdef __HIP_PLATFORM_AMD__
-                    if (g_dspark_verify_mode && n_tokens >= 5u && n_tokens <= 6u &&
+                    if (n_tokens >= 5u && n_tokens <= 6u &&
                         out_b_f16_t != NULL && out_dim == 4096u && low_dim == 8192u &&
                         g_rocblas_ready &&
                         g_rocblas_f16_solution_set == DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E &&
-                        !__atomic_load_n(&g_rocblas_dspark_attention_b_solution_disabled,
+                        !__atomic_load_n(&g_rocblas_attention_b_solution_disabled,
                                          __ATOMIC_RELAXED) &&
                         ds4_rocm_gfx1151_flag("DS4_ROCM_F16_Q4_SOLUTIONS")) {
                         const rocblas_status rst = rocblas_gemm_ex(
@@ -1385,7 +1385,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                         if (rst == rocblas_status_success) {
                             st = CUBLAS_STATUS_SUCCESS;
                         } else {
-                            __atomic_store_n(&g_rocblas_dspark_attention_b_solution_disabled,
+                            __atomic_store_n(&g_rocblas_attention_b_solution_disabled,
                                              1, __ATOMIC_RELAXED);
                         }
                     }

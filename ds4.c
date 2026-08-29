@@ -49791,13 +49791,8 @@ static bool ds4_dspark_scheduler_enabled(const ds4_session *s) {
 }
 
 static uint32_t ds4_dspark_scheduler_window(const ds4_session *s) {
-    uint32_t fallback = 4u;
-#ifdef DS4_ROCM_BUILD
-    if (ds4_session_dspark_rocm_gfx1151_fast_path(s) &&
-        ds4_gpu_dspark_gfx1151_attention_b_solution_enabled()) {
-        fallback = 16u;
-    }
-#endif
+    const uint32_t fallback =
+        ds4_session_dspark_rocm_gfx1151_fast_path(s) ? 16u : 4u;
     uint32_t v = ds4_dspark_env_u32("DS4_DSPARK_SCHEDULER_WINDOW", fallback);
     return v ? v : 4;
 }
