@@ -42,9 +42,16 @@ for i in "${!BINS[@]}"; do
         continue
     fi
     "$bin" --help > "$LOG" 2>&1 || true
-    assert_grep "$name --help mentions --gpu-vram" "gpu-vram" "$LOG"
-    assert_grep "$name --help mentions --gpu-devices" "gpu-devices" "$LOG"
-    assert_grep "$name --help mentions --cuda-tensor-parallel" "cuda-tensor-parallel" "$LOG"
+    if grep -q -- "--rocm" "$LOG"; then
+        assert_grep "$name --help mentions --rocm" "--rocm" "$LOG"
+        assert_not_grep "$name ROCm help omits --cuda-tensor-parallel" \
+            "--cuda-tensor-parallel" "$LOG"
+    else
+        assert_grep "$name --help mentions --gpu-vram" "gpu-vram" "$LOG"
+        assert_grep "$name --help mentions --gpu-devices" "gpu-devices" "$LOG"
+        assert_grep "$name --help mentions --cuda-tensor-parallel" \
+            "cuda-tensor-parallel" "$LOG"
+    fi
     if [ "$name" != "ds4-bench" ]; then
         "$bin" --help runtime > "$LOG" 2>&1 || true
         assert_grep "$name --help runtime mentions --mtp" \
@@ -277,6 +284,31 @@ fi
 # 6b: ds4-agent accepts the same TP coordinator flags as ds4. The worker role
 # remains a serving mode and is intentionally handled by ./ds4.
 if [ -x ./ds4-agent ]; then
+    if ./ds4-agent --help 2>&1 | grep -q -- "--rocm"; then
+        AGENT_GPU_FLAG=--rocm
+        AGENT_GPU_BACKEND=rocm
+    else
+        AGENT_GPU_FLAG=--cuda
+        AGENT_GPU_BACKEND=cuda
+    fi
+    ./ds4-agent "$AGENT_GPU_FLAG" --non-interactive -p test \
+        -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && ! grep -q "unknown option" "$LOG"; then
+        ok "ds4-agent parses advertised $AGENT_GPU_FLAG"
+    else
+        fail "ds4-agent rejected advertised $AGENT_GPU_FLAG"
+    fi
+    ./ds4-agent --backend "$AGENT_GPU_BACKEND" --non-interactive -p test \
+        -m /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] &&
+       ! grep -qE "unknown option|invalid backend" "$LOG"; then
+        ok "ds4-agent parses --backend $AGENT_GPU_BACKEND"
+    else
+        fail "ds4-agent rejected --backend $AGENT_GPU_BACKEND"
+    fi
+
     ./ds4-agent --metal --tensor-parallel --role coordinator \
         --listen 127.0.0.1 9911 --transport tcp \
         --tensor-parallel-token-prefill --debug-hash 2 \
