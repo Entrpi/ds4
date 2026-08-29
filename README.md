@@ -189,6 +189,8 @@ make strix-halo       # Linux ROCm, AMD Strix Halo
 make cpu              # CPU-only diagnostics build
 ```
 
+For ROCm packages, GTT configuration and the reproducible ROCm 10.0 container build, see [DS4 on Strix Halo](STRIXHALO.md).
+
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
