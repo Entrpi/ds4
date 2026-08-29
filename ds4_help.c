@@ -373,6 +373,7 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "-sys, --system TEXT", "System prompt used only with --chat-prompt-file.");
     fputc('\n', fp);
     title(fp, c, "Benchmark Sweep");
+    opt(fp, c, "--ctx-baseline N", "Untimed prefix loaded before the first measured frontier. Default: 0");
     opt(fp, c, "--ctx-start N", "First measured frontier. Default: 2048");
     opt(fp, c, "--ctx-max N", "Last measured frontier. Default: 32768");
     opt(fp, c, "--ctx-alloc N", "Allocated context. Default: ctx-max + gen-tokens + 1");

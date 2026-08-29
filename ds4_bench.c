@@ -37,6 +37,7 @@ typedef struct {
     const char *gpu_devices_arg;
     ds4_backend backend;
     int threads;
+    int ctx_baseline;
     int ctx_start;
     int ctx_max;
     int ctx_alloc;
@@ -261,6 +262,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--ctx-start")) {
             c.ctx_start = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--ctx-baseline")) {
+            c.ctx_baseline = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--ctx-max")) {
             c.ctx_max = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--ctx-alloc")) {
@@ -362,6 +365,10 @@ static bench_config parse_options(int argc, char **argv) {
     }
     if (c.ctx_start > c.ctx_max) {
         fprintf(stderr, "ds4-bench: --ctx-start must be <= --ctx-max\n");
+        exit(2);
+    }
+    if (c.ctx_baseline > 0 && c.ctx_baseline >= c.ctx_start) {
+        fprintf(stderr, "ds4-bench: --ctx-baseline must be less than --ctx-start\n");
         exit(2);
     }
     if (c.step_mul < 1.0) {
@@ -682,6 +689,25 @@ int main(int argc, char **argv) {
     }
     maybe_warn_distributed_step_shape(&cfg, session);
 
+    char err[256];
+    if (cfg.ctx_baseline > 0) {
+        ds4_tokens baseline = {
+            .v = prompt.v,
+            .len = cfg.ctx_baseline,
+            .cap = cfg.ctx_baseline,
+        };
+        if (ds4_session_sync(session, &baseline, err, sizeof(err)) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: untimed baseline prefill to %d failed: %s\n",
+                    cfg.ctx_baseline,
+                    err);
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
+    }
+
     FILE *out = stdout;
     if (cfg.csv_path) {
         out = fopen(cfg.csv_path, "wb");
@@ -715,8 +741,7 @@ int main(int argc, char **argv) {
     ds4_session_snapshot snap = {0};
     const uint64_t snapshot_max_bytes = bench_snapshot_max_bytes();
     bool warned_large_snapshot = false;
-    char err[256];
-    int previous = 0;
+    int previous = cfg.ctx_baseline;
     int rc = 0;
 
     for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {

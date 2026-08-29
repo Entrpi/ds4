@@ -82,6 +82,24 @@ if [ -x ./ds4-bench ]; then
     else
         fail "ds4-bench did not reject --dspark without --mtp"
     fi
+
+    ./ds4-bench --ctx-baseline 1024 --ctx-start 2048 \
+        -m /dev/null --prompt-file /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -ne 0 ] && ! grep -q "unknown option" "$LOG"; then
+        ok "ds4-bench parses an untimed context baseline"
+    else
+        fail "ds4-bench rejected --ctx-baseline in option parsing"
+    fi
+
+    ./ds4-bench --ctx-baseline 2048 --ctx-start 2048 \
+        -m /dev/null --prompt-file /dev/null > "$LOG" 2>&1
+    rc=$?
+    if [ $rc -eq 2 ] && grep -q -- "--ctx-baseline must be less than --ctx-start" "$LOG"; then
+        ok "ds4-bench rejects a baseline at or beyond the first frontier"
+    else
+        fail "ds4-bench accepted an invalid --ctx-baseline"
+    fi
 fi
 
 # 1c: exact DSpark sampling is parsed by every frontend that can run DSpark.
