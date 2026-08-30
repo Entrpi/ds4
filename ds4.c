@@ -44376,6 +44376,18 @@ static bool glm_graph_use_flash_attention_prefill(uint32_t n_tokens) {
            n_tokens >= glm_graph_flash_attention_prefill_min_tokens();
 }
 
+static bool glm_graph_use_dense_compact_attention_prefill(
+        uint32_t n_tokens) {
+    if (!glm_graph_use_flash_attention_prefill(n_tokens)) return false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    /* The CUDA GEMM setup crosses over the scalar online kernel near 256
+     * tokens on GB10. Keep short prompts on the lower-latency path. */
+    return g_n_gpus == 1 && n_tokens >= 256u;
+#else
+    return true;
+#endif
+}
+
 static bool glm_graph_use_flash_attention_staged_kv(
         uint32_t pos0,
         uint32_t n_tokens,
@@ -49084,9 +49096,9 @@ static bool glm_graph_forward_indexed_tokens(
                 }
                 if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ATTN_CORE)) { /* ablate */ } else if (ok && use_split_value_proj) {
                     int rc = 0;
-#if defined(__APPLE__)
+#if defined(__APPLE__) || (!defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU))
                     if (slice_causal &&
-                        glm_graph_use_flash_attention_prefill(slice) &&
+                        glm_graph_use_dense_compact_attention_prefill(slice) &&
                         !tp_attn_head_split) {
                         rc = ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
                                 attn_lora_view,

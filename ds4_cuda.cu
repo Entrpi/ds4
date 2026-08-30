@@ -27107,6 +27107,126 @@ __global__ static void glm53_kda_prefill_prepare_kernel(
     }
 }
 
+__global__ static void glm53_kda_prefill_prepare_parallel_kernel(
+        float *q,
+        float *k,
+        float *v,
+        float *raw_gate,
+        const float *raw_q,
+        const float *raw_k,
+        const float *raw_v,
+        const float *conv_state,
+        const float *q_conv,
+        const float *k_conv,
+        const float *v_conv,
+        const float *a_log,
+        const float *dt_bias,
+        uint32_t n_heads,
+        uint32_t n_tokens,
+        float lower_bound) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    if (token >= n_tokens || head >= n_heads ||
+        tid >= GLM53_CUDA_KDA_DIM) {
+        return;
+    }
+
+    __shared__ float sq[GLM53_CUDA_KDA_DIM];
+    __shared__ float sk[GLM53_CUDA_KDA_DIM];
+    __shared__ float reduce_q[4];
+    __shared__ float reduce_k[4];
+    const uint32_t projection = n_heads * GLM53_CUDA_KDA_DIM;
+    const uint32_t channel = head * GLM53_CUDA_KDA_DIM + tid;
+    const float *q_state = conv_state;
+    const float *k_state = q_state + GLM53_CUDA_KDA_HISTORY * projection;
+    const float *v_state = k_state + GLM53_CUDA_KDA_HISTORY * projection;
+    const uint64_t index = (uint64_t)token * projection + channel;
+
+    float q_acc = 0.0f;
+    float k_acc = 0.0f;
+    float v_acc = 0.0f;
+#pragma unroll
+    for (uint32_t w = 0; w < GLM53_CUDA_KDA_HISTORY; w++) {
+        const int32_t source_token =
+            (int32_t)token + (int32_t)w - GLM53_CUDA_KDA_HISTORY;
+        float q_value;
+        float k_value;
+        float v_value;
+        if (source_token >= 0) {
+            const uint64_t source =
+                (uint64_t)(uint32_t)source_token * projection + channel;
+            q_value = raw_q[source];
+            k_value = raw_k[source];
+            v_value = raw_v[source];
+        } else {
+            const uint32_t state_row = token + w;
+            const uint64_t source =
+                (uint64_t)state_row * projection + channel;
+            q_value = q_state[source];
+            k_value = k_state[source];
+            v_value = v_state[source];
+        }
+        q_acc = fmaf(q_value, q_conv[(uint64_t)channel * 4u + w], q_acc);
+        k_acc = fmaf(k_value, k_conv[(uint64_t)channel * 4u + w], k_acc);
+        v_acc = fmaf(v_value, v_conv[(uint64_t)channel * 4u + w], v_acc);
+    }
+    q_acc = fmaf(raw_q[index],
+                 q_conv[(uint64_t)channel * 4u + 3u], q_acc);
+    k_acc = fmaf(raw_k[index],
+                 k_conv[(uint64_t)channel * 4u + 3u], k_acc);
+    v_acc = fmaf(raw_v[index],
+                 v_conv[(uint64_t)channel * 4u + 3u], v_acc);
+
+    sq[tid] = glm53_cuda_silu(q_acc);
+    sk[tid] = glm53_cuda_silu(k_acc);
+    v[index] = glm53_cuda_silu(v_acc);
+    raw_gate[index] = expf(lower_bound * glm53_cuda_sigmoid(
+        expf(a_log[head]) * (raw_gate[index] + dt_bias[channel])));
+    __syncthreads();
+
+    float q_total = warp_sum_f32(sq[tid] * sq[tid]);
+    float k_total = warp_sum_f32(sk[tid] * sk[tid]);
+    if (lane == 0u) {
+        reduce_q[warp] = q_total;
+        reduce_k[warp] = k_total;
+    }
+    __syncthreads();
+    q_total = lane < 4u ? reduce_q[lane] : 0.0f;
+    k_total = lane < 4u ? reduce_k[lane] : 0.0f;
+    q_total = __shfl_sync(0xffffffffu, warp_sum_f32(q_total), 0);
+    k_total = __shfl_sync(0xffffffffu, warp_sum_f32(k_total), 0);
+    q[index] = sq[tid] * rsqrtf(q_total + 1.0e-6f) *
+               0.08838834764831845f;
+    k[index] = sk[tid] * rsqrtf(k_total + 1.0e-6f);
+}
+
+__global__ static void glm53_kda_prefill_update_conv_state_kernel(
+        float *conv_state,
+        const float *raw_q,
+        const float *raw_k,
+        const float *raw_v,
+        uint32_t projection,
+        uint32_t n_tokens) {
+    const uint32_t channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= projection) return;
+    float *q_state = conv_state;
+    float *k_state = q_state + GLM53_CUDA_KDA_HISTORY * projection;
+    float *v_state = k_state + GLM53_CUDA_KDA_HISTORY * projection;
+#pragma unroll
+    for (uint32_t w = 0; w < GLM53_CUDA_KDA_HISTORY; w++) {
+        const uint64_t source =
+            (uint64_t)(n_tokens - GLM53_CUDA_KDA_HISTORY + w) *
+                projection + channel;
+        const uint64_t target = (uint64_t)w * projection + channel;
+        q_state[target] = raw_q[source];
+        k_state[target] = raw_k[source];
+        v_state[target] = raw_v[source];
+    }
+}
+
 __global__ static void glm53_kda_prefill_recurrence_kernel(
         float *out,
         float *state,
@@ -27345,22 +27465,71 @@ extern "C" int ds4_gpu_glm53_kda_prefill(
         output_norm_offset, GLM53_CUDA_KDA_DIM, tier, "KDA output norm");
     if (!qw || !kw || !vw || !a_log || !dt_bias || !output_norm) return 0;
 
-    glm53_kda_prefill_prepare_kernel<<<n_heads, GLM53_CUDA_KDA_DIM, 0,
-        cuda_decode_stream()>>>(
-            (float *)q->ptr, (float *)k->ptr, (float *)v->ptr,
-            (float *)raw_gate->ptr, (float *)conv_state->ptr,
-            qw, kw, vw, a_log, dt_bias, n_heads, n_tokens,
-            gate_lower_bound);
-    if (!cuda_ok(cudaGetLastError(),
-                 "GLM-5.3 KDA prefill prepare launch")) {
-        return 0;
+    cudaStream_t stream = cuda_decode_stream();
+    const float *recurrence_q = (const float *)q->ptr;
+    const float *recurrence_k = (const float *)k->ptr;
+    const float *recurrence_v = (const float *)v->ptr;
+    bool used_parallel_prepare = false;
+    if (n_tokens >= GLM53_CUDA_KDA_HISTORY &&
+        activations <= UINT64_MAX / 3u &&
+        3u * activations <= SIZE_MAX / sizeof(float)) {
+        float *prepared = (float *)cuda_tmp_alloc_on(
+            tier, 3u * activations * sizeof(float),
+            "GLM-5.3 prepared KDA prefill activations");
+        if (prepared) {
+            float *prepared_q = prepared;
+            float *prepared_k = prepared_q + activations;
+            float *prepared_v = prepared_k + activations;
+            const dim3 prepare_grid(n_tokens, n_heads, 1u);
+            glm53_kda_prefill_prepare_parallel_kernel<<<
+                prepare_grid, GLM53_CUDA_KDA_DIM, 0, stream>>>(
+                    prepared_q, prepared_k, prepared_v,
+                    (float *)raw_gate->ptr,
+                    (const float *)q->ptr,
+                    (const float *)k->ptr,
+                    (const float *)v->ptr,
+                    (const float *)conv_state->ptr,
+                    qw, kw, vw, a_log, dt_bias, n_heads, n_tokens,
+                    gate_lower_bound);
+            if (!cuda_ok(cudaGetLastError(),
+                         "GLM-5.3 parallel KDA prefill prepare launch")) {
+                return 0;
+            }
+            glm53_kda_prefill_update_conv_state_kernel<<<
+                (projection + 255u) / 256u, 256u, 0, stream>>>(
+                    (float *)conv_state->ptr,
+                    (const float *)q->ptr,
+                    (const float *)k->ptr,
+                    (const float *)v->ptr,
+                    (uint32_t)projection, n_tokens);
+            if (!cuda_ok(cudaGetLastError(),
+                         "GLM-5.3 KDA prefill state update launch")) {
+                return 0;
+            }
+            recurrence_q = prepared_q;
+            recurrence_k = prepared_k;
+            recurrence_v = prepared_v;
+            used_parallel_prepare = true;
+        }
+    }
+    if (!used_parallel_prepare) {
+        glm53_kda_prefill_prepare_kernel<<<
+            n_heads, GLM53_CUDA_KDA_DIM, 0, stream>>>(
+                (float *)q->ptr, (float *)k->ptr, (float *)v->ptr,
+                (float *)raw_gate->ptr, (float *)conv_state->ptr,
+                qw, kw, vw, a_log, dt_bias, n_heads, n_tokens,
+                gate_lower_bound);
+        if (!cuda_ok(cudaGetLastError(),
+                     "GLM-5.3 KDA prefill prepare launch")) {
+            return 0;
+        }
     }
     const dim3 recurrence_grid(n_heads, 32u, 1u);
     glm53_kda_prefill_recurrence_kernel<<<recurrence_grid, 128u, 0,
-        cuda_decode_stream()>>>(
+        stream>>>(
             (float *)out->ptr, (float *)recurrent_state->ptr,
-            (const float *)q->ptr, (const float *)k->ptr,
-            (const float *)v->ptr, (const float *)raw_gate->ptr,
+            recurrence_q, recurrence_k, recurrence_v,
+            (const float *)raw_gate->ptr,
             (const float *)raw_beta->ptr, n_heads, n_tokens);
     if (!cuda_ok(cudaGetLastError(),
                  "GLM-5.3 KDA prefill recurrence launch")) {
@@ -27368,7 +27537,7 @@ extern "C" int ds4_gpu_glm53_kda_prefill(
     }
     const dim3 output_grid(n_tokens, n_heads, 1u);
     glm53_kda_prefill_output_kernel<<<output_grid, GLM53_CUDA_KDA_DIM, 0,
-        cuda_decode_stream()>>>(
+        stream>>>(
             (float *)out->ptr, (const float *)output_gate->ptr,
             output_norm, n_heads, n_tokens, norm_eps);
     return cuda_ok(cudaGetLastError(), "GLM-5.3 KDA prefill output launch");
@@ -27555,6 +27724,207 @@ __device__ __forceinline__ static float2 glm_cache_rope_pair_f16_dev(
     const float x0 = (float)rope_cache[rope_base + r];
     const float x1 = (float)rope_cache[rope_base + r + 1u];
     return make_float2(x0 * ct - x1 * st, x0 * st + x1 * ct);
+}
+
+__global__ static void glm_dense_attn_pack_q_f16_kernel(
+        __half *packed,
+        const float *q,
+        uint32_t n_q,
+        uint32_t n_head,
+        uint32_t head0,
+        uint32_t group_heads,
+        uint32_t dim) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t count = (uint64_t)group_heads * n_q * dim;
+    if (i >= count) return;
+    const uint32_t d = (uint32_t)(i % dim);
+    const uint64_t row = i / dim;
+    const uint32_t token = (uint32_t)(row % n_q);
+    const uint32_t head = head0 + (uint32_t)(row / n_q);
+    packed[i] = __float2half(q[((uint64_t)token * n_head + head) * dim + d]);
+}
+
+__global__ static void glm_dense_attn_causal_softmax_f16_kernel(
+        __half *prob,
+        const float *scores,
+        uint32_t n_q,
+        uint32_t n_kv,
+        uint32_t q_row0,
+        float scale) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t group_head = blockIdx.y;
+    if (token >= n_q) return;
+    const uint32_t visible = min(n_kv, q_row0 + token + 1u);
+    const uint64_t row = ((uint64_t)group_head * n_q + token) * n_kv;
+
+    float local_max = -FLT_MAX;
+    for (uint32_t col = threadIdx.x; col < visible; col += blockDim.x) {
+        local_max = fmaxf(local_max, scores[row + col] * scale);
+    }
+    __shared__ float reduce[256];
+    reduce[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] = fmaxf(reduce[threadIdx.x],
+                                         reduce[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    const float max_score = reduce[0];
+
+    float local_sum = 0.0f;
+    for (uint32_t col = threadIdx.x; col < visible; col += blockDim.x) {
+        local_sum += expf(scores[row + col] * scale - max_score);
+    }
+    reduce[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float inv_sum = reduce[0] > 0.0f ? 1.0f / reduce[0] : 0.0f;
+    for (uint32_t col = threadIdx.x; col < n_kv; col += blockDim.x) {
+        const float p = col < visible
+            ? expf(scores[row + col] * scale - max_score) * inv_sum : 0.0f;
+        prob[row + col] = __float2half(p);
+    }
+}
+
+__global__ static void glm_dense_attn_unpack_f32_kernel(
+        float *out,
+        const float *packed,
+        uint32_t n_q,
+        uint32_t n_head,
+        uint32_t head0,
+        uint32_t group_heads,
+        uint32_t dim) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t count = (uint64_t)group_heads * n_q * dim;
+    if (i >= count) return;
+    const uint32_t d = (uint32_t)(i % dim);
+    const uint64_t row = i / dim;
+    const uint32_t token = (uint32_t)(row % n_q);
+    const uint32_t head = head0 + (uint32_t)(row / n_q);
+    out[((uint64_t)token * n_head + head) * dim + d] = packed[i];
+}
+
+extern "C" int ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
+        ds4_gpu_tensor       *lora_out,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        uint32_t              q_row0,
+        uint32_t              n_q,
+        uint32_t              n_kv,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_dim) {
+    if (!lora_out || !qk_low || !kv_lora_cache || !g_cublas_ready ||
+        g_n_gpus != 1 || n_q == 0u || n_kv == 0u || n_kv > cache_cap ||
+        q_row0 >= n_kv || n_q > n_kv - q_row0 || !cache_f16 ||
+        n_q > INT_MAX || n_kv > INT_MAX || n_head == 0u ||
+        kv_lora_dim != 512u || qk_dim == 0u ||
+        qk_low->bytes < (uint64_t)n_q * n_head * kv_lora_dim * sizeof(float) ||
+        kv_lora_cache->bytes < (uint64_t)cache_cap * kv_lora_dim * sizeof(__half) ||
+        lora_out->bytes < (uint64_t)n_q * n_head * kv_lora_dim * sizeof(float)) {
+        return 0;
+    }
+
+    const uint32_t visible_kv = min(n_kv, q_row0 + n_q);
+    const uint32_t max_group_heads = min(n_head, 8u);
+    if ((uint64_t)n_q > UINT64_MAX / max_group_heads / visible_kv) {
+        return 0;
+    }
+    const uint64_t q_count =
+        (uint64_t)max_group_heads * n_q * kv_lora_dim;
+    const uint64_t score_count =
+        (uint64_t)max_group_heads * n_q * visible_kv;
+    const uint64_t q_bytes = q_count * sizeof(__half);
+    const uint64_t score_off = (q_bytes + 255u) & ~255ull;
+    const uint64_t score_bytes = score_count * sizeof(float);
+    const uint64_t prob_off = (score_off + score_bytes + 255u) & ~255ull;
+    const uint64_t prob_bytes = score_count * sizeof(__half);
+    const uint64_t out_off = (prob_off + prob_bytes + 255u) & ~255ull;
+    const uint64_t out_bytes = q_count * sizeof(float);
+    if (score_off < q_bytes || prob_off < score_off || out_off < prob_off ||
+        out_off > UINT64_MAX - out_bytes) {
+        return 0;
+    }
+    unsigned char *scratch = (unsigned char *)cuda_tmp_alloc_on(
+        0, out_off + out_bytes, "GLM dense compact attention");
+    if (!scratch) return 0;
+    __half *q_half = (__half *)scratch;
+    float *scores = (float *)(scratch + score_off);
+    __half *prob = (__half *)(scratch + prob_off);
+    float *packed_out = (float *)(scratch + out_off);
+    const __half *kv = (const __half *)kv_lora_cache->ptr;
+    const float attn_scale = 1.0f / sqrtf((float)qk_dim);
+    cublasHandle_t handle = cuda_cublas_for_tier(0);
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+
+    for (uint32_t head0 = 0; head0 < n_head; head0 += max_group_heads) {
+        const uint32_t group_heads = min(max_group_heads, n_head - head0);
+        const uint64_t group_q_count =
+            (uint64_t)group_heads * n_q * kv_lora_dim;
+        glm_dense_attn_pack_q_f16_kernel<<<
+            (group_q_count + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
+                q_half, (const float *)qk_low->ptr, n_q, n_head, head0,
+                group_heads, kv_lora_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "GLM dense attention Q pack launch")) return 0;
+
+        cublasStatus_t st = cublasGemmStridedBatchedEx(
+            handle,
+            CUBLAS_OP_T, CUBLAS_OP_N,
+            (int)visible_kv, (int)n_q, (int)kv_lora_dim,
+            &alpha,
+            kv, CUDA_R_16F, (int)kv_lora_dim, 0,
+            q_half, CUDA_R_16F, (int)kv_lora_dim,
+            (long long)n_q * kv_lora_dim,
+            &beta,
+            scores, CUDA_R_32F, (int)visible_kv,
+            (long long)n_q * visible_kv,
+            (int)group_heads,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "GLM dense attention score GEMM")) return 0;
+
+        dim3 softmax_grid(n_q, group_heads, 1u);
+        glm_dense_attn_causal_softmax_f16_kernel<<<
+            softmax_grid, 256, 0, cuda_decode_stream()>>>(
+                prob, scores, n_q, visible_kv, q_row0, attn_scale);
+        if (!cuda_ok(cudaGetLastError(),
+                     "GLM dense attention softmax launch")) return 0;
+
+        st = cublasGemmStridedBatchedEx(
+            handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            (int)kv_lora_dim, (int)n_q, (int)visible_kv,
+            &alpha,
+            kv, CUDA_R_16F, (int)kv_lora_dim, 0,
+            prob, CUDA_R_16F, (int)visible_kv,
+            (long long)n_q * visible_kv,
+            &beta,
+            packed_out, CUDA_R_32F, (int)kv_lora_dim,
+            (long long)n_q * kv_lora_dim,
+            (int)group_heads,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT);
+        if (!cublas_ok(st, "GLM dense attention value GEMM")) return 0;
+
+        glm_dense_attn_unpack_f32_kernel<<<
+            (group_q_count + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
+                (float *)lora_out->ptr, packed_out, n_q, n_head, head0,
+                group_heads, kv_lora_dim);
+        if (!cuda_ok(cudaGetLastError(),
+                     "GLM dense attention output unpack launch")) return 0;
+    }
+    return 1;
 }
 
 /* Scalar-correct MLA attention: one warp per head, grid
