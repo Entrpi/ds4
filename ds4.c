@@ -2508,7 +2508,7 @@ static void print_size(uint64_t bytes) {
 #define DS4_SPEC_PREFIX_SLOTS 4
 
 static bool ds4_dspark_rocm_gfx1151_fast_path(void) {
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     const char *env = getenv("DS4_ROCM_DSPARK_FAST");
     if (env && env[0]) return env[0] != '0';
     return ds4_gpu_dspark_gfx1151_fast_path() != 0;
