@@ -36474,6 +36474,16 @@ static uint32_t glm_graph_resume_prefill_min_tokens(void) {
     return 4u;
 }
 
+static uint32_t glm53_graph_resume_prefill_min_tokens(void) {
+#ifndef DS4_ROCM_BUILD
+    /* Measured on M5 Max and GB10: one token is marginally faster through
+     * decode, while two or more tokens amortize the batch setup cost. */
+    const char *env = getenv("DS4_GLM_RESUME_PREFILL_MIN");
+    if (!env || !env[0]) return 2u;
+#endif
+    return glm_graph_resume_prefill_min_tokens();
+}
+
 #define DS4_GLM_METAL_FULL_ATTN_DEFAULT_CONTEXT 4096u
 #define DS4_GLM_METAL_STREAMING_FULL_ATTN_CONTEXT 8192u
 #define DS4_GLM_METAL_FULL_ATTN_LAYER_FLUSH_CONTEXT 2048u
@@ -40834,6 +40844,14 @@ static uint32_t glm_graph_limit_indexed_prefill_chunk(
         const ds4_glm_gpu_graph *g,
         uint32_t pos,
         uint32_t chunk) {
+#ifndef DS4_ROCM_BUILD
+    /* GLM 5.3's resident Metal/CUDA graph can switch its attention slices
+     * from causal dense to indexed sparse inside one layer-major chunk. */
+    if (g && g->glm53 && glm_graph_indexed_prefill_batch_available(g) &&
+        getenv("DS4_GLM53_DISABLE_MIXED_PREFILL") == NULL) {
+        return chunk;
+    }
+#endif
     const uint32_t dense_limit = glm_graph_dense_compact_attention_limit(g);
     if (pos < dense_limit) {
         const uint32_t bridge = dense_limit - pos;
@@ -48123,9 +48141,11 @@ static bool glm_graph_forward_indexed_tokens(
     const uint32_t n_rows = pos0 + n_tokens;
     const uint32_t indexer_top_k = glm_graph_indexer_top_k_limit();
     const uint32_t dense_limit = glm_graph_dense_compact_attention_limit(g);
+#ifdef DS4_ROCM_BUILD
     if (pos0 < dense_limit && n_rows > dense_limit) {
         return false;
     }
+#endif
     const uint32_t indexed_selected_count = n_rows <= dense_limit ?
         n_rows :
         (g->glm53 ? glm53_graph_indexer_selected_limit() : indexer_top_k);
@@ -49000,8 +49020,15 @@ static bool glm_graph_forward_indexed_tokens(
             const uint32_t attn_slice_cap =
                 glm_graph_indexed_prefill_batch_attn_slice_tokens();
             for (uint32_t t0 = 0; ok && t0 < n_tokens; ) {
+                const uint32_t slice_pos = pos0 + t0;
                 uint32_t slice = n_tokens - t0;
                 if (slice > attn_slice_cap) slice = attn_slice_cap;
+                const bool slice_causal = slice_pos < dense_limit;
+                if (slice_causal && slice > dense_limit - slice_pos) {
+                    slice = dense_limit - slice_pos;
+                }
+                const uint32_t attention_selected_count = slice_causal ?
+                    dense_limit : last_indexer_selected_count;
 
                 ds4_gpu_tensor *q_view =
                     ds4_gpu_tensor_view(g->batch_q,
@@ -49020,12 +49047,12 @@ static bool glm_graph_forward_indexed_tokens(
                                         (uint64_t)t0 * DS4_N_HEAD * DS4_N_KV_LORA * sizeof(float),
                                         (uint64_t)slice * DS4_N_HEAD * DS4_N_KV_LORA * sizeof(float)) :
                     NULL;
-                ds4_gpu_tensor *selected_view = use_causal_range_select ? NULL :
+                ds4_gpu_tensor *selected_view = slice_causal ? NULL :
                     ds4_gpu_tensor_view(last_indexer_selected,
                                         (uint64_t)t0 * last_indexer_selected_count * sizeof(uint32_t),
                                         (uint64_t)slice * last_indexer_selected_count * sizeof(uint32_t));
                 ok = q_view && qk_low_view && heads_view &&
-                     (use_causal_range_select || selected_view) &&
+                     (slice_causal || selected_view) &&
                      (!use_split_value_proj || attn_lora_view);
                 if (!ok) {
                     fprintf(stderr, "ds4: GLM sliced indexed prefill failed to create attention views at layer %u token %u\n", il, t0);
@@ -49033,7 +49060,7 @@ static bool glm_graph_forward_indexed_tokens(
                 if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ATTN_CORE)) { /* ablate */ } else if (ok && use_split_value_proj) {
                     int rc = 0;
 #if defined(__APPLE__)
-                    if (use_causal_range_select &&
+                    if (slice_causal &&
                         glm_graph_use_flash_attention_prefill(slice) &&
                         !tp_attn_head_split) {
                         rc = ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
@@ -49042,7 +49069,7 @@ static bool glm_graph_forward_indexed_tokens(
                                 g->layer_kv_lora_cache[il],
                                 pos0 + t0,
                                 slice,
-                                last_indexer_selected_count,
+                                attention_selected_count,
                                 g->compact_cache_cap,
                                 glm_graph_compact_cache_is_f16(),
                                 DS4_N_HEAD,
@@ -49050,7 +49077,7 @@ static bool glm_graph_forward_indexed_tokens(
                                 (uint32_t)g->q_nope);
                     } else
 #endif
-                    if (use_causal_range_select) {
+                    if (slice_causal) {
                         rc = ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
                                 attn_lora_view,
                                 q_view,
@@ -49059,7 +49086,7 @@ static bool glm_graph_forward_indexed_tokens(
                                 g->layer_k_rope_cache[il],
                                 slice,
                                 pos0 + t0,
-                                last_indexer_selected_count,
+                                attention_selected_count,
                                 g->compact_cache_cap,
                                 glm_graph_compact_cache_is_f16(),
                                 DS4_N_HEAD,
@@ -64278,6 +64305,21 @@ static bool ds4_session_vision_prefix_matches(
     return true;
 }
 
+static bool ds4_session_vision_range_overlaps(
+        const ds4_session *s,
+        uint32_t           token_start,
+        uint32_t           token_count) {
+    const uint64_t range_start = token_start;
+    const uint64_t range_end = range_start + token_count;
+    for (size_t i = 0; i < s->sync_image_count; i++) {
+        const uint64_t image_start = s->sync_images[i].token_start;
+        const uint64_t image_end = image_start +
+                                   s->sync_images[i].embedding.token_count;
+        if (range_start < image_end && image_start < range_end) return true;
+    }
+    return false;
+}
+
 static bool ds4_session_store_vision_identities(ds4_session *s) {
     ds4_vision_identity *copy = NULL;
     if (s->sync_image_count != 0) {
@@ -64559,8 +64601,15 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
 
         /* GLM-5.3 uses bounded layer-major chunks for mHC and recurrent KDA.
          * DSA switches from dense attention to the pooled sparse graph at the
-         * full-attention boundary without returning to a token-major loop. */
+         * full-attention boundary without returning to a token-major loop.
+         * Very short checkpoint extensions retain the lower-latency decode
+         * path; image embeddings still require the batch prefill path. */
         if (s->glm_graph.glm53) {
+            const uint32_t suffix = (uint32_t)(prompt->len - start);
+            const bool short_resume =
+                resumed_checkpoint && suffix > 0 &&
+                suffix < glm53_graph_resume_prefill_min_tokens() &&
+                !ds4_session_vision_range_overlaps(s, (uint32_t)start, suffix);
             for (int i = start; i < prompt->len; ) {
                 if (ds4_session_cancelled(s)) {
                     snprintf(err, errlen, "interrupted");
@@ -64575,10 +64624,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 if (chunk > DS4_GLM53_PREFILL_CHUNK_TOKENS) {
                     chunk = DS4_GLM53_PREFILL_CHUNK_TOKENS;
                 }
+                if (short_resume) chunk = 1;
                 const bool use_indexed =
-                    glm53_graph_use_indexed_prefill(&s->glm_graph) ||
-                    (pos >= s->glm_graph.ctx_cap &&
-                     s->glm_graph.indexed_prefill_cap != 0);
+                    !short_resume &&
+                    (glm53_graph_use_indexed_prefill(&s->glm_graph) ||
+                     (pos >= s->glm_graph.ctx_cap &&
+                      s->glm_graph.indexed_prefill_cap != 0));
                 if (use_indexed) {
                     if (chunk > s->glm_graph.indexed_prefill_cap) {
                         chunk = s->glm_graph.indexed_prefill_cap;
@@ -64586,15 +64637,25 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                     chunk = glm_graph_limit_indexed_prefill_chunk(&s->glm_graph,
                                                                    pos,
                                                                    chunk);
-                } else if (pos < s->glm_graph.ctx_cap) {
+                } else if (!short_resume && pos < s->glm_graph.ctx_cap) {
                     const uint32_t dense_left = s->glm_graph.ctx_cap - pos;
                     if (chunk > dense_left) chunk = dense_left;
-                } else {
+                } else if (!short_resume) {
                     chunk = 1;
                 }
                 float *chunk_logits = i + (int)chunk == prompt->len ?
                     s->logits : NULL;
-                const bool ok = use_indexed ?
+                const bool ok = short_resume ?
+                    glm_graph_forward_token(&s->glm_graph,
+                                            &e->model,
+                                            &e->weights,
+                                            prompt->v[i],
+                                            NULL,
+                                            pos,
+                                            NULL,
+                                            chunk_logits,
+                                            false) :
+                    use_indexed ?
                     glm_graph_forward_indexed_tokens(
                                             &s->glm_graph,
                                             &e->model,
