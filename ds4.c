@@ -42911,6 +42911,29 @@ static bool glm53_graph_kda_attention(
     }
     const uint32_t projection = DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
     bool qk_paired = false;
+#if defined(__APPLE__)
+    bool qkv_paired = false;
+    if (getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") == NULL &&
+        getenv("DS4_METAL_DISABLE_GLM53_BF16_QKV") == NULL &&
+        l->kda_q->type == DS4_TENSOR_BF16 &&
+        l->kda_k->type == DS4_TENSOR_BF16 &&
+        l->kda_v->type == DS4_TENSOR_BF16) {
+        qkv_paired = ds4_gpu_glm53_matmul_bf16_qkv(
+                g->kda_q,
+                g->kda_k,
+                g->kda_v,
+                model->map,
+                model->size,
+                l->kda_q->abs_offset,
+                l->kda_k->abs_offset,
+                l->kda_v->abs_offset,
+                DS4_N_EMBD,
+                projection,
+                g->attn_norm) != 0;
+    }
+#else
+    const bool qkv_paired = false;
+#endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     if (l->kda_q->type == DS4_TENSOR_Q4_K &&
         l->kda_k->type == DS4_TENSOR_Q4_K &&
@@ -42927,30 +42950,32 @@ static bool glm53_graph_kda_attention(
                 g->attn_norm) != 0;
     }
 #endif
-    bool ok = qk_paired ||
+    bool ok = qkv_paired || qk_paired ||
         glm53_graph_matmul(g->kda_q, model, l->kda_q,
                            DS4_N_EMBD, projection, g->attn_norm);
-    if (ok && !qk_paired) {
+    if (ok && !qkv_paired && !qk_paired) {
         ok = glm53_graph_matmul(g->kda_k, model, l->kda_k,
                                 DS4_N_EMBD, projection, g->attn_norm);
     }
-    if (ok) ok = glm53_graph_matmul(g->kda_v, model, l->kda_v,
-                                         DS4_N_EMBD, projection, g->attn_norm);
-    if (ok) ok = glm53_graph_matmul(g->kda_lowrank, model, l->kda_f_a,
-                                         DS4_N_EMBD, DS4_N_KDA_HEAD_DIM,
-                                         g->attn_norm);
-    if (ok) ok = glm53_graph_matmul(g->kda_raw_gate, model, l->kda_f_b,
-                                         DS4_N_KDA_HEAD_DIM, projection,
-                                         g->kda_lowrank);
-    if (ok) ok = glm53_graph_matmul(g->kda_raw_beta, model, l->kda_beta,
-                                         DS4_N_EMBD, DS4_N_KDA_HEAD,
-                                         g->attn_norm);
-    if (ok) ok = glm53_graph_matmul(g->kda_lowrank, model, l->kda_g_a,
-                                         DS4_N_EMBD, DS4_N_KDA_HEAD_DIM,
-                                         g->attn_norm);
-    if (ok) ok = glm53_graph_matmul(g->kda_output_gate, model, l->kda_g_b,
-                                         DS4_N_KDA_HEAD_DIM, projection,
-                                         g->kda_lowrank);
+    if (ok && !qkv_paired) {
+        ok = glm53_graph_matmul(g->kda_v, model, l->kda_v,
+                                DS4_N_EMBD, projection, g->attn_norm);
+    }
+    if (ok) ok = glm53_graph_matmul(
+            g->kda_lowrank, model, l->kda_f_a,
+            DS4_N_EMBD, DS4_N_KDA_HEAD_DIM, g->attn_norm);
+    if (ok) ok = glm53_graph_matmul(
+            g->kda_raw_gate, model, l->kda_f_b,
+            DS4_N_KDA_HEAD_DIM, projection, g->kda_lowrank);
+    if (ok) ok = glm53_graph_matmul(
+            g->kda_raw_beta, model, l->kda_beta,
+            DS4_N_EMBD, DS4_N_KDA_HEAD, g->attn_norm);
+    if (ok) ok = glm53_graph_matmul(
+            g->kda_lowrank, model, l->kda_g_a,
+            DS4_N_EMBD, DS4_N_KDA_HEAD_DIM, g->attn_norm);
+    if (ok) ok = glm53_graph_matmul(
+            g->kda_output_gate, model, l->kda_g_b,
+            DS4_N_KDA_HEAD_DIM, projection, g->kda_lowrank);
     if (ok) ok = ds4_gpu_glm53_kda_decode(
             g->kda_out,
             g->layer_kda_conv_state[il],

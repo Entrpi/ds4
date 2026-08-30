@@ -26,17 +26,15 @@ kernel void kernel_glm53_embedding_bf16(
             : 0.0f;
 }
 
-/* One simdgroup owns one output row. Eight independent loads expose enough
- * memory-level parallelism for decode without changing the reduction tree. */
-kernel void kernel_glm53_mul_mv_bf16_f32(
+static inline void glm53_mul_mv_bf16_f32_row(
         constant glm53_bf16_matmul_args &args,
         device const ushort             *weights,
         device const float              *x,
         device float                    *out,
-        uint2 tgpig [[threadgroup_position_in_grid]],
-        ushort lane [[thread_index_in_simdgroup]],
-        ushort sg [[simdgroup_index_in_threadgroup]],
-        ushort nsg [[simdgroups_per_threadgroup]]) {
+        uint2                            tgpig,
+        ushort                           lane,
+        ushort                           sg,
+        ushort                           nsg) {
     const uint out_row = tgpig.x * (uint)nsg + sg;
     const uint token = tgpig.y;
     if (out_row >= args.out_dim || token >= args.n_rows) return;
@@ -76,6 +74,42 @@ kernel void kernel_glm53_mul_mv_bf16_f32(
     }
     sum = simd_sum(sum);
     if (lane == 0u) out[(ulong)token * args.out_dim + out_row] = sum;
+}
+
+/* One simdgroup owns one output row. Eight independent loads expose enough
+ * memory-level parallelism for decode without changing the reduction tree. */
+kernel void kernel_glm53_mul_mv_bf16_f32(
+        constant glm53_bf16_matmul_args &args,
+        device const ushort             *weights,
+        device const float              *x,
+        device float                    *out,
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    glm53_mul_mv_bf16_f32_row(args, weights, x, out,
+                              tgpig, lane, sg, nsg);
+}
+
+kernel void kernel_glm53_mul_mv_bf16_f32_qkv(
+        constant glm53_bf16_matmul_args &args,
+        device const ushort             *weights_q,
+        device const ushort             *weights_k,
+        device const ushort             *weights_v,
+        device const float              *x,
+        device float                    *out_q,
+        device float                    *out_k,
+        device float                    *out_v,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]],
+        ushort nsg [[simdgroups_per_threadgroup]]) {
+    device const ushort *weights = tgpig.z == 0u ? weights_q :
+                                     (tgpig.z == 1u ? weights_k : weights_v);
+    device float *out = tgpig.z == 0u ? out_q :
+                            (tgpig.z == 1u ? out_k : out_v);
+    glm53_mul_mv_bf16_f32_row(args, weights, x, out,
+                              tgpig.xy, lane, sg, nsg);
 }
 
 struct glm53_bf16_block16 {

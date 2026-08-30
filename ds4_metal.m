@@ -43831,6 +43831,13 @@ int ds4_gpu_glm53_embedding_bf16(
     }
 }
 
+static uint32_t glm53_gpu_bf16_mv_nsg(void) {
+    return ds4_gpu_device_name_contains("M3 Ultra") &&
+           getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") == NULL &&
+           getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_BF16_NSG4") == NULL
+               ? 4u : 8u;
+}
+
 int ds4_gpu_glm53_matmul_bf16(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -43870,7 +43877,7 @@ int ds4_gpu_glm53_matmul_bf16(
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         if (use_mv) {
-            const uint32_t nsg = 8u;
+            const uint32_t nsg = glm53_gpu_bf16_mv_nsg();
             glm53_gpu_bf16_matmul_args args = {
                 .in_dim = in_dim,
                 .out_dim = out_dim,
@@ -43903,6 +43910,78 @@ int ds4_gpu_glm53_matmul_bf16(
         }
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "GLM-5.3 BF16 matmul");
+    }
+}
+
+int ds4_gpu_glm53_matmul_bf16_qkv(
+        ds4_gpu_tensor       *out_q,
+        ds4_gpu_tensor       *out_k,
+        ds4_gpu_tensor       *out_v,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_q_offset,
+        uint64_t              weight_k_offset,
+        uint64_t              weight_v_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!ds4_gpu_device_name_contains("M3 Ultra")) return 0;
+    uint64_t weights = 0;
+    if (in_dim == 0 || out_dim == 0 ||
+        !glm53_gpu_mul_u64(in_dim, out_dim, &weights) ||
+        !glm53_gpu_tensor_has(x, in_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out_q, out_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out_k, out_dim, sizeof(float)) ||
+        !glm53_gpu_tensor_has(out_v, out_dim, sizeof(float))) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        const uint64_t weight_bytes = weights * sizeof(uint16_t);
+        uint64_t inner_q = 0, inner_k = 0, inner_v = 0;
+        id<MTLBuffer> weight_q = glm53_gpu_weight_buffer(
+            model_map, model_size, weight_q_offset, weight_bytes,
+            &inner_q, "BF16 Q matrix");
+        id<MTLBuffer> weight_k = glm53_gpu_weight_buffer(
+            model_map, model_size, weight_k_offset, weight_bytes,
+            &inner_k, "BF16 K matrix");
+        id<MTLBuffer> weight_v = glm53_gpu_weight_buffer(
+            model_map, model_size, weight_v_offset, weight_bytes,
+            &inner_v, "BF16 V matrix");
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_mul_mv_bf16_f32_qkv");
+        if (!weight_q || !weight_k || !weight_v || !pipeline) return 0;
+
+        const uint32_t nsg = glm53_gpu_bf16_mv_nsg();
+        glm53_gpu_bf16_matmul_args args = {
+            .in_dim = in_dim,
+            .out_dim = out_dim,
+            .n_rows = 1u,
+        };
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:weight_q offset:(NSUInteger)inner_q atIndex:1];
+        [enc setBuffer:weight_k offset:(NSUInteger)inner_k atIndex:2];
+        [enc setBuffer:weight_v offset:(NSUInteger)inner_v atIndex:3];
+        [enc setBuffer:ds4_gpu_tensor_buffer(x)
+                offset:ds4_gpu_tensor_offset(x) atIndex:4];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out_q)
+                offset:ds4_gpu_tensor_offset(out_q) atIndex:5];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out_k)
+                offset:ds4_gpu_tensor_offset(out_k) atIndex:6];
+        [enc setBuffer:ds4_gpu_tensor_buffer(out_v)
+                offset:ds4_gpu_tensor_offset(out_v) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake((out_dim + nsg - 1u) / nsg,
+                                              1u, 3u)
+            threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1u, 1u)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        return ds4_gpu_finish_command_buffer(cb, owned,
+                                              "GLM-5.3 BF16 QKV matmul");
     }
 }
 
