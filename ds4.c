@@ -65909,6 +65909,7 @@ static bool ds4_session_vision_prefix_matches(
         const ds4_session     *s,
         const ds4_vision_span *images,
         size_t                 image_count) {
+    if (!s || (image_count != 0 && !images)) return false;
     if (!s->checkpoint_valid) return true;
     if (s->checkpoint_image_count > image_count) return false;
     for (size_t i = 0; i < s->checkpoint_image_count; i++) {
@@ -65924,6 +65925,19 @@ static bool ds4_session_vision_prefix_matches(
         if (next->token_start < (uint32_t)s->checkpoint.len) return false;
     }
     return true;
+}
+
+bool ds4_session_vision_state_matches(
+        const ds4_session     *s,
+        const ds4_vision_span *images,
+        size_t                 image_count) {
+    return s && s->checkpoint_valid &&
+           s->checkpoint_image_count == image_count &&
+           ds4_session_vision_prefix_matches(s, images, image_count);
+}
+
+bool ds4_session_has_vision_state(const ds4_session *s) {
+    return s && (s->checkpoint_image_count != 0 || s->sync_image_count != 0);
 }
 
 static bool ds4_session_vision_range_overlaps(

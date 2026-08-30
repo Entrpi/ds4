@@ -78,6 +78,13 @@ int main(int argc, char **argv) {
     }
     if (ds4_session_sync_multimodal(session, &prompt, &span, 1,
                                     error, sizeof(error)) != 0) goto done;
+    if (!ds4_session_has_vision_state(session) ||
+        !ds4_session_vision_state_matches(session, &span, 1) ||
+        ds4_session_vision_state_matches(session, NULL, 0)) {
+        snprintf(error, sizeof(error),
+                 "live session did not retain exact image identity");
+        goto done;
+    }
 
     progress_counter progress = {0};
     ds4_session_set_progress(session, count_progress, &progress);
@@ -130,8 +137,18 @@ int main(int argc, char **argv) {
     memset(span.embedding.data, 0,
            image_embedding_elems * sizeof(*span.embedding.data));
     span.embedding.fingerprint[0] ^= 1u;
+    if (ds4_session_vision_state_matches(session, &span, 1)) {
+        snprintf(error, sizeof(error),
+                 "changed image fingerprint matched live session");
+        goto done;
+    }
     if (ds4_session_sync_multimodal(session, &prompt, &span, 1,
                                     error, sizeof(error)) != 0) goto done;
+    if (!ds4_session_vision_state_matches(session, &span, 1)) {
+        snprintf(error, sizeof(error),
+                 "rebuilt session did not retain changed image identity");
+        goto done;
+    }
     if (progress.calls == 0 || progress.current != prompt.len ||
         progress.total != prompt.len) {
         snprintf(error, sizeof(error),
