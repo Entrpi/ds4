@@ -90,12 +90,15 @@ def qtype_nbytes(qtype, shape):
 
 
 def regular_qtype(artifact, role, name, source_qtype):
-    if artifact != "q2" or source_qtype != QTYPE_BF16:
+    if artifact not in ("q2", "q4") or source_qtype != QTYPE_BF16:
         return source_qtype
     if role in ("embedding", "output"):
         return QTYPE_Q8_0
     if role == "linear_attention":
-        if name.endswith(".kda_q.weight") or name.endswith(".kda_k.weight"):
+        if artifact == "q2" and (
+            name.endswith(".kda_q.weight") or
+            name.endswith(".kda_k.weight")
+        ):
             return QTYPE_Q4_K
         return QTYPE_Q8_0
     return source_qtype

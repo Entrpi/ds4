@@ -104,7 +104,11 @@ class GLM53QuantizeTests(unittest.TestCase):
         )
         self.assertEqual(
             regular_qtype("q4", "linear_attention", "blk.0.kda_q.weight", QTYPE_BF16),
-            QTYPE_BF16,
+            QTYPE_Q8_0,
+        )
+        self.assertEqual(
+            regular_qtype("q4", "embedding", "token_embd.weight", QTYPE_BF16),
+            QTYPE_Q8_0,
         )
 
     def test_fp8_e4m3_edge_values(self):

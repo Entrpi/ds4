@@ -178,6 +178,10 @@ top-logprob slices, so do not replace them with one sampled chat answer.
   average NLL `0.458030488`, first-token match `89/100`, and average greedy
   prefix `7.37`; Q4 is `0.299917952`, `90/100`, and `9.66`. These are fresh
   GLM-5.3 Z.AI FP8 continuations and must not be replaced by GLM 5.2 fixtures.
+  The Q4 layout with Q8 KDA projections, embedding, and output head scored
+  `0.300804038`, `90/100`, and `9.48` on M3 Ultra. Its paired BF16-layout
+  control scored `0.300477636`, `90/100`, and `9.48`; the Q8 layout won 54 of
+  100 cases despite its `0.109%` higher aggregate NLL.
 - Run the same GLM fixture for reduced-precision GLM release files.  The Q2
   routed reference is lower quality but should stay near first-token match
   `92/100`, API top-1 agreement about `0.890`, and API pair-order agreement
@@ -958,6 +962,7 @@ claims across different models or contexts.
 | MacBook Pro M5 Max 128 GB, Metal | Flash 0731 q2, opportunistic temperature-1 128-token code prompt | - | 44.49 t/s ordinary median; 48.19 t/s DSpark median |
 | Mac Studio M3 Ultra 512 GB, Metal | Flash q2, 11,709-token prompt | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra 512 GB, Metal | Flash q4, 12,018-token prompt | 448.82 t/s | 26.62 t/s |
+| Mac Studio M3 Ultra 512 GB, Metal | GLM 5.3 Flash Q4 with Q8 KDA/head, 2,048-token prompt | 437.62 t/s | 24.74 t/s |
 | Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.2 IQ2_XXS, 4,096-token prefill and 256-token teacher-forced decode | about 214 t/s | about 16.7 t/s |
 | MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, resident short prompt | 86.68 t/s | 34.45 t/s; 41.97 t/s greedy MTP |
 | MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, 8,192-token compact-attention prompt | 479.09 t/s | 29.89 t/s steady |
