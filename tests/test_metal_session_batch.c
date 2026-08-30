@@ -321,6 +321,16 @@ int main(void) {
             return 1;
         }
     }
+    if (steering_file && steering_file[0] && !tp_leader) {
+        const float initial = opt.directional_steering_ffn;
+        if (ds4_session_directional_steering_ffn(batched[0]) != initial ||
+            ds4_session_set_directional_steering_ffn(batched[0], 0.0f) != 0 ||
+            ds4_session_directional_steering_ffn(batched[0]) != 0.0f ||
+            ds4_session_set_directional_steering_ffn(batched[0], initial) != 0 ||
+            ds4_session_directional_steering_ffn(batched[0]) != initial) {
+            fail("live steering control", 0, -1);
+        }
+    }
 
     if (tp_leader && getenv("DS4_TEST_TP_DISCONNECT")) {
         ds4_decode_item items[MAX_SESSION_COUNT];

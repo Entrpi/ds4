@@ -1273,6 +1273,7 @@ static void print_repl_help(void) {
     puts("  /nothink       Disable thinking mode.");
     puts("  /ctx N         Set context size for following prompts.");
     puts("  /power N       Set GPU duty cycle percentage, 1..100.");
+    puts("  /steer F       Set FFN steering for subsequent tokens; no value shows it.");
     puts("  /read FILE     Submit a text file, PNG, or JPEG.");
     puts("  /quit, /exit   Leave the prompt.");
     puts("  Ctrl+C         Stop generation and return to the prompt.");
@@ -1283,6 +1284,18 @@ static bool parse_power_percent(const char *arg, int *out) {
     long v = strtol(arg, &end, 10);
     if (!arg[0] || *end != '\0' || v < 1 || v > 100) return false;
     *out = (int)v;
+    return true;
+}
+
+static bool parse_steering_level(const char *arg, float *out) {
+    char *end = NULL;
+    errno = 0;
+    float v = strtof(arg, &end);
+    if (!arg[0] || *end != '\0' || errno == ERANGE || !isfinite(v) ||
+        v < -100.0f || v > 100.0f) {
+        return false;
+    }
+    *out = v;
     return true;
 }
 
@@ -1718,6 +1731,22 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                 } else {
                     cfg->engine.power_percent = power;
                     printf("Power: %d%%.\n", power);
+                }
+            }
+        } else if (!strncmp(cmd, "/steer", 6) &&
+                   (cmd[6] == '\0' || isspace((unsigned char)cmd[6]))) {
+            char *arg = trim_inplace(cmd + 6);
+            if (!arg[0]) {
+                printf("Steering FFN: %g.\n",
+                       (double)ds4_session_directional_steering_ffn(chat.session));
+            } else {
+                float scale = 0.0f;
+                if (!parse_steering_level(arg, &scale)) {
+                    fprintf(stderr, "ds4: /steer must be between -100 and 100\n");
+                } else if (ds4_session_set_directional_steering_ffn(
+                                   chat.session, scale) == 0) {
+                    cfg->engine.directional_steering_ffn = scale;
+                    printf("Steering FFN: %g.\n", (double)scale);
                 }
             }
         } else if (!strncmp(cmd, "/ctx", 4) && (cmd[4] == '\0' || isspace((unsigned char)cmd[4]))) {

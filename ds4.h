@@ -387,6 +387,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
+float ds4_session_directional_steering_ffn(ds4_session *s);
+/* Change steering for future evaluation without rebuilding the existing KV
+ * state. Live changes are currently limited to non-distributed sessions. */
+int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale);
 bool ds4_session_is_distributed(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;

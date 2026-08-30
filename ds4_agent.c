@@ -541,6 +541,18 @@ static bool parse_power_percent(const char *arg, int *out) {
     return true;
 }
 
+static bool parse_steering_level(const char *arg, float *out) {
+    char *end = NULL;
+    errno = 0;
+    float v = strtof(arg, &end);
+    if (!arg[0] || *end != '\0' || errno == ERANGE || !isfinite(v) ||
+        v < -100.0f || v > 100.0f) {
+        return false;
+    }
+    *out = v;
+    return true;
+}
+
 static bool agent_slash_command_with_args(const char *cmd, const char *name) {
     size_t len = strlen(name);
     return !strncmp(cmd, name, len) &&
@@ -556,6 +568,7 @@ static bool agent_slash_command_known(const char *cmd) {
            !strcmp(cmd, "/exit") ||
            !strcmp(cmd, "/new") ||
            agent_slash_command_with_args(cmd, "/power") ||
+           agent_slash_command_with_args(cmd, "/steer") ||
            agent_slash_command_with_args(cmd, "/switch") ||
            agent_slash_command_with_args(cmd, "/del") ||
            agent_slash_command_with_args(cmd, "/strip") ||
@@ -7242,6 +7255,21 @@ static void test_agent_tp_cache_payload_rebuild_policy(void) {
     AGENT_TEST_ASSERT(agent_kv_payload_requires_rebuild(&w, 1));
 }
 
+static void test_agent_steering_command(void) {
+    float scale = 0.0f;
+    AGENT_TEST_ASSERT(parse_steering_level("-100", &scale) && scale == -100.0f);
+    AGENT_TEST_ASSERT(parse_steering_level("0", &scale) && scale == 0.0f);
+    AGENT_TEST_ASSERT(parse_steering_level("1.25", &scale) && scale == 1.25f);
+    AGENT_TEST_ASSERT(parse_steering_level("100", &scale) && scale == 100.0f);
+    AGENT_TEST_ASSERT(!parse_steering_level("", &scale));
+    AGENT_TEST_ASSERT(!parse_steering_level("101", &scale));
+    AGENT_TEST_ASSERT(!parse_steering_level("nan", &scale));
+    AGENT_TEST_ASSERT(!parse_steering_level("1x", &scale));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/steer"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/steer 1"));
+    AGENT_TEST_ASSERT(!agent_slash_command_known("/steering"));
+}
+
 static void test_agent_terminal_wrap_output_is_deferred(void);
 
 static void ds4_agent_unit_tests_run(void) {
@@ -7249,6 +7277,7 @@ static void ds4_agent_unit_tests_run(void) {
     test_agent_edit_upto_requires_tail_after_newline_strip();
     test_agent_cache_rejects_impossible_lengths();
     test_agent_tp_cache_payload_rebuild_policy();
+    test_agent_steering_command();
     test_agent_read_default_lines_follow_context();
     test_agent_glm_template_policy();
     test_agent_edit_upto_prompt_is_opt_in();
@@ -11010,6 +11039,7 @@ static void runtime_help(void) {
     puts("  /strip SHA   Strip KV payload; /switch rebuilds it by prefill.");
     puts("  /history [N] Show N recent user turns from the current session.");
     puts("  /power N     Set GPU duty cycle percentage, 1..100.");
+    puts("  /steer [F]   Show or set FFN steering for subsequent tokens.");
     puts("  /new         Start a fresh session from the system prompt.");
     puts("  /quit, /exit Exit.");
     puts("  Ctrl+C       Interrupt generation; clear edited text.");
@@ -11684,6 +11714,28 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                             printf("usage: /power <1..100>\n");
                         } else {
                             worker_request_power(&worker, power);
+                        }
+                    }
+                } else if (!strncmp(cmd, "/steer", 6) &&
+                           (cmd[6] == '\0' || cmd[6] == ' ' || cmd[6] == '\t')) {
+                    if (busy) {
+                        printf("command requires the model to be idle: %s\n", cmd);
+                    } else {
+                        char *arg = cmd + 6;
+                        while (*arg == ' ' || *arg == '\t') arg++;
+                        if (!arg[0]) {
+                            printf("Steering FFN: %g.\n",
+                                   (double)ds4_session_directional_steering_ffn(
+                                           worker.session));
+                        } else {
+                            float scale = 0.0f;
+                            if (!parse_steering_level(arg, &scale)) {
+                                printf("usage: /steer <-100..100>\n");
+                            } else if (ds4_session_set_directional_steering_ffn(
+                                               worker.session, scale) == 0) {
+                                worker.cfg->engine.directional_steering_ffn = scale;
+                                printf("Steering FFN: %g.\n", (double)scale);
+                            }
                         }
                     }
                 } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {

@@ -63150,6 +63150,67 @@ int ds4_session_set_power(ds4_session *s, int power_percent) {
     return 0;
 }
 
+float ds4_session_directional_steering_ffn(ds4_session *s) {
+    if (!s || !s->engine) return 0.0f;
+#ifndef DS4_NO_GPU
+    if (!ds4_session_is_cpu(s)) {
+        return ds4_session_is_glm(s) ?
+            s->glm_graph.directional_steering_ffn_scale :
+            s->graph.directional_steering_ffn_scale;
+    }
+#endif
+    return s->engine->directional_steering_ffn_scale;
+}
+
+int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale) {
+    if (!s || !s->engine || !isfinite(scale) ||
+        scale < -100.0f || scale > 100.0f) {
+        return 1;
+    }
+    if (s->distributed || s->engine->tp.active) {
+        fprintf(stderr,
+                "ds4: live steering changes are not supported for distributed or network tensor-parallel sessions\n");
+        return 1;
+    }
+
+    bool loaded = s->engine->directional_steering_dirs != NULL;
+#ifndef DS4_NO_GPU
+    if (!ds4_session_is_cpu(s)) {
+        if (ds4_session_is_glm(s)) {
+            const int tier = glm_graph_directional_steering_tier(
+                    &s->glm_graph, s->glm_graph.layer_start);
+            loaded = tier >= 0 &&
+                     s->glm_graph.directional_steering_dirs_by_tier[tier] != NULL;
+        } else {
+            loaded = metal_graph_directional_steering_dirs(&s->graph) != NULL;
+        }
+    }
+#endif
+    if (scale != 0.0f && !loaded) {
+        fprintf(stderr,
+                "ds4: live FFN steering needs a directional steering vector loaded at startup\n");
+        return 1;
+    }
+
+    s->engine->directional_steering_ffn_scale = scale;
+#ifndef DS4_NO_GPU
+    if (!ds4_session_is_cpu(s)) {
+        if (ds4_session_is_glm(s)) {
+            s->glm_graph.directional_steering_ffn_scale = scale;
+            s->glm_mtp_have = 0;
+            s->glm_mtp_rollback_valid = false;
+        } else {
+            s->graph.directional_steering_ffn_scale = scale;
+            ds4_session_dspark_capture_invalidate(s);
+        }
+    }
+#endif
+    s->mtp_draft_valid = false;
+    s->greedy_splitkv_segment.len = 0;
+    s->greedy_splitkv_anchor_valid = false;
+    return 0;
+}
+
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud) {
     if (!s) return;
     s->progress = fn;

@@ -1700,6 +1700,19 @@ and so forth, much faster than fine-tuning.
 This is also useful for cybersecurity researchers who want to reduce a model's
 willingness to provide dual-use or offensive security guidance.
 
+Load a direction when starting either interactive client:
+
+```sh
+./ds4 -m model.gguf --dir-steering-file direction.f32
+./ds4-agent -m model.gguf --dir-steering-file direction.f32
+```
+
+The default FFN scale is `1`. At an interactive prompt, `/steer` shows the
+current scale, `/steer 0` disables it, and `/steer F` sets a value from `-100`
+to `100` for subsequent tokens. The existing KV cache is kept. Live changes
+are currently limited to local sessions, not distributed inference or network
+tensor parallelism.
+
 ## Test Vectors
 
 `tests/test-vectors` contains short and long-context continuation vectors
