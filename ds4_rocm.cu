@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "ds4_gpu.h"
+#include "ds4_image.h"
 
 static thread_local bool g_dspark_verify_mode;
 
