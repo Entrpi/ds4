@@ -148,7 +148,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     title(fp, c, "Model And Runtime");
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
     if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
-        opt(fp, c, "--vision FILE", "GLM 5.3 vision encoder GGUF.");
+        opt(fp, c, "--vision FILE", "Vision encoder GGUF for the selected model.");
     }
 #ifdef DS4_ROCM_BUILD
     opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");

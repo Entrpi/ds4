@@ -14,6 +14,11 @@ PRO_Q2_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-
 PRO_Q4_LAYERS00_30_FILE="DeepSeek-V4-Pro-Q4K-Layers00-30.gguf"
 PRO_Q4_LAYERS31_OUTPUT_FILE="DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf"
 DS4F_DSPARK_FILE="DeepSeek-V4-Flash-DSpark-support-0731.gguf"
+DS4F_VISION_Q2_FILE="DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf"
+DS4F_VISION_Q2_Q4_FILE="DeepSeek-V4-Flash-Vision-Exp-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8.gguf"
+DS4F_VISION_MXFP4_FILE="DeepSeek-V4-Flash-Vision-Exp-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out.gguf"
+DS4F_VISION_ENCODER_FILE="DeepSeek-V4-Flash-Vision-Encoder.gguf"
+DS4F_VISION_DSPARK_FILE="DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf"
 GLM_UNSLOTH_Q4_REMOTE_BASE="UD-Q4_K_XL/GLM-5.2-UD-Q4_K_XL"
 GLM_UNSLOTH_Q4_LOCAL_BASE="GLM-5.2-UD-Q4_K_XL"
 GLM_UNSLOTH_Q4_FIRST_FILE="$GLM_UNSLOTH_Q4_LOCAL_BASE-00001-of-00011.gguf"
@@ -44,6 +49,11 @@ Usage:
   ./download_model.sh ds4f-q4 [--token TOKEN]
   ./download_model.sh ds4f-mxfp4 [--token TOKEN]
   ./download_model.sh ds4f-dspark [--token TOKEN]
+  ./download_model.sh ds4f-vision-q2 [--token TOKEN]
+  ./download_model.sh ds4f-vision-q2-q4 [--token TOKEN]
+  ./download_model.sh ds4f-vision-mxfp4 [--token TOKEN]
+  ./download_model.sh ds4f-vision-encoder [--token TOKEN]
+  ./download_model.sh ds4f-vision-dspark [--token TOKEN]
   ./download_model.sh pro-q2-imatrix [--token TOKEN]
   ./download_model.sh pro-q4-layers00-30 [--token TOKEN]
   ./download_model.sh pro-q4-layers31-output [--token TOKEN]
@@ -82,6 +92,26 @@ Targets:
   ds4f-dspark
        Optional DSpark speculative decoding support GGUF for Flash 0731, about
        6 GB. Enable it with --dspark and --mtp-model when running ds4 or ds4-server.
+
+  ds4f-vision-q2
+       DeepSeek V4 Flash Vision Experimental with 2-bit routed experts, about
+       81 GiB, plus its vision encoder. Recommended for 96 and 128 GB Macs.
+
+  ds4f-vision-q2-q4
+       Mixed Vision Experimental quant with routed experts in layers 37-42 at
+       Q4_K and the others at 2 bits, about 91 GiB, plus its vision encoder.
+
+  ds4f-vision-mxfp4
+       Native MXFP4 Vision Experimental model, about 145 GiB, plus its vision
+       encoder. Intended for CUDA or two 128 GB Macs using tensor parallelism.
+
+  ds4f-vision-encoder
+       Standalone Vision Experimental encoder, about 0.9 GiB. Use this when
+       the matching language GGUF is already present.
+
+  ds4f-vision-dspark
+       Matching DSpark speculative decoding support for Vision Experimental,
+       about 5.6 GiB. It is not compatible with the 0731 language checkpoint.
 
   pro-q2-imatrix
        DeepSeek V4 PRO 0813 q2 imatrix quant, as a single GGUF file. About
@@ -152,8 +182,8 @@ Then the default commands work:
   ./ds4 -p "Hello"
   ./ds4-server --ctx 100000
 
-After downloading DSpark support, enable it explicitly in greedy mode:
-  ./ds4 --dspark --mtp-model <download directory>/$DS4F_DSPARK_FILE --temp 0
+After downloading DSpark support, enable it explicitly:
+  ./ds4 --dspark --mtp-model <download directory>/$DS4F_DSPARK_FILE
 
 PRO and GLM files are downloaded with the official Hugging Face downloader
 because they are too large, sharded, or nested for the curl path used by the
@@ -179,6 +209,31 @@ case "$MODEL" in
     ds4f-q4) MODEL_FILE=$DS4F_Q4_FILE ;;
     ds4f-mxfp4) MODEL_FILE=$DS4F_MXFP4_FILE; FORCE_HF_DOWNLOAD=1 ;;
     ds4f-dspark) MODEL_FILE=$DS4F_DSPARK_FILE; LINK_MODEL=0 ;;
+    ds4f-vision-q2)
+        MODEL_FILE=$DS4F_VISION_Q2_FILE
+        MODEL_FILES="$MODEL_FILE $DS4F_VISION_ENCODER_FILE"
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    ds4f-vision-q2-q4)
+        MODEL_FILE=$DS4F_VISION_Q2_Q4_FILE
+        MODEL_FILES="$MODEL_FILE $DS4F_VISION_ENCODER_FILE"
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    ds4f-vision-mxfp4)
+        MODEL_FILE=$DS4F_VISION_MXFP4_FILE
+        MODEL_FILES="$MODEL_FILE $DS4F_VISION_ENCODER_FILE"
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    ds4f-vision-encoder)
+        MODEL_FILE=$DS4F_VISION_ENCODER_FILE
+        FORCE_HF_DOWNLOAD=1
+        LINK_MODEL=0
+        ;;
+    ds4f-vision-dspark)
+        MODEL_FILE=$DS4F_VISION_DSPARK_FILE
+        FORCE_HF_DOWNLOAD=1
+        LINK_MODEL=0
+        ;;
     pro-q2-imatrix) MODEL_FILE=$PRO_Q2_IMATRIX_FILE ;;
     pro-q4-layers00-30) MODEL_FILE=$PRO_Q4_LAYERS00_30_FILE; LINK_MODEL=0 ;;
     pro-q4-layers31-output) MODEL_FILE=$PRO_Q4_LAYERS31_OUTPUT_FILE; LINK_MODEL=0 ;;
@@ -408,8 +463,12 @@ fi
 
 if [ "$MODEL" = "ds4f-dspark" ]; then
     echo
-    echo "DSpark support downloaded. Enable it explicitly in greedy mode:"
-    echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp-model $OUT_DIR/$DS4F_DSPARK_FILE --temp 0"
+    echo "DSpark support downloaded. Enable it explicitly:"
+    echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp-model $OUT_DIR/$DS4F_DSPARK_FILE"
+elif [ "$MODEL" = "ds4f-vision-dspark" ]; then
+    echo
+    echo "Vision Experimental DSpark support downloaded. Use it only with the matching checkpoint:"
+    echo "  ./ds4 --dspark -m ./ds4flash.gguf --mtp-model $OUT_DIR/$DS4F_VISION_DSPARK_FILE"
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
     echo
     echo "Downloaded PRO Q4 distributed split file(s). Use them with --layers,"

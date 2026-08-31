@@ -235,6 +235,10 @@ def main() -> int:
     ap.add_argument("--allow-provider-fallbacks", action="store_true")
     ap.add_argument("--require-parameters", action="store_true",
                     help="for OpenRouter, route only to endpoints advertising the requested parameters")
+    ap.add_argument("--require-response-model",
+                    help="reject a response that reports a different model ID")
+    ap.add_argument("--require-response-provider",
+                    help="reject a response from a different provider")
     ap.add_argument("--resume", action="store_true",
                     help="reuse complete cases already present in the output directory")
     args = ap.parse_args()
@@ -319,6 +323,19 @@ def main() -> int:
             else:
                 raise RuntimeError(f"{case_id}: provider returned three empty continuations")
         choice = response["choices"][0]
+        if (args.require_response_model and
+                response.get("model") != args.require_response_model):
+            raise RuntimeError(
+                f"{case_id}: expected model {args.require_response_model!r}, "
+                f"got {response.get('model')!r}"
+            )
+        if (args.require_response_provider and
+                response.get("provider") != args.require_response_provider):
+            raise RuntimeError(
+                f"{case_id}: expected provider "
+                f"{args.require_response_provider!r}, got "
+                f"{response.get('provider')!r}"
+            )
         if response.get("model"):
             observed_models.add(response["model"])
         if response.get("provider"):
@@ -354,6 +371,8 @@ def main() -> int:
         "provider_order": provider_order,
         "allow_provider_fallbacks": args.allow_provider_fallbacks,
         "require_parameters": provider_require_parameters,
+        "required_response_model": args.require_response_model,
+        "required_response_provider": args.require_response_provider,
         "case_count": len(rows),
     }
     (out / "collection.json").write_text(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the fixed GLM 5.3 vision facts against an OpenAI-compatible endpoint."""
+"""Run fixed vision facts against an OpenAI-compatible endpoint."""
 
 import base64
 import json
@@ -16,6 +16,9 @@ ENDPOINT = os.environ.get(
 MODEL = os.environ.get("DS4_VISION_MODEL", "z-ai/glm-5.3-flash")
 API_KEY = os.environ.get("OPENROUTER_API_KEY")
 OFFICIAL_ZAI = os.environ.get("DS4_VISION_OFFICIAL_ZAI") == "1"
+SUITE = os.environ.get("DS4_VISION_SUITE", "glm53")
+REQUIRED_PROVIDER = os.environ.get("DS4_VISION_REQUIRE_PROVIDER")
+REASONING_EFFORT = os.environ.get("DS4_VISION_REASONING_EFFORT", "none")
 
 
 def contains(answer, requirement):
@@ -32,6 +35,7 @@ def run_case(case):
         "model": MODEL,
         "temperature": 0,
         "max_tokens": 320,
+        "reasoning_effort": REASONING_EFFORT,
         "messages": [{
             "role": "user",
             "content": [
@@ -54,10 +58,13 @@ def run_case(case):
     with urllib.request.urlopen(request, timeout=240) as response:
         result = json.load(response)
     answer = result["choices"][0]["message"]["content"]
+    provider = result.get("provider")
     normalized = answer.lower()
     missing = [item for item in case["required"] if not contains(normalized, item)]
     forbidden = [item for item in case.get("forbidden", []) if item in normalized]
-    return answer, missing, forbidden, result.get("provider")
+    if REQUIRED_PROVIDER and provider != REQUIRED_PROVIDER:
+        missing.append(f"provider:{REQUIRED_PROVIDER}")
+    return answer, missing, forbidden, provider
 
 
 def main():
@@ -75,7 +82,7 @@ def main():
             "provider": provider,
             "answer": answer,
         }, ensure_ascii=False))
-    print(f"glm53 vision quality: {len(cases) - failures}/{len(cases)} passed",
+    print(f"{SUITE} vision quality: {len(cases) - failures}/{len(cases)} passed",
           file=sys.stderr)
     return 1 if failures else 0
 

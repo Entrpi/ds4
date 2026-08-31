@@ -8314,8 +8314,8 @@ static void agent_tool_view_image(agent_worker *w,
     agent_tool_observation_add_image(obs, &embedding);
     char meta[192];
     snprintf(meta, sizeof(meta),
-             "\nImage observation: %s (%ux%u, %u visual tokens).\n",
-             path, obs->images[obs->image_count - 1].width,
+             "\nImage observation attached (%ux%u, %u visual tokens).\n",
+             obs->images[obs->image_count - 1].width,
              obs->images[obs->image_count - 1].height,
              obs->images[obs->image_count - 1].token_count);
     agent_tool_observation_puts(obs, meta);
@@ -8408,6 +8408,13 @@ static agent_tool_observation agent_execute_tool_observation(
     return obs;
 }
 
+static void agent_vision_spans_free(ds4_vision_span *spans, size_t count) {
+    if (!spans) return;
+    for (size_t i = 0; i < count; i++)
+        ds4_vision_embedding_free(&spans[i].embedding);
+    free(spans);
+}
+
 static bool agent_tool_observation_build(agent_worker *w,
                                          const agent_tool_observation *obs,
                                          ds4_tokens *tokens,
@@ -8421,8 +8428,39 @@ static bool agent_tool_observation_build(agent_worker *w,
     if (obs->image_count) {
         images = xmalloc(obs->image_count * sizeof(images[0]));
         spans = xmalloc(obs->image_count * sizeof(spans[0]));
-        memcpy(images, obs->images, obs->image_count * sizeof(images[0]));
+        memset(images, 0, obs->image_count * sizeof(images[0]));
         memset(spans, 0, obs->image_count * sizeof(spans[0]));
+        const int n_embd = ds4_engine_embd_dim(w->engine);
+        for (size_t i = 0; i < obs->image_count; i++) {
+            const ds4_vision_embedding *src = &obs->images[i];
+            if (!src->data || src->token_count == 0 || n_embd <= 0 ||
+                (uint64_t)src->token_count >
+                    SIZE_MAX / (uint64_t)n_embd / sizeof(float)) {
+                snprintf(err, err_len, "invalid image observation embedding");
+                for (size_t j = 0; j < i; j++)
+                    ds4_vision_embedding_free(&images[j]);
+                free(images);
+                free(spans);
+                free(parts);
+                ds4_tokens_free(tokens);
+                return false;
+            }
+            const size_t bytes = (size_t)src->token_count *
+                                 (size_t)n_embd * sizeof(float);
+            images[i] = *src;
+            images[i].data = malloc(bytes);
+            if (!images[i].data) {
+                snprintf(err, err_len, "unable to copy image observation embedding");
+                for (size_t j = 0; j <= i; j++)
+                    ds4_vision_embedding_free(&images[j]);
+                free(images);
+                free(spans);
+                free(parts);
+                ds4_tokens_free(tokens);
+                return false;
+            }
+            memcpy(images[i].data, src->data, bytes);
+        }
     }
     ds4_tokens_copy(tokens, &w->transcript);
     /* GLM grounds image tokens in user turns; keep text-only observations in
@@ -8432,6 +8470,12 @@ static bool agent_tool_observation_build(agent_worker *w,
         parts, images, obs->image_count, spans,
         err, err_len) != 0;
     free(parts);
+    if (!ok) {
+        for (size_t i = 0; i < obs->image_count; i++) {
+            ds4_vision_embedding_free(&images[i]);
+            ds4_vision_embedding_free(&spans[i].embedding);
+        }
+    }
     free(images);
     if (!ok) {
         free(spans);
@@ -8454,7 +8498,7 @@ static bool agent_tool_observation_fits(agent_worker *w,
         return false;
     int tokens = tmp.len;
     ds4_tokens_free(&tmp);
-    free(spans);
+    agent_vision_spans_free(spans, obs->image_count);
     if (tokens_out) *tokens_out = tokens;
     int ctx = agent_worker_effective_ctx_size(w);
     return ctx > 0 && tokens + reserve_tokens < ctx;
@@ -8470,8 +8514,6 @@ static bool agent_tool_observation_commit(agent_worker *w,
     ds4_tokens_free(&w->transcript);
     w->transcript = next;
     agent_worker_images_append(w, spans, obs->image_count);
-    for (size_t i = 0; i < obs->image_count; i++)
-        memset(&obs->images[i], 0, sizeof(obs->images[i]));
     free(spans);
     return true;
 }

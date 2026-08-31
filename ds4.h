@@ -177,6 +177,9 @@ typedef struct {
 typedef struct {
     float *data;
     uint32_t token_count;
+    uint32_t layout;
+    uint32_t grid_width;
+    uint32_t grid_height;
     uint32_t width;
     uint32_t height;
     uint32_t content_width;

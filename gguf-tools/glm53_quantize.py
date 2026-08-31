@@ -289,7 +289,12 @@ class TensorPlan:
 
 
 class SourceDB:
-    def __init__(self, hf_dir, index_validator=validate_glm53_index):
+    def __init__(
+        self,
+        hf_dir,
+        index_validator=validate_glm53_index,
+        scale_validator=validate_fp8_scales,
+    ):
         self.hf_dir = hf_dir
         index_path = os.path.join(hf_dir, "model.safetensors.index.json")
         document, self.weight_map = load_index(index_path)
@@ -313,7 +318,7 @@ class SourceDB:
         if set(self.tensors) != set(self.weight_map):
             missing = sorted(set(self.weight_map) - set(self.tensors))
             fail(f"source headers are incomplete; first missing tensor is {missing[0]}")
-        validate_fp8_scales(self.tensors)
+        scale_validator(self.tensors)
 
     def info(self, name):
         try:

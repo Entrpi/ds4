@@ -104,6 +104,14 @@ struct ds4_metal_args_dsv4_router_select_one {
     uint32_t hash_rows;
 };
 
+struct ds4_metal_args_dsv4_router_select_visual {
+    uint32_t hash_rows;
+    uint32_t vocab_size;
+    uint32_t n_tokens;
+    uint32_t has_bias;
+    uint32_t hash_mode;
+};
+
 struct ds4_metal_args_glm_router_select_one {
     uint32_t n_expert;
     uint32_t n_expert_used;
@@ -4923,6 +4931,60 @@ kernel void kernel_dsv4_router_finalize_one(
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+/* Vision-Exp uses score-based visual routing even in the first three layers,
+ * where ordinary text rows use a token-id hash table. One threadgroup owns a
+ * row so the image/text decision is uniform across all barriers. */
+kernel void kernel_dsv4_router_select_visual_batch(
+        constant ds4_metal_args_dsv4_router_select_visual & args,
+        device const float *probs,
+        device const float *bias,
+        device const float *visual_bias,
+        device const int32_t *hash,
+        device const int32_t *tokens,
+        device int32_t *selected,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint row [[threadgroup_position_in_grid]]) {
+    if (tid >= 256u || row >= args.n_tokens) return;
+
+    const int32_t token = tokens[row];
+    const bool image = token >= 0 && (uint32_t)token >= args.vocab_size;
+    device int32_t *out = selected + (uint64_t)row * 6u;
+    if (args.hash_mode && !image) {
+        const uint hash_row = token >= 0 && (uint32_t)token < args.hash_rows
+            ? (uint32_t)token : 0u;
+        if (tid < 6u) out[tid] = hash[(uint64_t)hash_row * 6u + tid];
+        return;
+    }
+
+    threadgroup float *scores = scratch;
+    threadgroup int32_t *indices = (threadgroup int32_t *)(scratch + 256u);
+    const float p = probs[(uint64_t)row * 256u + tid];
+    scores[tid] = p + (image ? visual_bias[tid]
+                             : (args.has_bias ? bias[tid] : 0.0f));
+    indices[tid] = (int32_t)tid;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint k = 2u; k <= 256u; k <<= 1u) {
+        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+            const uint other = tid ^ j;
+            if (other > tid) {
+                const bool descending = (tid & k) == 0u;
+                const int32_t a = indices[tid];
+                const int32_t b = indices[other];
+                const float sa = scores[(uint)a];
+                const float sb = scores[(uint)b];
+                if ((descending && sa < sb) || (!descending && sa > sb)) {
+                    indices[tid] = b;
+                    indices[other] = a;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    if (tid < 6u) out[tid] = indices[tid];
 }
 
 // M3 decode specialization for the non-hash one-token router. Scores and ids

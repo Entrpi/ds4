@@ -2207,6 +2207,34 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+/* DeepSeek Vision-Exp attention over the current prefill chunk. The raw cache
+ * is chronological from raw_start and may include the preceding SWA rows.
+ * Synthetic image spans in tokens are made bidirectional as specified by the
+ * checkpoint; text and compressed keys retain the normal causal masks. */
+int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
+        const ds4_gpu_tensor *comp_mask,
+        uint32_t                use_comp_mask,
+        const int32_t          *tokens,
+        uint32_t                vocab_size,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_raw,
+        uint32_t                raw_cap,
+        uint32_t                raw_start,
+        uint32_t                n_comp,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
 int ds4_gpu_attention_output_q8_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
@@ -2372,6 +2400,32 @@ int ds4_gpu_router_select_batch_tensor(
         bool                    hash_mode,
         const ds4_gpu_tensor *logits,
         const ds4_gpu_tensor *tokens,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
+        uint32_t                n_tokens);
+
+/* DeepSeek Vision-Exp prefill may mix ordinary vocabulary IDs and synthetic
+ * image IDs in one batch. Text rows keep the normal/hash route; image rows use
+ * the checkpoint's visual selection bias. Routing weights always come from
+ * the original, unbiased scores. */
+int ds4_gpu_router_select_batch_visual_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        uint64_t                hash_offset,
+        uint32_t                hash_rows,
+        bool                    has_bias,
+        bool                    hash_mode,
+        const void             *vision_map,
+        uint64_t                vision_size,
+        uint64_t                visual_bias_offset,
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *tokens,
+        uint32_t                vocab_size,
         uint32_t                n_expert,
         uint32_t                n_expert_used,
         float                   expert_weight_scale,
@@ -2997,6 +3051,54 @@ int ds4_gpu_glm53_vision_encode(
         const void                     *model_map,
         uint64_t                        model_size,
         const ds4_glm53_vision_weights *weights);
+
+#ifndef DS4_DEEPSEEK4_VISION_TYPES_DEFINED
+#define DS4_DEEPSEEK4_VISION_TYPES_DEFINED
+#define DS4_DEEPSEEK4_VISION_LAYERS 32u
+#define DS4_DEEPSEEK4_LANGUAGE_LAYERS 43u
+#define DS4_DEEPSEEK4_MTP_LAYERS 3u
+
+typedef struct {
+    uint64_t norm1;
+    uint64_t qkv_weight;
+    uint64_t qkv_bias;
+    uint64_t attn_proj_weight;
+    uint64_t attn_proj_bias;
+    uint64_t norm2;
+    uint64_t mlp_w1;
+    uint64_t mlp_w2;
+} ds4_deepseek4_vision_layer_weights;
+
+typedef struct {
+    uint64_t patch_weight;
+    uint64_t patch_bias;
+    uint64_t post_norm;
+    uint64_t aligner_w1;
+    uint64_t aligner_w1_bias;
+    uint64_t aligner_w2;
+    uint64_t aligner_w2_bias;
+    uint64_t image_start;
+    uint64_t image_pad;
+    uint64_t image_newline;
+    uint64_t image_end;
+    uint64_t visual_router_bias[DS4_DEEPSEEK4_LANGUAGE_LAYERS];
+    uint64_t mtp_visual_router_bias[DS4_DEEPSEEK4_MTP_LAYERS];
+    uint64_t hash_router_bias[3];
+    ds4_deepseek4_vision_layer_weights layer[DS4_DEEPSEEK4_VISION_LAYERS];
+} ds4_deepseek4_vision_weights;
+#endif
+
+/* Encode row-major normalized 14x14 RGB patches. The output is the natural
+ * row-major 3x3-aligned grid; N-layout permutation and sentinels are applied
+ * by the prompt layer once the image's token position is known. */
+int ds4_gpu_deepseek4_vision_encode(
+        float                              *out,
+        const float                        *patches,
+        uint32_t                            grid_h,
+        uint32_t                            grid_w,
+        const void                         *model_map,
+        uint64_t                            model_size,
+        const ds4_deepseek4_vision_weights *weights);
 
 /* Replace token rows with projected image embeddings and repeat each row into
  * every GLM hyperconnection stream. Must be called in an active command batch. */
