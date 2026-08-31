@@ -172,46 +172,7 @@ extern "C" int ds4_gpu_dspark_gfx1151_fast_path(void) {
 
 #include "ds4_glm53_vision_gpu.cuh"
 #include "ds4_deepseek4_vision_gpu.cuh"
-
-extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
-        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size,
-        uint64_t sinks_offset, const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *raw_kv, const ds4_gpu_tensor *comp_kv,
-        uint32_t comp_kv_f16, const ds4_gpu_tensor *comp_mask,
-        uint32_t use_comp_mask, const int32_t *tokens, uint32_t vocab_size,
-        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
-        uint32_t raw_start, uint32_t n_comp, uint32_t window, uint32_t ratio,
-        uint32_t n_head, uint32_t head_dim) {
-    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset;
-    (void)q; (void)raw_kv; (void)comp_kv; (void)comp_kv_f16;
-    (void)comp_mask; (void)use_comp_mask; (void)tokens; (void)vocab_size;
-    (void)n_tokens; (void)pos0; (void)n_raw; (void)raw_cap;
-    (void)raw_start; (void)n_comp; (void)window; (void)ratio;
-    (void)n_head; (void)head_dim;
-    fprintf(stderr, DS4_GPU_LOG_PREFIX
-            "DeepSeek Vision-Exp language attention is not implemented\n");
-    return 0;
-}
-
-extern "C" int ds4_gpu_router_select_batch_visual_tensor(
-        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
-        ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size,
-        uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows,
-        bool has_bias, bool hash_mode, const void *vision_map,
-        uint64_t vision_size, uint64_t visual_bias_offset,
-        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens,
-        uint32_t vocab_size, uint32_t n_expert, uint32_t n_expert_used,
-        float expert_weight_scale, uint32_t n_tokens) {
-    (void)selected; (void)weights; (void)probs; (void)model_map;
-    (void)model_size; (void)bias_offset; (void)hash_offset; (void)hash_rows;
-    (void)has_bias; (void)hash_mode; (void)vision_map; (void)vision_size;
-    (void)visual_bias_offset; (void)logits; (void)tokens; (void)vocab_size;
-    (void)n_expert; (void)n_expert_used; (void)expert_weight_scale;
-    (void)n_tokens;
-    fprintf(stderr, DS4_GPU_LOG_PREFIX
-            "DeepSeek Vision-Exp language routing is not implemented\n");
-    return 0;
-}
+#include "rocm/ds4_rocm_deepseek4_vision.cuh"
 
 /* Tensor-parallel gates are Metal-only; stubs keep shared graph code
  * linkable (TP option validation rejects non-Metal backends). */
