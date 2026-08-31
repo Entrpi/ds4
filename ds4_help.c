@@ -284,6 +284,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
     opt(fp, c, "--imatrix-out FILE", "Write llama-compatible routed-MoE imatrix .dat.");
     opt(fp, c, "--imatrix-max-prompts N", "Stop imatrix collection after N prompts.");
     opt(fp, c, "--imatrix-max-tokens N", "Stop imatrix collection after N prompt tokens.");
+    opt(fp, c, "--imatrix-min-expert-samples N", "Continue until every routed expert has N samples.");
     opt(fp, c, "--head-test", "Run the output HC/logits head after the native slice.");
     opt(fp, c, "--first-token-test", "Run exact CPU whole-model pass for the first prompt token.");
     opt(fp, c, "--metal-graph-test", "Compare first GPU-resident graph stages with CPU.");

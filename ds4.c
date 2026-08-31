@@ -34430,24 +34430,29 @@ static float *imatrix_down_ptr(ds4_imatrix_collector *c, uint32_t il, uint32_t e
     return c->down_sum2 + ((size_t)il * DS4_N_EXPERT + expert) * DS4_N_FF_EXP;
 }
 
-static bool imatrix_collect_layer_batch(
+static bool imatrix_collect_tensor_batch(
         ds4_imatrix_collector *c,
-        ds4_gpu_graph         *g,
+        ds4_gpu_tensor        *ffn_norm,
+        ds4_gpu_tensor        *routed_mid,
+        ds4_gpu_tensor        *router_selected,
+        bool                   routed_mid_is_f16,
         uint32_t               il,
         uint32_t               n_tokens) {
     if (!c || n_tokens == 0) return true;
-    if (n_tokens > c->cap_tokens) return false;
+    if (!ffn_norm || !routed_mid || !router_selected ||
+        n_tokens > c->cap_tokens) return false;
 
     const uint64_t norm_bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
     const uint64_t mid_elems = (uint64_t)n_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP;
-    const uint64_t mid_bytes = mid_elems * (g->batch_routed_mid_is_f16 ? sizeof(uint16_t) : sizeof(float));
+    const uint64_t mid_bytes = mid_elems *
+        (routed_mid_is_f16 ? sizeof(uint16_t) : sizeof(float));
     const uint64_t sel_bytes = (uint64_t)n_tokens * DS4_N_EXPERT_USED * sizeof(int);
-    void *mid_dst = g->batch_routed_mid_is_f16
+    void *mid_dst = routed_mid_is_f16
         ? (void *)c->routed_mid_f16_buf
         : (void *)c->routed_mid_buf;
-    if (ds4_gpu_tensor_read(metal_graph_batch_ffn_norm(g), 0, c->ffn_norm_buf, norm_bytes) == 0 ||
-        ds4_gpu_tensor_read(metal_graph_batch_routed_mid(g), 0, mid_dst, mid_bytes) == 0 ||
-        ds4_gpu_tensor_read(metal_graph_batch_router_selected(g), 0, c->selected_buf, sel_bytes) == 0)
+    if (ds4_gpu_tensor_read(ffn_norm, 0, c->ffn_norm_buf, norm_bytes) == 0 ||
+        ds4_gpu_tensor_read(routed_mid, 0, mid_dst, mid_bytes) == 0 ||
+        ds4_gpu_tensor_read(router_selected, 0, c->selected_buf, sel_bytes) == 0)
     {
         return false;
     }
@@ -34466,7 +34471,7 @@ static bool imatrix_collect_layer_batch(
 
             float *down = imatrix_down_ptr(c, il, (uint32_t)expert);
             const size_t mid_off = ((size_t)t * DS4_N_EXPERT_USED + slot) * DS4_N_FF_EXP;
-            if (g->batch_routed_mid_is_f16) {
+            if (routed_mid_is_f16) {
                 const uint16_t *mid = c->routed_mid_f16_buf + mid_off;
                 for (uint32_t i = 0; i < DS4_N_FF_EXP; i++) {
                     const float v = f16_to_f32(mid[i]);
@@ -34483,6 +34488,21 @@ static bool imatrix_collect_layer_batch(
     c->observed_tokens += n_tokens;
     c->chunks++;
     return true;
+}
+
+static bool imatrix_collect_layer_batch(
+        ds4_imatrix_collector *c,
+        ds4_gpu_graph         *g,
+        uint32_t               il,
+        uint32_t               n_tokens) {
+    if (!g) return false;
+    return imatrix_collect_tensor_batch(c,
+                                        metal_graph_batch_ffn_norm(g),
+                                        metal_graph_batch_routed_mid(g),
+                                        metal_graph_batch_router_selected(g),
+                                        g->batch_routed_mid_is_f16,
+                                        il,
+                                        n_tokens);
 }
 
 static void imatrix_write_i32(FILE *fp, int32_t v) {
@@ -34509,7 +34529,7 @@ static void imatrix_write_entry(
         const uint32_t count = counts[e];
         const float *src = sum2 + (size_t)e * n_col;
         if (count == 0) {
-            for (uint32_t i = 0; i < n_col; i++) tmp[i] = 1.0f;
+            memset(tmp, 0, (size_t)n_col * sizeof(tmp[0]));
         } else {
             const float inv = 1.0f / (float)count;
             for (uint32_t i = 0; i < n_col; i++) tmp[i] = src[i] * inv;
@@ -34575,22 +34595,56 @@ static bool imatrix_collector_save(
     return true;
 }
 
+static uint32_t imatrix_collector_min_samples(
+        const ds4_imatrix_collector *c,
+        const ds4_weights           *weights,
+        uint32_t                     layer_limit) {
+    bool found = false;
+    uint32_t min_samples = UINT32_MAX;
+    if (layer_limit > DS4_N_LAYER) layer_limit = DS4_N_LAYER;
+    for (uint32_t il = 0; il < layer_limit; il++) {
+        if (!weights->layer[il].ffn_gate_exps) continue;
+        for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+            uint32_t samples = c->gate_up_count[il][expert];
+            if (c->down_count[il][expert] < samples) {
+                samples = c->down_count[il][expert];
+            }
+            if (samples < min_samples) min_samples = samples;
+            found = true;
+        }
+    }
+    return found ? min_samples : 0;
+}
+
 static void imatrix_collector_report_coverage(
         const ds4_imatrix_collector *c,
-        const ds4_weights           *weights) {
+        const ds4_weights           *weights,
+        uint32_t                     layer_limit) {
     uint32_t layers = 0;
     uint32_t covered = 0;
     uint32_t possible = 0;
     uint32_t min_layer = DS4_N_EXPERT;
     uint32_t max_layer = 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    uint32_t min_samples = UINT32_MAX;
+    uint32_t max_samples = 0;
+    uint32_t under_four = 0;
+    uint32_t under_eight = 0;
+    if (layer_limit > DS4_N_LAYER) layer_limit = DS4_N_LAYER;
+    for (uint32_t il = 0; il < layer_limit; il++) {
         if (!weights->layer[il].ffn_gate_exps) continue;
         uint32_t layer_covered = 0;
         for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
-            if (c->gate_up_count[il][expert] != 0 &&
-                c->down_count[il][expert] != 0) {
+            uint32_t samples = c->gate_up_count[il][expert];
+            if (c->down_count[il][expert] < samples) {
+                samples = c->down_count[il][expert];
+            }
+            if (samples != 0) {
                 layer_covered++;
             }
+            if (samples < min_samples) min_samples = samples;
+            if (samples > max_samples) max_samples = samples;
+            if (samples < 4) under_four++;
+            if (samples < 8) under_eight++;
         }
         layers++;
         covered += layer_covered;
@@ -34598,15 +34652,47 @@ static void imatrix_collector_report_coverage(
         if (layer_covered < min_layer) min_layer = layer_covered;
         if (layer_covered > max_layer) max_layer = layer_covered;
     }
-    if (layers == 0) min_layer = 0;
+    if (layers == 0) {
+        min_layer = 0;
+        min_samples = 0;
+    }
     fprintf(stderr,
             "ds4: imatrix expert coverage %u/%u (%.2f%%), "
-            "per sparse layer min=%u max=%u\n",
+            "per sparse layer min=%u max=%u, samples min=%u max=%u, "
+            "under4=%u under8=%u\n",
             covered,
             possible,
             possible ? 100.0 * (double)covered / (double)possible : 0.0,
             min_layer,
-            max_layer);
+            max_layer,
+            min_samples,
+            max_samples,
+            under_four,
+            under_eight);
+    if (under_eight != 0) {
+        uint32_t shown = 0;
+        fprintf(stderr, "ds4: imatrix expert slots under 8 samples:");
+        for (uint32_t samples = 0; samples < 8 && shown < 256; samples++) {
+            for (uint32_t il = 0; il < layer_limit && shown < 256; il++) {
+                if (!weights->layer[il].ffn_gate_exps) continue;
+                for (uint32_t expert = 0;
+                     expert < DS4_N_EXPERT && shown < 256;
+                     expert++) {
+                    uint32_t count = c->gate_up_count[il][expert];
+                    if (c->down_count[il][expert] < count) {
+                        count = c->down_count[il][expert];
+                    }
+                    if (count != samples) continue;
+                    fprintf(stderr, " %u:%u=%u", il, expert, count);
+                    shown++;
+                }
+            }
+        }
+        if (shown < under_eight) {
+            fprintf(stderr, " ... (%u more)", under_eight - shown);
+        }
+        fputc('\n', stderr);
+    }
 }
 
 static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
@@ -40177,48 +40263,14 @@ static bool imatrix_collect_glm_one(
         ds4_imatrix_collector    *c,
         struct ds4_glm_gpu_graph *g,
         uint32_t                  il) {
-    if (!c || !g || il >= DS4_N_LAYER || !g->ffn_norm ||
-        !g->ffn_mid || !g->router_selected) return false;
-
-    const uint64_t norm_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
-    const uint64_t mid_values = (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP;
-    const uint64_t mid_bytes = mid_values * sizeof(float);
-    const uint64_t selected_bytes =
-        (uint64_t)DS4_N_EXPERT_USED * sizeof(c->selected_buf[0]);
-    if (ds4_gpu_tensor_read(g->ffn_norm, 0, c->ffn_norm_buf,
-                            norm_bytes) == 0 ||
-        ds4_gpu_tensor_read(g->ffn_mid, 0, c->routed_mid_buf,
-                            mid_bytes) == 0 ||
-        ds4_gpu_tensor_read(g->router_selected, 0, c->selected_buf,
-                            selected_bytes) == 0) {
-        return false;
-    }
-
-    for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
-        const float v = c->ffn_norm_buf[i];
-        c->sq_tmp[i] = v * v;
-    }
-    for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
-        const int expert = c->selected_buf[slot];
-        if (expert < 0 || (uint32_t)expert >= DS4_N_EXPERT) continue;
-        float *gate_up = imatrix_gate_up_ptr(c, il, (uint32_t)expert);
-        for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
-            gate_up[i] += c->sq_tmp[i];
-        }
-        c->gate_up_count[il][expert]++;
-
-        float *down = imatrix_down_ptr(c, il, (uint32_t)expert);
-        const float *mid = c->routed_mid_buf +
-                           (uint64_t)slot * DS4_N_FF_EXP;
-        for (uint32_t i = 0; i < DS4_N_FF_EXP; i++) {
-            down[i] += mid[i] * mid[i];
-        }
-        c->down_count[il][expert]++;
-        c->observed_routes++;
-    }
-    c->observed_tokens++;
-    c->chunks++;
-    return true;
+    if (!g || il >= DS4_N_LAYER) return false;
+    return imatrix_collect_tensor_batch(c,
+                                        g->ffn_norm,
+                                        g->ffn_mid,
+                                        g->router_selected,
+                                        false,
+                                        il,
+                                        1);
 }
 
 static bool glm_graph_reset_kda_state(ds4_glm_gpu_graph *g) {
@@ -56079,7 +56131,7 @@ static char *imatrix_find_marker(char *dataset, char *cursor, const char *marker
     return NULL;
 }
 
-static int ds4_engine_collect_glm53_imatrix(
+static int ds4_engine_collect_glm_imatrix(
         ds4_engine *e,
         char       *dataset,
         size_t      dataset_len,
@@ -56087,31 +56139,33 @@ static int ds4_engine_collect_glm53_imatrix(
         const char *output_path,
         int         ctx_size,
         int         max_prompts,
-        int         max_tokens) {
+        int         max_tokens,
+        int         min_expert_samples) {
     ds4_glm_gpu_graph g;
     if (!glm_graph_alloc(&g, &e->model, &e->weights, ctx_size,
                          e->ssd_streaming, e->ssd_streaming_cold)) {
-        fprintf(stderr, "ds4: failed to allocate GLM 5.3 imatrix graph\n");
+        fprintf(stderr, "ds4: failed to allocate GLM imatrix graph\n");
         return 1;
     }
     g.quality = e->quality;
 
     ds4_imatrix_collector collector;
     if (!imatrix_collector_init(&collector, 1, dataset_path)) {
-        fprintf(stderr, "ds4: failed to allocate GLM 5.3 imatrix collector\n");
+        fprintf(stderr, "ds4: failed to allocate GLM imatrix collector\n");
         glm_graph_free(&g);
         return 1;
     }
     g.imatrix = &collector;
 
     fprintf(stderr,
-            "ds4: collecting GLM 5.3 routed imatrix from %s "
+            "ds4: collecting GLM routed imatrix from %s "
             "(layers=%u experts=%u ctx=%d)\n",
             dataset_path, DS4_N_LAYER, DS4_N_EXPERT, ctx_size);
 
     bool ok = true;
     int prompts_done = 0;
     int tokens_done = 0;
+    bool sample_target_reached = false;
     char *cursor = dataset;
     const char *marker_lit = "===== DS4_IMATRIX_PROMPT";
     while (ok && *cursor) {
@@ -56138,7 +56192,7 @@ static int ds4_engine_collect_glm53_imatrix(
             }
             if (prompt.len > 0) {
                 if (!glm_graph_reset_kda_state(&g)) {
-                    fprintf(stderr, "ds4: failed to reset GLM 5.3 imatrix KDA state\n");
+                    fprintf(stderr, "ds4: failed to reset GLM imatrix state\n");
                     ok = false;
                 }
                 for (int pos = 0; ok && pos < prompt.len; pos++) {
@@ -56153,22 +56207,32 @@ static int ds4_engine_collect_glm53_imatrix(
                                                  false);
                 }
                 if (!ok) {
-                    fprintf(stderr, "ds4: GLM 5.3 imatrix failed at prompt %d\n",
+                    fprintf(stderr, "ds4: GLM imatrix failed at prompt %d\n",
                             prompts_done + 1);
                 } else {
                     prompts_done++;
                     tokens_done += prompt.len;
                     fprintf(stderr,
-                            "ds4: GLM 5.3 imatrix prompts=%d tokens=%d routes=%llu\r",
+                            "ds4: GLM imatrix prompts=%d tokens=%d routes=%llu "
+                            "min_samples=%u\r",
                             prompts_done,
                             tokens_done,
-                            (unsigned long long)collector.observed_routes);
+                            (unsigned long long)collector.observed_routes,
+                            imatrix_collector_min_samples(&collector,
+                                                         &e->weights,
+                                                         g.normal_layers));
                     fflush(stderr);
+                    sample_target_reached = min_expert_samples > 0 &&
+                        imatrix_collector_min_samples(&collector,
+                                                     &e->weights,
+                                                     g.normal_layers) >=
+                            (uint32_t)min_expert_samples;
                 }
             }
             token_vec_free(&prompt);
         }
         *end = saved;
+        if (sample_target_reached) break;
         if (!next) break;
         cursor = next;
         if (max_prompts > 0 && prompts_done >= max_prompts) break;
@@ -56178,12 +56242,23 @@ static int ds4_engine_collect_glm53_imatrix(
 
     g.imatrix = NULL;
     if (ok) {
-        imatrix_collector_report_coverage(&collector, &e->weights);
+        imatrix_collector_report_coverage(&collector,
+                                          &e->weights,
+                                          g.normal_layers);
+        if (min_expert_samples > 0 && !sample_target_reached) {
+            fprintf(stderr,
+                    "ds4: GLM imatrix minimum expert sample target %d "
+                    "was not reached\n",
+                    min_expert_samples);
+            ok = false;
+        }
+    }
+    if (ok) {
         ok = imatrix_collector_save(&collector, &e->weights, output_path);
     }
     if (ok) {
         fprintf(stderr,
-                "ds4: wrote GLM 5.3 imatrix %s from %d prompts, %d tokens, "
+                "ds4: wrote GLM imatrix %s from %d prompts, %d tokens, "
                 "%llu routes\n",
                 output_path,
                 prompts_done,
@@ -56201,7 +56276,8 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                const char *output_path,
                                int ctx_size,
                                int max_prompts,
-                               int max_tokens) {
+                               int max_tokens,
+                               int min_expert_samples) {
 #ifdef DS4_NO_GPU
     (void)e;
     (void)dataset_path;
@@ -56209,6 +56285,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     (void)ctx_size;
     (void)max_prompts;
     (void)max_tokens;
+    (void)min_expert_samples;
     fprintf(stderr, "ds4: imatrix collection requires a graph backend build\n");
     return 1;
 #else
@@ -56223,15 +56300,16 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     size_t dataset_len = 0;
     if (!imatrix_read_text_file(dataset_path, &dataset, &dataset_len)) return 1;
 
-    if (ds4_model_is_glm53()) {
-        const int rc = ds4_engine_collect_glm53_imatrix(e,
-                                                        dataset,
-                                                        dataset_len,
-                                                        dataset_path,
-                                                        output_path,
-                                                        ctx_size,
-                                                        max_prompts,
-                                                        max_tokens);
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        const int rc = ds4_engine_collect_glm_imatrix(e,
+                                                      dataset,
+                                                      dataset_len,
+                                                      dataset_path,
+                                                      output_path,
+                                                      ctx_size,
+                                                      max_prompts,
+                                                      max_tokens,
+                                                      min_expert_samples);
         free(dataset);
         return rc;
     }
@@ -56272,6 +56350,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 
     int prompts_done = 0;
     int tokens_done = 0;
+    bool sample_target_reached = false;
     char *cursor = dataset;
     const char *marker_lit = "===== DS4_IMATRIX_PROMPT";
     while (*cursor) {
@@ -56325,18 +56404,28 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                 }
                 prompts_done++;
                 tokens_done += prompt.len;
+                sample_target_reached = min_expert_samples > 0 &&
+                    imatrix_collector_min_samples(&collector,
+                                                 weights,
+                                                 DS4_N_LAYER) >=
+                        (uint32_t)min_expert_samples;
                 if (prompts_done % 10 == 0) {
                     fprintf(stderr,
-                            "ds4: imatrix prompts=%d tokens=%d routes=%llu\r",
+                            "ds4: imatrix prompts=%d tokens=%d routes=%llu "
+                            "min_samples=%u\r",
                             prompts_done,
                             tokens_done,
-                            (unsigned long long)collector.observed_routes);
+                            (unsigned long long)collector.observed_routes,
+                            imatrix_collector_min_samples(&collector,
+                                                         weights,
+                                                         DS4_N_LAYER));
                     fflush(stderr);
                 }
             }
             token_vec_free(&prompt);
         }
         *end = saved;
+        if (sample_target_reached) break;
         if (!next) break;
         cursor = next;
         if (max_prompts > 0 && prompts_done >= max_prompts) break;
@@ -56345,7 +56434,16 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     fputc('\n', stderr);
 
     if (ok) {
-        imatrix_collector_report_coverage(&collector, weights);
+        imatrix_collector_report_coverage(&collector, weights, DS4_N_LAYER);
+        if (min_expert_samples > 0 && !sample_target_reached) {
+            fprintf(stderr,
+                    "ds4: imatrix minimum expert sample target %d "
+                    "was not reached\n",
+                    min_expert_samples);
+            ok = false;
+        }
+    }
+    if (ok) {
         ok = imatrix_collector_save(&collector, weights, output_path);
         if (ok) {
             fprintf(stderr,

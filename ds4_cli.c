@@ -81,6 +81,7 @@ typedef struct {
     const char *imatrix_output_path;
     int imatrix_max_prompts;
     int imatrix_max_tokens;
+    int imatrix_min_expert_samples;
     ds4_think_mode think_mode;
     bool head_test;
     bool first_token_test;
@@ -2088,6 +2089,9 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.imatrix_max_prompts = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--imatrix-max-tokens")) {
             c.gen.imatrix_max_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--imatrix-min-expert-samples")) {
+            c.gen.imatrix_min_expert_samples =
+                parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
         } else if (!strcmp(arg, "--think-max")) {
@@ -2145,6 +2149,10 @@ static cli_config parse_options(int argc, char **argv) {
     }
     if (c.gen.imatrix_dataset_path && !c.gen.imatrix_output_path) {
         fprintf(stderr, "ds4: --imatrix-dataset requires --imatrix-out\n");
+        exit(2);
+    }
+    if (c.gen.imatrix_min_expert_samples < 0) {
+        fprintf(stderr, "ds4: --imatrix-min-expert-samples must not be negative\n");
         exit(2);
     }
     if (c.gen.perplexity_file_path && c.gen.prompt) {
@@ -2313,7 +2321,8 @@ int main(int argc, char **argv) {
                                         cfg.gen.imatrix_output_path,
                                         cfg.gen.ctx_size,
                                         cfg.gen.imatrix_max_prompts,
-                                        cfg.gen.imatrix_max_tokens);
+                                        cfg.gen.imatrix_max_tokens,
+                                        cfg.gen.imatrix_min_expert_samples);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
     } else if (cfg.gen.prompt == NULL) {
