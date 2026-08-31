@@ -7028,6 +7028,45 @@ static DS4_MAYBE_UNUSED bool weights_model_map_decode_static_slice_spans(
     return model_map_span_vec_finish(spans);
 }
 
+/* Runtime static maps are built after the streaming cache and resident-layer
+ * policy is configured. Unlike the guard-only static spans above, they must
+ * include routed tensors for resident layers and cache-incompatible layouts. */
+static DS4_MAYBE_UNUSED bool weights_model_map_decode_runtime_spans(
+        const ds4_weights *w,
+        bool include_token,
+        bool include_output,
+        ds4_model_map_span_vec *spans) {
+    if (!w || !spans) return false;
+    memset(spans, 0, sizeof(*spans));
+    if (include_token) model_map_span_vec_include_one(spans, w->token_embd);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        model_map_span_vec_include_layer_decode(spans, w, il);
+    }
+    if (include_output) model_map_span_vec_include_output(spans, w);
+    return model_map_span_vec_finish(spans);
+}
+
+static DS4_MAYBE_UNUSED bool weights_model_map_decode_runtime_slice_spans(
+        const ds4_weights *w,
+        uint32_t layer_start,
+        uint32_t layer_end,
+        bool include_token,
+        bool include_output,
+        ds4_model_map_span_vec *spans) {
+    if (!w || !spans) return false;
+    if (layer_start >= DS4_N_LAYER) return false;
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) return false;
+
+    memset(spans, 0, sizeof(*spans));
+    if (include_token) model_map_span_vec_include_one(spans, w->token_embd);
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        model_map_span_vec_include_layer_decode(spans, w, il);
+    }
+    if (include_output) model_map_span_vec_include_output(spans, w);
+    return model_map_span_vec_finish(spans);
+}
+
 static DS4_MAYBE_UNUSED uint64_t model_map_span_vec_total_bytes(
         const ds4_model_map_span_vec *spans) {
     if (!spans) return 0;
@@ -20048,7 +20087,7 @@ static bool metal_graph_stream_map_decode_static_all(
         const ds4_model   *model,
         const ds4_weights *weights) {
     ds4_model_map_span_vec spans;
-    if (!weights_model_map_decode_static_spans(weights, true, true, &spans)) {
+    if (!weights_model_map_decode_runtime_spans(weights, true, true, &spans)) {
         fprintf(stderr, "ds4: Metal SSD streaming could not build static decode spans\n");
         return false;
     }
@@ -62380,7 +62419,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             ds4_model_map_span_vec spans;
             bool spans_ok = false;
             if (load_slice) {
-                spans_ok = weights_model_map_decode_static_slice_spans(
+                spans_ok = weights_model_map_decode_runtime_slice_spans(
                         &e->weights,
                         load_layer_start,
                         load_layer_end,
