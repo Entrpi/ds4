@@ -260,6 +260,36 @@ __global__ static void glm53_rocm_matvec_bf16_f32_kernel(
     }
 }
 
+__global__ static void glm53_rocm_matvec_bf16_row_f32_kernel(
+        float *out,
+        const uint16_t *weights,
+        const float *x,
+        uint32_t in_dim,
+        uint32_t out_dim) {
+    const uint32_t col = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    if (col >= out_dim) return;
+    const uint16_t *wrow = weights + (uint64_t)col * in_dim;
+    const float *xrow = x + (uint64_t)row * in_dim;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < in_dim; i += blockDim.x) {
+        const float w = __uint_as_float((uint32_t)wrow[i] << 16);
+        sum = fmaf(w, xrow[i], sum);
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u; stride != 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+        out[(uint64_t)row * out_dim + col] = partial[0];
+    }
+}
+
 extern "C" int ds4_gpu_glm53_embedding_bf16(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -332,6 +362,15 @@ extern "C" int ds4_gpu_glm53_matmul_bf16(
         "GLM-5.3 BF16 matrix");
     if (!weights) return 0;
     if (n_rows <= 8u) {
+        if (out_dim <= 128u && in_dim >= 4096u &&
+            getenv("DS4_ROCM_GLM_DISABLE_BF16_ROW_MATVEC") == NULL) {
+            const dim3 row_grid(out_dim, n_rows, 1u);
+            glm53_rocm_matvec_bf16_row_f32_kernel<<<row_grid, 256u>>>(
+                (float *)out->ptr, (const uint16_t *)weights,
+                (const float *)x->ptr, in_dim, out_dim);
+            return cuda_ok(cudaGetLastError(),
+                           "GLM-5.3 BF16/F32 row matvec launch");
+        }
         const dim3 grid((out_dim + 7u) / 8u, n_rows, 1u);
         glm53_rocm_matvec_bf16_f32_kernel<<<grid, 256u>>>(
             (float *)out->ptr, (const uint16_t *)weights,
@@ -2978,6 +3017,28 @@ extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
                                 (uint64_t)n_head * kv_lora_dim, qk_nope,
                                 "glm_qk_lowrank", &w, &row_bytes)) {
         return 0;
+    }
+    const char *wave_decode_env =
+        getenv("DS4_ROCM_GLM_QK_LOW_WAVE_DECODE");
+    if (wave_decode_env == NULL || cuda_env_present(wave_decode_env)) {
+        const uint32_t threads = 256u;
+        const uint32_t waves_per_block = threads / 32u;
+        const dim3 grid((kv_lora_dim + waves_per_block - 1u) /
+                            waves_per_block,
+                        n_head,
+                        1u);
+        glm_q8_project_head_wave_kernel<<<grid, threads>>>(
+                (float *)qk_low->ptr,
+                w,
+                (const float *)q->ptr,
+                n_head,
+                qk_nope,
+                kv_lora_dim,
+                (uint32_t)x_stride64,
+                qk_dim,
+                row_bytes);
+        return cuda_ok(cudaGetLastError(),
+                       "glm wave-parallel qk lowrank launch");
     }
     glm_q8_project_head_kernel<<<dim3(n_head, 1, 1), 256, (size_t)qk_nope * sizeof(float)>>>(
             (float *)qk_low->ptr,

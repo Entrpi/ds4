@@ -4783,18 +4783,17 @@ static ds4_rocm_runtime_config g_rocm_cfg;
 
 static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
     if (!g_rocm_cfg.initialized) {
-        const char *dsv4_prequant_env =
-            getenv("DS4_ROCM_DSV4_PREQUANT_DECODE");
+        const char *q8_prequant_env =
+            getenv("DS4_ROCM_Q8_PREQUANT_DECODE");
         /*
-         * DeepSeek V4 used the prequantized Q8 decode kernels before ROCm
-         * GLM support landed.  They are substantially faster on gfx1151.
-         * Keep GLM and --quality on the current full-F32 activation path.
-         * An explicit =0 remains available as a diagnostic rollback.
+         * Prequantized Q8 decode kernels are substantially faster on gfx1151.
+         * Quality mode retains the full-F32 activation path, and an explicit
+         * =0 remains available as a diagnostic rollback.
          */
         g_rocm_cfg.q8_prequant_decode =
             !g_quality_mode &&
-            (dsv4_prequant_env == NULL ||
-             cuda_env_present(dsv4_prequant_env));
+            (q8_prequant_env == NULL ||
+             cuda_env_present(q8_prequant_env));
         g_rocm_cfg.disable_splitk_attn_out_low = !g_quality_mode;
         g_rocm_cfg.disable_shared_gate_up_fused_w32 = !g_quality_mode;
         g_rocm_cfg.attention_output_cublas_all = !g_quality_mode;
@@ -4863,7 +4862,7 @@ static const ds4_rocm_runtime_config *cuda_runtime_config(void) {
 }
 
 static bool cuda_q8_prequant_decode_enabled(void) {
-    return !g_glm_model && cuda_runtime_config()->q8_prequant_decode;
+    return cuda_runtime_config()->q8_prequant_decode;
 }
 
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
@@ -5009,6 +5008,10 @@ static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_
     if (g_quality_mode) return 0;
     if (g_q8_f16_disabled_after_oom) return 0;
     if (g_q8_f16_disabled_for_multi_model) return 0;
+    /* Resident GLM nearly fills a 128 GB unified-memory host, and its decode
+     * uses native Q8 kernels. Avoid speculative F16 copies that are discarded
+     * as soon as the remaining headroom is exhausted. */
+    if (g_glm_model && !g_ssd_streaming_mode) return 0;
     if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
     if (!label) return 0;
     if (strstr(label, "attn_output_a") != NULL ||

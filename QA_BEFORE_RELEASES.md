@@ -813,11 +813,11 @@ a substitute for CUDA or Metal release testing.
   system OOM instead of failing cleanly.
 - Run a short CLI prompt:
   `./ds4 -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf --ctx 4096 --nothink -p "Reply with exactly: OK"`.
-- For DeepSeek Flash decode, confirm the default path uses prequantized Q8
-  activations. Repeat the same greedy run with
-  `DS4_ROCM_DSV4_PREQUANT_DECODE=0` only as a diagnostic control. The default
-  must be materially faster and must still pass the continuation-quality gate.
-  GLM and `--quality` must stay on the full-FP32 activation path.
+- For DeepSeek Flash and GLM 5.3 Flash decode, confirm the default path uses
+  prequantized Q8 activations. Repeat the same greedy run with
+  `DS4_ROCM_Q8_PREQUANT_DECODE=0` only as a diagnostic control. The default
+  must be materially faster and must still pass the matching continuation-
+  quality gate. `--quality` must stay on the full-FP32 activation path.
 - Test DSpark with the matched 0731 target and support files:
   `DS4_BIN=./ds4 DS4_DSPARK_MODEL=gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DS4_DSPARK_SUPPORT=gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf DS4_DSPARK_FIXTURE_TOKENS=64 sh tests/dspark_acceptance_fixture.sh`.
   Require proposals, accepted draft tokens, at least one direct state commit,
@@ -1030,6 +1030,7 @@ claims across different models or contexts.
 | DGX Spark GB10, CUDA | pre-0731 Flash q2, opportunistic temperature-1 128-token code prompt | - | 18.32 t/s ordinary; 18.43 t/s DSpark |
 | Strix Halo gfx1151, ROCm | Flash IQ2 resident, short section 9 smoke | - | 17.27 t/s; FP32 rollback 9.70 t/s |
 | Strix Halo gfx1151, ROCm | Flash IQ2 resident, 4,096-token context | - | 14.82 t/s; FP32 rollback 8.76 t/s |
+| Strix Halo gfx1151, ROCm | GLM 5.3 Flash Q2 resident, 64-token prompt and 128-token decode | 47.18 t/s median | 14.25 t/s median steady; 8.64 t/s FP32 rollback |
 | Strix Halo gfx1151, ROCm | Flash IQ2 DSpark, 64-token C fixture | - | 11.40 t/s direct; 9.77 t/s replay predecessor; 16.70 t/s ordinary |
 | Strix Halo gfx1151, ROCm | Flash 0731 IQ2, exact-sampled 128-token code prompt | - | 16.55 t/s ordinary; 12.68 t/s DSpark |
 | Strix Halo gfx1151, ROCm | Flash 0731 IQ2, temperature-1 128-token code prompt | - | 16.26 t/s ordinary; 12.28 t/s opportunistic; 13.52 t/s exact |

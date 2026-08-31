@@ -557,6 +557,9 @@ static void test_glm_memory_guard_budget(void) {
                   128ull * gib, 90ull * gib, true) == 110ull * gib,
           "GLM-5.3 keeps 18 GiB free on a 128 GiB resident-Q2 host");
     CHECK(ds4_test_glm_memory_guard_default_budget(
+                  112ull * gib, 90ull * gib, true) == 94ull * gib,
+          "GLM-5.3 recognizes a 128 GB ROCm host by available GiB");
+    CHECK(ds4_test_glm_memory_guard_default_budget(
                   256ull * gib, 178ull * gib, true) == 224ull * gib,
           "GLM-5.3 uses the host-sized budget on a 256 GiB host");
     CHECK(ds4_test_glm_memory_guard_default_budget(

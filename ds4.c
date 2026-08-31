@@ -40144,6 +40144,10 @@ static double glm_graph_bytes_to_gib(uint64_t bytes) {
     return (double)bytes / (1024.0 * 1024.0 * 1024.0);
 }
 
+#ifdef DS4_ROCM_BUILD
+static uint64_t g_glm_rocm_guard_available_baseline;
+#endif
+
 static bool glm_graph_memory_guard_disabled(void) {
     const char *env = getenv("DS4_GLM_MEMORY_GUARD");
     if (!env || !env[0]) return false;
@@ -40165,11 +40169,12 @@ static double glm_graph_memory_guard_default_reserve_gib(
         return 24.0;
     }
     if (glm53 &&
-        base_gib >= 120.0 &&
+        base_gib >= 108.0 &&
         base_gib <= 160.0 &&
         model_gib >= 70.0) {
-        /* Preserve the proven 110 GiB resident-Q2 budget on 128 GiB hosts
-         * without imposing that reference-machine limit on larger Macs. */
+        /* A nominal 128 GB host reports less than 120 GiB, and ROCm further
+         * limits this base to currently available memory. Preserve the proven
+         * resident-Q2 budget without imposing it on larger machines. */
         return 18.0;
     }
     return 32.0;
@@ -40678,8 +40683,17 @@ static bool glm_graph_memory_guard_budget(
         budget_base = ds4_gpu_recommended_working_set_size();
     }
 #ifdef DS4_ROCM_BUILD
-    const uint64_t host_available =
+    uint64_t host_available =
         glm_graph_host_available_memory_bytes();
+    if (!ssd_streaming && host_available != 0) {
+        /* The resident model is charged in model_bytes below. Keep the
+         * pre-upload availability baseline so later session guards do not
+         * charge the same ROCm allocation once through MemAvailable too. */
+        if (host_available > g_glm_rocm_guard_available_baseline) {
+            g_glm_rocm_guard_available_baseline = host_available;
+        }
+        host_available = g_glm_rocm_guard_available_baseline;
+    }
     if (host_available != 0 && host_available < budget_base) {
         budget_base = host_available;
     }
@@ -61851,6 +61865,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                      const ds4_engine_options *opt,
                                      const ds4_gpu_config *gpu_cfg) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
+#ifdef DS4_ROCM_BUILD
+    g_glm_rocm_guard_available_baseline =
+        glm_graph_host_available_memory_bytes();
+#endif
     e->model.fd = -1;
     e->mtp_model.fd = -1;
     e->vision_model.fd = -1;
@@ -62142,7 +62160,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         const bool rocm_full_model_requires_streaming =
             e->backend == DS4_BACKEND_CUDA &&
             !e->ssd_streaming &&
-            !load_slice;
+            !load_slice &&
+            !ds4_model_is_glm53();
         if (rocm_full_model_requires_streaming) {
             glm_backend_supported = false;
         }
@@ -62151,7 +62170,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #ifdef DS4_ROCM_BUILD
             if (rocm_full_model_requires_streaming) {
                 fprintf(stderr,
-                        "ds4: full-model GLM 5.2 ROCm inference requires "
+                        "ds4: full-model GLM DSA ROCm inference requires "
                         "--ssd-streaming; distributed layer slices can run "
                         "fully resident\n");
             } else {

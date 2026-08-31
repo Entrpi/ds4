@@ -815,6 +815,7 @@ static int routed_moe_launch(
             getenv("DS4_ROCM_ENABLE_MXFP4_ROW64") != NULL;
         const uint32_t use_rocm_mmq_gateup =
             ok && iq2_path && n_tokens >= 128u && !g_quality_mode &&
+            n_total_expert <= 256u &&
             !batch_stream_selected && !batch_stream_split_selected &&
             !split_selected && !compact_selected && gate_w && up_w &&
             (stream_full_layer || full_table_cached) &&
