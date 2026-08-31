@@ -3781,10 +3781,10 @@ static int glm_attention_indexed_lora_causal_gemm(
         float beta_fast,
         float beta_slow) {
     if (!g_cublas_ready || !lora_out || !q || !qk_low ||
-        !kv_lora_cache || !k_rope_cache ||
+        !kv_lora_cache || (qk_rope != 0u && !k_rope_cache) ||
         n_tokens < 256u || n_selected == 0u ||
         n_head == 0u || kv_lora_dim == 0u ||
-        qk_rope == 0u || (qk_rope & 1u) != 0u ||
+        (qk_rope & 1u) != 0u ||
         n_tokens > INT_MAX || n_selected > INT_MAX ||
         kv_lora_dim > INT_MAX || qk_rope > INT_MAX) {
         return 0;
@@ -3849,23 +3849,27 @@ static int glm_attention_indexed_lora_causal_gemm(
     if (!cuda_ok(cudaGetLastError(), "glm causal attention kv f16 launch")) {
         return 0;
     }
-    const uint64_t rope_pairs = (uint64_t)n_selected * (qk_rope >> 1u);
-    glm_causal_gemm_rope_to_f16_kernel<<<
-        (rope_pairs + 255u) / 256u, 256>>>(
-            rope_h,
-            (const char *)k_rope_cache->ptr,
-            n_selected,
-            qk_rope,
-            cache_f16,
-            n_ctx_orig,
-            freq_base,
-            freq_scale,
-            ext_factor,
-            attn_factor,
-            beta_fast,
-            beta_slow);
-    if (!cuda_ok(cudaGetLastError(), "glm causal attention rope f16 launch")) {
-        return 0;
+    if (qk_rope != 0u) {
+        const uint64_t rope_pairs =
+            (uint64_t)n_selected * (qk_rope >> 1u);
+        glm_causal_gemm_rope_to_f16_kernel<<<
+            (rope_pairs + 255u) / 256u, 256>>>(
+                rope_h,
+                (const char *)k_rope_cache->ptr,
+                n_selected,
+                qk_rope,
+                cache_f16,
+                n_ctx_orig,
+                freq_base,
+                freq_scale,
+                ext_factor,
+                attn_factor,
+                beta_fast,
+                beta_slow);
+        if (!cuda_ok(cudaGetLastError(),
+                     "glm causal attention rope f16 launch")) {
+            return 0;
+        }
     }
 
     const float one = 1.0f;
@@ -3912,27 +3916,29 @@ static int glm_attention_indexed_lora_causal_gemm(
         if (!cublas_ok(st, "glm causal attention lora score gemm")) {
             return 0;
         }
-        st = cublasGemmEx(g_cublas,
-                          CUBLAS_OP_T,
-                          CUBLAS_OP_N,
-                          (int)n_selected,
-                          (int)n_tokens,
-                          (int)qk_rope,
-                          &one,
-                          rope_h,
-                          CUDA_R_16F,
-                          (int)qk_rope,
-                          qrope_h,
-                          CUDA_R_16F,
-                          (int)qk_rope,
-                          &one,
-                          scores,
-                          CUDA_R_32F,
-                          (int)n_selected,
-                          CUBLAS_COMPUTE_32F,
-                          CUBLAS_GEMM_DEFAULT);
-        if (!cublas_ok(st, "glm causal attention rope score gemm")) {
-            return 0;
+        if (qk_rope != 0u) {
+            st = cublasGemmEx(g_cublas,
+                              CUBLAS_OP_T,
+                              CUBLAS_OP_N,
+                              (int)n_selected,
+                              (int)n_tokens,
+                              (int)qk_rope,
+                              &one,
+                              rope_h,
+                              CUDA_R_16F,
+                              (int)qk_rope,
+                              qrope_h,
+                              CUDA_R_16F,
+                              (int)qk_rope,
+                              &one,
+                              scores,
+                              CUDA_R_32F,
+                              (int)n_selected,
+                              CUBLAS_COMPUTE_32F,
+                              CUBLAS_GEMM_DEFAULT);
+            if (!cublas_ok(st, "glm causal attention rope score gemm")) {
+                return 0;
+            }
         }
         glm_causal_gemm_softmax_f16_kernel<<<n_tokens, 256>>>(
             probs, scores, n_tokens, n_selected, pos0, scale);

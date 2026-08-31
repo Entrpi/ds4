@@ -1031,6 +1031,7 @@ claims across different models or contexts.
 | Strix Halo gfx1151, ROCm | Flash IQ2 resident, short section 9 smoke | - | 17.27 t/s; FP32 rollback 9.70 t/s |
 | Strix Halo gfx1151, ROCm | Flash IQ2 resident, 4,096-token context | - | 14.82 t/s; FP32 rollback 8.76 t/s |
 | Strix Halo gfx1151, ROCm | GLM 5.3 Flash Q2 resident, 64-token prompt and 128-token decode | 47.18 t/s median | 14.25 t/s median steady; 8.64 t/s FP32 rollback |
+| Strix Halo gfx1151, ROCm | GLM 5.3 Flash Q2 resident, 4,096-token prefill | 80.08 t/s; scalar-attention rollback 23.35 t/s | - |
 | Strix Halo gfx1151, ROCm | Flash IQ2 DSpark, 64-token C fixture | - | 11.40 t/s direct; 9.77 t/s replay predecessor; 16.70 t/s ordinary |
 | Strix Halo gfx1151, ROCm | Flash 0731 IQ2, exact-sampled 128-token code prompt | - | 16.55 t/s ordinary; 12.68 t/s DSpark |
 | Strix Halo gfx1151, ROCm | Flash 0731 IQ2, temperature-1 128-token code prompt | - | 16.26 t/s ordinary; 12.28 t/s opportunistic; 13.52 t/s exact |
