@@ -441,8 +441,7 @@ Start with the automatic cache budget:
 ./ds4 -m ./ds4flash.gguf --ssd-streaming
 ```
 
-If startup reports that the expert cache is too large, or if you want to reserve
-more memory for context, set the routed expert cache explicitly:
+To reserve more memory for context, set the routed expert cache explicitly:
 
 ```sh
 ./ds4 -m ./ds4flash.gguf --ssd-streaming --ssd-streaming-cache-experts 32GB
@@ -451,12 +450,13 @@ more memory for context, set the routed expert cache explicitly:
 The `32GB` value is a routed-expert memory budget, not a generic byte cache.
 DwarfStar first reserves headroom for the two full routed layers used by
 overlapped streaming prefill, then converts the remaining bytes to the number of
-dynamic cached experts that fit for the current GGUF. Explicit `NGB` budgets may
-also be capped after context/KV accounting so the backend working set stays out of
-the slow pressure zone. A plain number such as
-`--ssd-streaming-cache-experts 4000` is different: it means exactly 4000 dynamic
-expert slots, with no extra accounting. Non-routed weights, KV cache, graph
-scratch, and activations need additional memory. The automatic cache budget takes
+dynamic cached experts that fit for the current GGUF. This is a target, not a
+promise to allocate that much: DwarfStar reduces it when the model map, graph,
+context, and backend working-set limit leave less room. A plain number such as
+`--ssd-streaming-cache-experts 4000` requests 4000 dynamic expert slots without
+the two-layer reserve, but it can be reduced by the same final memory check.
+Non-routed weights, KV cache, graph scratch, and activations need additional
+memory. The automatic cache budget takes
 80% of the backend's recommended working set, subtracts non-routed weights, then
 applies the same routed-prefill headroom before sizing the dynamic cache. Leave
 the hot expert preload enabled for normal use; use `--ssd-streaming-cold` and
@@ -518,8 +518,9 @@ cache. Start with the automatic budget:
   --ctx 32768
 ```
 
-The important startup line is the cache report. Start conservative, then
-increase the cache if the machine has headroom.
+The startup report shows the effective cache and whether GLM decode uses one
+global model map or the lower-memory per-layer fallback. Start conservative,
+then increase the cache if the machine has headroom.
 
 On a 128GB Strix Halo, use the routed Q2_K model and a 4096-token context as the
 starting point. The automatic cache budget leaves room for the GLM graph and KV

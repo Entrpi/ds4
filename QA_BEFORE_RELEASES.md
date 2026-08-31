@@ -670,6 +670,14 @@ SSD streaming is a capacity path, so test both correctness and user experience.
   or impossible slowdown.
 - Confirm startup reports cache budget and that generation does not stall on
   repeated expert misses for a small interactive prompt.
+- After changing model-map or memory accounting, test automatic sizing, an
+  impossible large target such as `--ssd-streaming-cache-experts 500GB`, and
+  `--ssd-streaming-cache-experts 1`. The large target must be reduced below
+  the final memory-guard budget instead of failing or pressuring the machine
+  into swap. The one-slot run must select direct per-layer reads and complete
+  correctly without pretending that the selected-expert cache can hold one
+  token's routed set. Preserve the startup lines showing the effective cache,
+  global or per-layer decode map, and total planned memory.
 - If streaming cache internals changed, test the same prompt twice and compare
   first-token/logprob sanity between runs.
 - On an idle M5 Max, run the full GLM 5.3 Q2 SSD-streaming regression with the
@@ -828,6 +836,11 @@ a substitute for CUDA or Metal release testing.
   `./ds4 --rocm -m gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf --ssd-streaming --ctx 4096 --nothink --tokens 4 -p "Reply with exactly: OK"`.
   Startup must select a cache budget that passes the memory guard without an
   override, and both compact indexed prefill and decode must complete.
+- Repeat the ROCm GLM smoke with an overlarge byte target and with a one-expert
+  target. The byte target is a hint and must be reduced using current Linux
+  `MemAvailable` as well as the backend limit. The one-expert target must use
+  the per-layer fallback. After each run, confirm SSH remains responsive and
+  no OOM kill, GPU reset, or reboot was recorded.
 - Run one longer GLM prompt with the release-advertised Strix context after
   changes to GLM attention, typed quantized projections, streaming expert
   caches, or memory budgeting. Record the context, cache split, and whether
