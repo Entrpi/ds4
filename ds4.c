@@ -6775,19 +6775,17 @@ static bool glm_stream_selected_expert_cache_supported(
         return false;
     }
 
-#ifdef __APPLE__
-    /* Metal's selected-slot IQ2/Q2 decode kernels currently bind six experts.
-     * Keep eight-expert models on the full-layer mapping until matching slots8
-     * kernels exist; otherwise the fallback dispatch sees unmapped weights. */
-    if (DS4_N_EXPERT_USED != 6) return false;
-#endif
-
     if (l->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
         l->ffn_up_exps->type != DS4_TENSOR_IQ2_XXS) {
         return false;
     }
 
     if (l->ffn_down_exps->type == DS4_TENSOR_Q2_K) {
+#ifdef __APPLE__
+        /* Metal's IQ2/Q2 selected-slot down kernel sums six experts. The
+         * separate IQ2/IQ2 address-table path below supports up to eight. */
+        if (DS4_N_EXPERT_USED != 6) return false;
+#endif
         return !glm_graph_env_present("DS4_ROCM_DISABLE_IQ2_SELECTED_EXPERT_VIEWS",
                                       "DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS");
     }
@@ -6956,7 +6954,7 @@ static DS4_MAYBE_UNUSED bool weights_model_map_decode_static_spans(
     memset(spans, 0, sizeof(*spans));
     if (include_token) model_map_span_vec_include_one(spans, w->token_embd);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        model_map_span_vec_include_layer_decode(spans, w, il);
+        model_map_span_vec_include_layer_decode_static(spans, &w->layer[il]);
     }
     if (include_output) model_map_span_vec_include_output(spans, w);
     return model_map_span_vec_finish(spans);
@@ -6977,7 +6975,7 @@ static DS4_MAYBE_UNUSED bool weights_model_map_decode_static_slice_spans(
     memset(spans, 0, sizeof(*spans));
     if (include_token) model_map_span_vec_include_one(spans, w->token_embd);
     for (uint32_t il = layer_start; il <= layer_end; il++) {
-        model_map_span_vec_include_layer_decode(spans, w, il);
+        model_map_span_vec_include_layer_decode_static(spans, &w->layer[il]);
     }
     if (include_output) model_map_span_vec_include_output(spans, w);
     return model_map_span_vec_finish(spans);
@@ -21262,18 +21260,15 @@ static uint32_t metal_graph_streaming_expert_preload_count(
         const char *env = glm_graph_env_value(
                 "DS4_ROCM_STREAMING_EXPERT_AUTO_PRELOAD_CAP",
                 "DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP");
-#ifdef DS4_ROCM_BUILD
         if (g_ds4_shape.variant == DS4_VARIANT_GLM52 &&
             (!env || !env[0])) {
             return 0;
         }
-#endif
         /* Auto mode is a hot seed, not a request to synchronously fill the
          * whole cache. Large Flash caches can otherwise spend startup doing
-         * thousands of preads into shared Metal buffers and trip the system
-         * watchdog before decode begins. ROCm GLM52 uses indexed batch prefill
-         * by default, which already populates the cache; explicit CLI preload
-         * counts and auto-preload env caps bypass that default. */
+         * thousands of preads into shared buffers and trip the system watchdog
+         * before decode begins. GLM demand-fills by default; explicit CLI
+         * preload counts and auto-preload env caps bypass that default. */
         uint32_t cap = 4096;
         if (env && env[0]) {
             char *end = NULL;
@@ -40284,17 +40279,23 @@ static uint64_t glm_graph_streaming_active_model_bytes(
     if (!weights) return 0;
 
     uint64_t max_bytes = 0;
+    const char *max_group = "none";
+    uint32_t max_layer = UINT32_MAX;
     ds4_model_map_span_vec spans;
 
     if (weights_layer_has_required(&weights->layer[0], 0) &&
         weights_model_map_token_spans(weights, &spans)) {
         max_bytes = model_map_span_vec_total_bytes(&spans);
+        max_group = "token";
         free(spans.v);
     }
     if (weights_have_output_head(weights) &&
         weights_model_map_output_spans(weights, &spans)) {
         const uint64_t bytes = model_map_span_vec_total_bytes(&spans);
-        if (bytes > max_bytes) max_bytes = bytes;
+        if (bytes > max_bytes) {
+            max_bytes = bytes;
+            max_group = "output";
+        }
         free(spans.v);
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -40302,8 +40303,27 @@ static uint64_t glm_graph_streaming_active_model_bytes(
             continue;
         }
         const uint64_t bytes = model_map_span_vec_total_bytes(&spans);
-        if (bytes > max_bytes) max_bytes = bytes;
+        if (bytes > max_bytes) {
+            max_bytes = bytes;
+            max_group = "layer";
+            max_layer = il;
+        }
         free(spans.v);
+    }
+
+    const char *report = getenv("DS4_GLM_MEMORY_GUARD_REPORT");
+    if (report && report[0]) {
+        if (max_layer == UINT32_MAX) {
+            fprintf(stderr,
+                    "ds4: GLM streaming largest active model group %s: %.2f GiB\n",
+                    max_group,
+                    glm_graph_bytes_to_gib(max_bytes));
+        } else {
+            fprintf(stderr,
+                    "ds4: GLM streaming largest active model group layer %u: %.2f GiB\n",
+                    max_layer,
+                    glm_graph_bytes_to_gib(max_bytes));
+        }
     }
 
     return max_bytes;
@@ -49028,7 +49048,8 @@ static bool glm_graph_forward_indexed_tokens(
                     slice = dense_limit - slice_pos;
                 }
                 const uint32_t attention_selected_count = slice_causal ?
-                    dense_limit : last_indexer_selected_count;
+                    (n_rows < dense_limit ? n_rows : dense_limit) :
+                    last_indexer_selected_count;
 
                 ds4_gpu_tensor *q_view =
                     ds4_gpu_tensor_view(g->batch_q,
@@ -49059,25 +49080,9 @@ static bool glm_graph_forward_indexed_tokens(
                 }
                 if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ATTN_CORE)) { /* ablate */ } else if (ok && use_split_value_proj) {
                     int rc = 0;
-#if defined(__APPLE__)
-                    if (slice_causal &&
-                        glm_graph_use_flash_attention_prefill(slice) &&
-                        !tp_attn_head_split) {
-                        rc = ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
-                                attn_lora_view,
-                                qk_low_view,
-                                g->layer_kv_lora_cache[il],
-                                pos0 + t0,
-                                slice,
-                                attention_selected_count,
-                                g->compact_cache_cap,
-                                glm_graph_compact_cache_is_f16(),
-                                DS4_N_HEAD,
-                                DS4_N_KV_LORA,
-                                (uint32_t)g->q_nope);
-                    } else
-#endif
                     if (slice_causal) {
+                        /* The compact causal score includes both absorbed MLA
+                         * and the separate RoPE query/key contribution. */
                         rc = ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
                                 attn_lora_view,
                                 q_view,
