@@ -431,6 +431,8 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
+int ds4_session_argmax_ignoring_eos(ds4_session *s,
+                                    ds4_think_mode think_mode);
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
@@ -495,6 +497,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+int ds4_session_eval_speculative_argmax_ignoring_eos(
+        ds4_session *s, int first_token, int max_tokens, int eos_token,
+        ds4_think_mode think_mode,
+        int *accepted, int accepted_cap, char *err, size_t errlen);
 /* Evaluate one already-sampled target token and speculatively extend it.
  * Positive-temperature DSpark normally commits greedily verified draft
  * tokens; dspark_exact_sampling selects exact stochastic p/q acceptance for

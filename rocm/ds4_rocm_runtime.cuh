@@ -18,6 +18,18 @@ static uint64_t g_selected_readback_event_value;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 #ifdef __HIP_PLATFORM_AMD__
+static rocblas_handle g_rocblas;
+static int g_rocblas_ready;
+/* rocBLAS solution indices are library-version specific. Unknown versions use
+ * the library default; a rejected known solution disables the tuned path. */
+enum {
+    DS4_ROCBLAS_F16_SOLUTIONS_NONE = 0,
+    DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402,
+    DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E,
+};
+static int g_rocblas_f16_solution_set;
+static int g_rocblas_f16_solutions_disabled;
+static int g_rocblas_attention_b_solution_disabled;
 #include "ds4_rocm_hipblaslt.cuh"
 #endif
 static int g_quality_mode;
@@ -5840,6 +5852,25 @@ extern "C" int ds4_gpu_init(void) {
         g_cublas_ready = 1;
     }
 #ifdef __HIP_PLATFORM_AMD__
+    if (!g_rocblas_ready) {
+        const rocblas_status st = rocblas_create_handle(&g_rocblas);
+        if (st != rocblas_status_success) {
+            fprintf(stderr, "ds4: rocBLAS create handle failed: status %d\n", (int)st);
+            return 0;
+        }
+        char version[64] = {0};
+        g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_NONE;
+        if (rocblas_get_version_string(version, sizeof(version)) == rocblas_status_success) {
+            if (strcmp(version, "5.5.0.cd957402") == 0) {
+                g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_5_5_CD957402;
+            } else if (strcmp(version, "5.6.0.8d1ae90e") == 0) {
+                g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_5_6_8D1AE90E;
+            }
+        }
+        __atomic_store_n(&g_rocblas_f16_solutions_disabled, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_rocblas_attention_b_solution_disabled, 0, __ATOMIC_RELAXED);
+        g_rocblas_ready = 1;
+    }
     if (!g_hipblaslt_ready) {
         if (hipblaslt_ok(hipblasLtCreate(&g_hipblaslt), "create handle")) {
             g_hipblaslt_ready = 1;
@@ -5862,6 +5893,14 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cublas = NULL;
     }
 #ifdef __HIP_PLATFORM_AMD__
+    if (g_rocblas_ready) {
+        (void)rocblas_destroy_handle(g_rocblas);
+        g_rocblas_ready = 0;
+        g_rocblas = NULL;
+        g_rocblas_f16_solution_set = DS4_ROCBLAS_F16_SOLUTIONS_NONE;
+        __atomic_store_n(&g_rocblas_f16_solutions_disabled, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_rocblas_attention_b_solution_disabled, 0, __ATOMIC_RELAXED);
+    }
     if (g_hipblaslt_ready) {
         (void)hipblasLtDestroy(g_hipblaslt);
         g_hipblaslt_ready = 0;

@@ -52,6 +52,11 @@ static bool ds4_mmq_nvtx_requested() {
     return enabled != 0;
 }
 
+static bool ds4_mmq_gfx1151_flag(const char *name, int cc) {
+    const char *env = getenv(name);
+    return env ? env[0] != '0' : cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151;
+}
+
 static uint64_t ds4_mmq_nvtx_payload(uint32_t first, uint32_t second) {
     return ((uint64_t)first << 32) | second;
 }
@@ -117,6 +122,23 @@ static bool   g_q81_scratch_enabled = false;
 static void  *g_aligned_q81_scratch_ptr = nullptr;
 static size_t g_aligned_q81_scratch_bytes = 0;
 static int    g_aligned_q81_scratch_device = -1;
+
+// The gfx1151 IQ2 pair path is fed in tiles of at most 2048 tokens with six
+// routed experts per token. Keep its small routing maps out of the ROCm async
+// pool: repeated shape churn can recycle/remap those allocations while the
+// following quantize kernel still consumes them. One plain allocation per
+// device gives the maps a stable lifetime for the full MMQ session.
+static constexpr size_t MMQ_GFX1151_PAIR_MAP_ROWS = 2048u * 6u;
+static constexpr size_t MMQ_GFX1151_PAIR_MAP_EXPERTS = 256u;
+
+struct mmq_pair_map_scratch {
+    int32_t *base = nullptr;
+    int32_t *ids_src1 = nullptr;
+    int32_t *ids_dst = nullptr;
+    int32_t *expert_bounds = nullptr;
+};
+
+static mmq_pair_map_scratch g_mmq_pair_maps[GGML_CUDA_MAX_DEVICES] = {};
 
 extern "C" void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes) {
     g_aligned_q81_scratch_ptr = ptr;
@@ -306,6 +328,25 @@ extern "C" int ds4_mmq_init(int device) {
         fprintf(stderr, "ds4_mmq_init: device %d out of range (have %d)\n",
                 device, info.device_count);
         return -1;
+    }
+
+    if (info.devices[device].cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 &&
+        !g_mmq_pair_maps[device].base) {
+        constexpr size_t map_ints =
+            2u * MMQ_GFX1151_PAIR_MAP_ROWS + MMQ_GFX1151_PAIR_MAP_EXPERTS + 1u;
+        int32_t *base = nullptr;
+        const cudaError_t err = cudaMalloc((void **)&base, map_ints * sizeof(int32_t));
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4_mmq_init: cudaMalloc(gfx1151 pair maps %zu B) failed: %s\n",
+                    map_ints * sizeof(int32_t), cudaGetErrorString(err));
+            return -1;
+        }
+        auto & maps = g_mmq_pair_maps[device];
+        maps.base = base;
+        maps.ids_src1 = base;
+        maps.ids_dst = base + MMQ_GFX1151_PAIR_MAP_ROWS;
+        maps.expert_bounds = base + 2u * MMQ_GFX1151_PAIR_MAP_ROWS;
     }
 
     // Step 7 task #29: pre-allocate persistent Q8_1 scratch if enabled.
@@ -1314,6 +1355,12 @@ int ds4_mmq_moe_pair_impl(
         ne_get_rows * ne10_padded * y_block_size / y_values_per_block +
         get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
     size_t direct_down_q8_bytes = 0;
+    const bool persistent_pair_maps =
+        !direct_gateup_q8 && type == GGML_TYPE_IQ2_XXS &&
+        cc == GGML_CUDA_CC_OFFSET_AMD + 0x1151 && stream == nullptr &&
+        n_expert_used == 6 && n_experts == (int)MMQ_GFX1151_PAIR_MAP_EXPERTS &&
+        ne_get_rows <= (int64_t)MMQ_GFX1151_PAIR_MAP_ROWS &&
+        g_mmq_pair_maps[dev].base != nullptr;
     if (direct_gateup_q8) {
         const int64_t down_ne10_padded = GGML_PAD((int64_t)M, MATRIX_ROW_PADDING);
         direct_down_q8_bytes =
@@ -1361,6 +1408,11 @@ int ds4_mmq_moe_pair_impl(
         ids_src1 = (int32_t *)ids_src1_raw;
         ids_dst = (int32_t *)ids_dst_raw;
         expert_bounds = (int32_t *)expert_bounds_raw;
+    } else if (persistent_pair_maps) {
+        const auto & maps = g_mmq_pair_maps[dev];
+        ids_src1 = maps.ids_src1;
+        ids_dst = maps.ids_dst;
+        expert_bounds = maps.expert_bounds;
     } else {
         ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
         ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
@@ -1408,7 +1460,14 @@ int ds4_mmq_moe_pair_impl(
      * token cannot select the same expert twice, so no expert bucket can
      * exceed n_tokens rows. Keep the conservative gathered-row bound for all
      * generic MMQ callers, including DSpark/MTP. */
-    const int64_t routed_ncols_max = fused_down
+    /* The IQ2 gate/up route is a true top-k selection: one token contributes
+     * at most one row to any expert. The default gathered-row upper bound
+     * overlaunches empty expert tiles by top_k; keep this opt-in until the
+     * compact expert-tile launch replaces the rectangular grid entirely. */
+    const bool tight_iq2_ncols =
+        type == GGML_TYPE_IQ2_XXS &&
+        ds4_mmq_gfx1151_flag("DS4_ROCM_MMQ_TIGHT_NCOLS", cc);
+    const int64_t routed_ncols_max = (fused_down || tight_iq2_ncols)
         ? (int64_t)n_tokens
         : ne_get_rows;
 
@@ -3157,8 +3216,8 @@ static __global__ void ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel(
     const int kqs = vdr * (lane % lanes_per_k);
 
 #pragma unroll
-    for (uint32_t rr = 0; rr < 4u; ++rr) {
-        const uint32_t row = blockIdx.x * 64u + row_lane + rr * 16u;
+    for (uint32_t rr = 0; rr < 8u; ++rr) {
+        const uint32_t row = blockIdx.x * 64u + row_lane + rr * 8u;
         if (row >= nrows_x) continue;
         float total = 0.0f;
 #pragma unroll
@@ -3402,7 +3461,7 @@ int ds4_mmq_moe_down_sum6_vec_impl(
     const uint32_t stride_channel_x = (uint32_t)((int64_t)M * stride_row_x);
 
     const dim3 block_nums((M + 63) / 64, n_tokens);
-    const dim3 block_dims(256);
+    const dim3 block_dims(128);
 
     ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel<type><<<block_nums, block_dims, 0, stream>>>(
         W, (const block_q8_1 *)src1_q8_1_ptr, ids, out_f32,

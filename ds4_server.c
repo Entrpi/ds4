@@ -799,6 +799,7 @@ typedef struct {
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
+    bool ignore_eos;
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
@@ -957,6 +958,19 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->top_p = DS4_DEFAULT_TOP_P;
     r->min_p = DS4_DEFAULT_MIN_P;
     r->think_mode = DS4_THINK_HIGH;
+}
+
+static bool parse_ignore_eos_value(const char **p, request *r) {
+    return p && r && json_bool(p, &r->ignore_eos);
+}
+
+static bool request_validate_ignore_eos(const request *r,
+                                        char *err, size_t errlen) {
+    if (!r || !r->ignore_eos) return true;
+    if (r->temperature_set && r->temperature == 0.0f) return true;
+    snprintf(err, errlen,
+             "ignore_eos requires an explicit temperature of 0");
+    return false;
 }
 
 static void request_free(request *r) {
@@ -3612,6 +3626,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "ignore_eos")) {
+            if (!parse_ignore_eos_value(&p, r)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "thinking")) {
             if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
@@ -3646,6 +3665,12 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     if (*p != '}') goto bad;
     if (!got_messages) {
         snprintf(err, errlen, "missing messages");
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
+    if (!request_validate_ignore_eos(r, err, errlen)) {
         chat_msgs_free(&msgs);
         free(tool_schemas);
         request_free(r);
@@ -10701,7 +10726,7 @@ static uint64_t trace_begin(
     fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
     trace_time(s->trace);
     fprintf(s->trace,
-            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nseed: %llu\n",
+            " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nignore_eos: %d\nseed: %llu\n",
             j->req.kind == REQ_CHAT ? "chat" : "completion",
             j->req.model ? j->req.model : "",
             j->req.stream ? 1 : 0,
@@ -10715,6 +10740,7 @@ static uint64_t trace_begin(
             j->req.top_k,
             j->req.top_p,
             j->req.min_p,
+            j->req.ignore_eos ? 1 : 0,
             (unsigned long long)j->req.seed);
     fprintf(s->trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
@@ -12368,8 +12394,17 @@ decode_again:
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
-        int token = ds4_session_sample(slot->session, temperature, top_k,
-                                       top_p, min_p, &rng);
+        const int eos_token = ds4_token_eos(s->engine);
+        int token = j->req.ignore_eos ?
+            ds4_session_argmax_ignoring_eos(slot->session,
+                                            j->req.think_mode) :
+            ds4_session_sample(slot->session, temperature, top_k,
+                               top_p, min_p, &rng);
+        if (token < 0) {
+            finish = "error";
+            snprintf(err, sizeof(err), "failed to select a non-EOS token");
+            break;
+        }
         if (ds4_token_is_stop_for_think_mode(s->engine,
                                              token,
                                              j->req.think_mode)) {
@@ -12383,12 +12418,19 @@ decode_again:
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
-            ntok = ds4_session_eval_speculative(
-                slot->session, token, max_tokens - completion,
-                ds4_token_eos(s->engine), temperature, top_k,
-                top_p, min_p, &rng,
-                toks, (int)(sizeof(toks) / sizeof(toks[0])),
-                err, sizeof(err));
+            if (j->req.ignore_eos) {
+                ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
+                    slot->session, token, max_tokens - completion,
+                    eos_token, j->req.think_mode,
+                    toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                    err, sizeof(err));
+            } else {
+                ntok = ds4_session_eval_speculative(
+                    slot->session, token, max_tokens - completion,
+                    eos_token, temperature, top_k, top_p, min_p, &rng,
+                    toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                    err, sizeof(err));
+            }
             if (ntok < 0) {
                 finish = "error";
                 break;
@@ -13350,6 +13392,7 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"top_p\","
             "\"top_k\","
             "\"min_p\","
+            "\"ignore_eos\","
             "\"stop\","
             "\"seed\","
             "\"stream\","
@@ -15645,7 +15688,50 @@ static void test_request_defaults_use_min_p_filtering(void) {
     TEST_ASSERT(r.top_p == DS4_DEFAULT_TOP_P);
     TEST_ASSERT(r.top_k == 0);
     TEST_ASSERT(r.min_p == DS4_DEFAULT_MIN_P);
+    TEST_ASSERT(!r.ignore_eos);
     request_free(&r);
+}
+
+static void test_chat_ignore_eos_contract(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    char err[128] = {0};
+
+    const char *p = "true";
+    TEST_ASSERT(parse_ignore_eos_value(&p, &r));
+    TEST_ASSERT(r.ignore_eos);
+    TEST_ASSERT(*p == '\0');
+    TEST_ASSERT(!request_validate_ignore_eos(&r, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "temperature") != NULL);
+
+    r.temperature_set = true;
+    r.temperature = 0.0f;
+    TEST_ASSERT(request_validate_ignore_eos(&r, err, sizeof(err)));
+
+    p = "false";
+    TEST_ASSERT(parse_ignore_eos_value(&p, &r));
+    TEST_ASSERT(!r.ignore_eos);
+    TEST_ASSERT(*p == '\0');
+
+    p = "1";
+    TEST_ASSERT(!parse_ignore_eos_value(&p, &r));
+    request_free(&r);
+
+    bool ok = parse_chat_request(
+        NULL, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"ignore_eos\":true}",
+        128, 32768, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "temperature") != NULL);
+
+    ok = parse_chat_request(
+        NULL, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"temperature\":0,\"ignore_eos\":\"yes\"}",
+        128, 32768, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(!strcmp(err, "invalid JSON request"));
 }
 
 static void test_reasoning_effort_mapping(void) {
@@ -17695,6 +17781,7 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"ignore_eos\"") != NULL);
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
@@ -19174,6 +19261,7 @@ static void ds4_server_unit_tests_run(void) {
     test_mixed_prefill_quantum_option();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
+    test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();

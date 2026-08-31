@@ -3,6 +3,12 @@
 This is the minimal setup for DS4 ROCm inference on a
 Strix Halo machine with 128 GB RAM and Radeon 8060S (`gfx1151`).
 
+## Recommended: ROCm 10.0 container
+
+The maintained [ROCm 10.0 Dockerfile](https://github.com/kyuz0/strix-halo-ds4-toolbox/blob/main/toolboxes/Dockerfile.rocm-10.0) installs AMD's `gfx1151` development packages and builds DS4 with `make strix-halo ROCM_ARCH=gfx1151`. A prebuilt image can be installed and managed with [AI Toolbox Cockpit](https://github.com/kyuz0/ai-toolbox-cockpit).
+
+Use the manual setup below only for a native Ubuntu build.
+
 ## 1. Install ROCm
 
 On Ubuntu 26.04 LTS, install the ROCm compiler/runtime and libraries used by the Strix Halo backend:

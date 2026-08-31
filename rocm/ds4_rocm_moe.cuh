@@ -7,6 +7,26 @@
 #include <rocwmma/rocwmma.hpp>
 #endif
 
+__global__ static void moe_swiglu_weighted_f32_kernel(
+        float * __restrict__ mid,
+        const float * __restrict__ gate,
+        const float * __restrict__ up,
+        const float * __restrict__ weights,
+        uint64_t n,
+        uint32_t expert_mid_dim,
+        float clamp) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint64_t pair = i / expert_mid_dim;
+    float g = isfinite(gate[i]) ? gate[i] : 0.0f;
+    float u = isfinite(up[i]) ? up[i] : 0.0f;
+    if (clamp > 1.0e-6f) {
+        g = fminf(g, clamp);
+        u = fminf(fmaxf(u, -clamp), clamp);
+    }
+    mid[i] = (g / (1.0f + expf(-g))) * u * weights[pair];
+}
+
 __device__ static float dev_f16_to_f32(uint16_t v) {
     return __half2float(*reinterpret_cast<const __half *>(&v));
 }
@@ -1346,6 +1366,19 @@ __global__ static void moe_build_expert_tiles_kernel(
         tile_experts[off + t] = e;
         tile_starts[off + t] = t * block_m;
     }
+}
+
+__global__ static void moe_build_active_experts_kernel(
+        uint32_t *active_count,
+        uint32_t *active_experts,
+        const uint32_t *counts,
+        uint32_t n_total_expert) {
+    if (blockIdx.x != 0u || threadIdx.x != 0u) return;
+    uint32_t total = 0u;
+    for (uint32_t e = 0; e < n_total_expert; e++) {
+        if (counts[e] != 0u) active_experts[total++] = e;
+    }
+    *active_count = total;
 }
 
 __global__ static void moe_gate_up_mid_sorted_qwarp32_kernel(
@@ -4110,6 +4143,49 @@ __device__ __forceinline__ static void q2_K_dequant_pair_tile_half_rowwise(
 }
 
 template <int BN, int BK>
+__device__ __forceinline__ static void q2_K_dequant_pair_tile_half_rowwise_staged(
+        half *shB0,
+        half *shB1,
+        const uint32_t *raw_rows,
+        uint32_t k0,
+        uint32_t tid) {
+    const uint32_t g = (k0 & 255u) >> 4u;
+    const uint32_t within = g & 7u;
+    const uint32_t qbase = (g >> 3u) * 32u + (within & 1u) * 16u;
+    const uint32_t shift = (within >> 1u) * 2u;
+    constexpr uint32_t KG = 4u;
+    constexpr uint32_t RAW_DWORDS = 84u / sizeof(uint32_t);
+    constexpr uint32_t UNITS_PER_TILE = (uint32_t)(BN * (BK / KG));
+    for (uint32_t j = tid; j < 2u * UNITS_PER_TILE; j += blockDim.x) {
+        const uint32_t tile = j / UNITS_PER_TILE;
+        const uint32_t rem = j - tile * UNITS_PER_TILE;
+        const uint32_t nn = rem / (uint32_t)(BK / KG);
+        const uint32_t kk0 = (rem - nn * (uint32_t)(BK / KG)) * KG;
+        const uint32_t row = tile * (uint32_t)BN + nn;
+        const unsigned char *blk =
+                reinterpret_cast<const unsigned char *>(raw_rows + row * RAW_DWORDS);
+        const uint32_t dm_bits = *reinterpret_cast<const uint32_t *>(blk + 80u);
+        const float d = dev_f16_to_f32((uint16_t)dm_bits);
+        const float dm = dev_f16_to_f32((uint16_t)(dm_bits >> 16u));
+        const float s = (float)(blk[g] & 0x0fu);
+        const float m = (float)(blk[g] >> 4u);
+        const uint32_t qbits = *reinterpret_cast<const uint32_t *>(blk + 16u + qbase + kk0);
+        const uint32_t q0 = (qbits >> shift) & 3u;
+        const uint32_t q1 = (qbits >> (8u + shift)) & 3u;
+        const uint32_t q2 = (qbits >> (16u + shift)) & 3u;
+        const uint32_t q3 = (qbits >> (24u + shift)) & 3u;
+        const float ds = d * s;
+        const float dmm = dm * m;
+        half *shB = tile == 0u ? shB0 : shB1;
+        half *dst = shB + nn * (uint32_t)BK + kk0;
+        *reinterpret_cast<uint32_t *>(dst) =
+                dev_pack_half2_bits(ds * (float)q0 - dmm, ds * (float)q1 - dmm);
+        *reinterpret_cast<uint32_t *>(dst + 2u) =
+                dev_pack_half2_bits(ds * (float)q2 - dmm, ds * (float)q3 - dmm);
+    }
+}
+
+template <int BN, int BK>
 __device__ __forceinline__ static void q2_K_dequant_dual_pair_tile_half_rowwise(
         half *shB0g,
         half *shB0u,
@@ -4611,14 +4687,18 @@ __global__ static void moe_down_q2K_expert_batch_sharedmid_kernel(
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
         uint32_t n_expert,
-        uint32_t n_tokens = 0u) {
+        uint32_t n_tokens = 0u,
+        const uint32_t *active_count = NULL,
+        const uint32_t *active_experts = NULL) {
     extern __shared__ float shmid[];
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
     const uint32_t wave = tid >> 5u;
     const uint32_t rows_per_block = blockDim.x >> 5u;
     const uint32_t row = blockIdx.x * rows_per_block + wave;
-    const uint32_t expert = blockIdx.y;
+    const uint32_t expert_index = blockIdx.y;
+    if (active_experts && expert_index >= *active_count) return;
+    const uint32_t expert = active_experts ? active_experts[expert_index] : expert_index;
     const bool row_valid = row < out_dim;
     const uint32_t count = counts[expert];
     if (count == 0u || count < min_count || (max_count != 0u && count >= max_count)) return;
@@ -5165,8 +5245,10 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
     half *shA = reinterpret_cast<half *>(raw_sh);
     half *shB0 = shA + MTILES * BM * BK;
     half *shB1 = shB0 + BK * BN;
-    float *shC0 = reinterpret_cast<float *>(shB1 + BK * BN);
-    float *shC1 = shC0 + MTILES * BM * BN;
+    constexpr uint32_t RAW_DWORDS = 84u / sizeof(uint32_t);
+    constexpr uint32_t RAW_ROWS = 2u * BN;
+    uint32_t *shW = reinterpret_cast<uint32_t *>(shB1 + BK * BN);
+    float *shC = reinterpret_cast<float *>(shW + RAW_ROWS * RAW_DWORDS);
     const uint32_t hot_idx = (uint32_t)blockIdx.z;
     if (hot_idx >= hot_count) return;
     const uint32_t expert = hot_experts[hot_idx];
@@ -5198,49 +5280,65 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
     }
 
     const unsigned char *dew = (const unsigned char *)down_base + (uint64_t)expert * down_expert_bytes;
-    for (uint32_t k0 = 0; k0 < expert_mid_dim; k0 += BK) {
-        if (MID_F16) {
-            for (uint32_t j = tid; j < MTILES * BM * (BK / 2); j += blockDim.x) {
-                const uint32_t pair_row = j / (BK / 2);
-                const uint32_t kk2 = j - pair_row * (BK / 2);
-                const uint32_t pair = shPair[pair_row];
-                uint32_t v = 0u;
-                if (pair != UINT32_MAX) {
-                    const uint64_t moff = (uint64_t)pair * expert_mid_dim + k0 + kk2 * 2u;
-                    v = *reinterpret_cast<const uint32_t *>(mid_h + moff);
-                }
-                *reinterpret_cast<uint32_t *>(shA + pair_row * BK + kk2 * 2u) = v;
+    for (uint32_t kb = 0; kb < expert_mid_dim; kb += 256u) {
+        for (uint32_t j = tid; j < RAW_ROWS * RAW_DWORDS; j += blockDim.x) {
+            const uint32_t row_local = j / RAW_DWORDS;
+            const uint32_t word = j - row_local * RAW_DWORDS;
+            const uint32_t row = n0 + row_local;
+            uint32_t v = 0u;
+            if (row < out_dim) {
+                const unsigned char *blk = dew + (uint64_t)row * down_row_bytes +
+                                           (uint64_t)(kb >> 8u) * 84u;
+                v = *reinterpret_cast<const uint32_t *>(blk + word * sizeof(uint32_t));
             }
-        } else {
-            for (uint32_t j = tid; j < MTILES * BM * BK; j += blockDim.x) {
-                const uint32_t mt = j / (BM * BK);
-                const uint32_t rem = j - mt * BM * BK;
-                const uint32_t mm = rem / BK;
-                const uint32_t kk = rem - mm * BK;
-                const uint32_t pair = shPair[mt * BM + mm];
-                if (pair != UINT32_MAX) {
-                    shA[j] = __float2half(mid[(uint64_t)pair * expert_mid_dim + k0 + kk]);
-                } else {
-                    shA[j] = __float2half(0.0f);
-                }
-            }
-        }
-        q2_K_dequant_pair_tile_half_rowwise<BN, BK>(
-                shB0, shB1, dew, down_row_bytes, n0, k0, out_dim, tid);
-        __syncthreads();
-        if (wave < MTILES) {
-            rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
-            rocwmma::load_matrix_sync(b0, shB0, BN);
-            rocwmma::load_matrix_sync(b1, shB1, BN);
-            rocwmma::mma_sync(acc0, a, b0, acc0);
-            rocwmma::mma_sync(acc1, a, b1, acc1);
+            shW[j] = v;
         }
         __syncthreads();
+
+        for (uint32_t krel = 0; krel < 256u && kb + krel < expert_mid_dim; krel += BK) {
+            const uint32_t k0 = kb + krel;
+            if (MID_F16) {
+                for (uint32_t j = tid; j < MTILES * BM * (BK / 2); j += blockDim.x) {
+                    const uint32_t pair_row = j / (BK / 2);
+                    const uint32_t kk2 = j - pair_row * (BK / 2);
+                    const uint32_t pair = shPair[pair_row];
+                    uint32_t v = 0u;
+                    if (pair != UINT32_MAX) {
+                        const uint64_t moff = (uint64_t)pair * expert_mid_dim + k0 + kk2 * 2u;
+                        v = *reinterpret_cast<const uint32_t *>(mid_h + moff);
+                    }
+                    *reinterpret_cast<uint32_t *>(shA + pair_row * BK + kk2 * 2u) = v;
+                }
+            } else {
+                for (uint32_t j = tid; j < MTILES * BM * BK; j += blockDim.x) {
+                    const uint32_t mt = j / (BM * BK);
+                    const uint32_t rem = j - mt * BM * BK;
+                    const uint32_t mm = rem / BK;
+                    const uint32_t kk = rem - mm * BK;
+                    const uint32_t pair = shPair[mt * BM + mm];
+                    if (pair != UINT32_MAX) {
+                        shA[j] = __float2half(mid[(uint64_t)pair * expert_mid_dim + k0 + kk]);
+                    } else {
+                        shA[j] = __float2half(0.0f);
+                    }
+                }
+            }
+            q2_K_dequant_pair_tile_half_rowwise_staged<BN, BK>(
+                    shB0, shB1, shW, krel, tid);
+            __syncthreads();
+            if (wave < MTILES) {
+                rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
+                rocwmma::load_matrix_sync(b0, shB0, BN);
+                rocwmma::load_matrix_sync(b1, shB1, BN);
+                rocwmma::mma_sync(acc0, a, b0, acc0);
+                rocwmma::mma_sync(acc1, a, b1, acc1);
+            }
+            __syncthreads();
+        }
     }
 
     if (wave < MTILES) {
-        rocwmma::store_matrix_sync(shC0 + wave * BM * BN, acc0, BN, rocwmma::mem_row_major);
-        rocwmma::store_matrix_sync(shC1 + wave * BM * BN, acc1, BN, rocwmma::mem_row_major);
+        rocwmma::store_matrix_sync(shC + wave * BM * BN, acc0, BN, rocwmma::mem_row_major);
     }
     __syncthreads();
     for (uint32_t j = tid; j < MTILES * BM * BN; j += blockDim.x) {
@@ -5251,29 +5349,46 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
         const uint32_t pair = shPair[mt * BM + mm];
         if (pair != UINT32_MAX) {
             const uint32_t row0 = n0 + nn;
-            const uint32_t row1 = n0 + BN + nn;
             const uint32_t tok = pair / n_expert;
             const uint32_t slot = pair - tok * n_expert;
             if (row0 < out_dim) {
                 if (OUT_F16) {
                     uint64_t dst = (uint64_t)pair * out_dim + row0;
                     if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row0;
-                    down_out_h[dst] = __float2half(shC0[j]);
+                    down_out_h[dst] = __float2half(shC[j]);
                 } else {
                     uint64_t dst = (uint64_t)pair * out_dim + row0;
                     if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row0;
-                    down_out[dst] = shC0[j];
+                    down_out[dst] = shC[j];
                 }
             }
+        }
+    }
+    __syncthreads();
+
+    if (wave < MTILES) {
+        rocwmma::store_matrix_sync(shC + wave * BM * BN, acc1, BN, rocwmma::mem_row_major);
+    }
+    __syncthreads();
+    for (uint32_t j = tid; j < MTILES * BM * BN; j += blockDim.x) {
+        const uint32_t mt = j / (BM * BN);
+        const uint32_t rem = j - mt * BM * BN;
+        const uint32_t mm = rem / BN;
+        const uint32_t nn = rem - mm * BN;
+        const uint32_t pair = shPair[mt * BM + mm];
+        if (pair != UINT32_MAX) {
+            const uint32_t row1 = n0 + BN + nn;
+            const uint32_t tok = pair / n_expert;
+            const uint32_t slot = pair - tok * n_expert;
             if (row1 < out_dim) {
                 if (OUT_F16) {
                     uint64_t dst = (uint64_t)pair * out_dim + row1;
                     if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row1;
-                    down_out_h[dst] = __float2half(shC1[j]);
+                    down_out_h[dst] = __float2half(shC[j]);
                 } else {
                     uint64_t dst = (uint64_t)pair * out_dim + row1;
                     if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row1;
-                    down_out[dst] = shC1[j];
+                    down_out[dst] = shC[j];
                 }
             }
         }
