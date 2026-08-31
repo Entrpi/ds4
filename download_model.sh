@@ -4,6 +4,7 @@ set -e
 GLM_UNSLOTH_REPO="unsloth/GLM-5.2-GGUF"
 GLM_ANTIREZ_REPO="antirez/GLM-5.2-GGUF"
 GLM53_REPO="antirez/glm-5.3-flash-gguf"
+GLM53_FULL_REPO="antirez/glm-5.3-gguf"
 REPO="antirez/deepseek-v4-gguf"
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
@@ -19,6 +20,7 @@ GLM_UNSLOTH_Q4_FIRST_FILE="$GLM_UNSLOTH_Q4_LOCAL_BASE-00001-of-00011.gguf"
 GLM_ANTIREZ_IQ2XXS_FILE="GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf"
 GLM_ANTIREZ_Q2_FILE="GLM-5.2-UD-Q2_K_RoutedQ2K.gguf"
 GLM_ANTIREZ_Q4_FILE="GLM-5.2-UD-Q4_K_RoutedQ4K.gguf"
+GLM53_FULL_Q2_FILE="GLM-5.3-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf"
 GLM53_Q2_FILE="GLM-5.3-Flash-Q2.gguf"
 GLM53_Q4_FILE="GLM-5.3-Flash-Q4_K.gguf"
 GLM53_FP8_FILE="GLM-5.3-Flash-FP8.gguf"
@@ -50,6 +52,7 @@ Usage:
   ./download_model.sh glm-antirez-iq2xxs [--token TOKEN]
   ./download_model.sh glm-antirez-q2 [--token TOKEN]
   ./download_model.sh glm-antirez-q4 [--token TOKEN]
+  ./download_model.sh glm53-full-q2 [--token TOKEN]
   ./download_model.sh glm53-q2 [--token TOKEN]
   ./download_model.sh glm53-q4 [--token TOKEN]
   ./download_model.sh glm53-fp8 [--token TOKEN]
@@ -112,6 +115,10 @@ Targets:
   glm-antirez-q4
        GLM 5.2 antirez routed Q4_K GGUF from antirez/GLM-5.2-GGUF.
        About 434 GB on disk.
+
+  glm53-full-q2
+       Full GLM 5.3 routed IQ2_XXS/Q2_K GGUF, about 197 GiB on disk.
+       Intended for 256 GB machines or SSD streaming on smaller systems.
 
   glm53-q2
        GLM 5.3 Flash imatrix Q2 GGUF, about 90 GiB on disk. Intended for
@@ -202,6 +209,11 @@ case "$MODEL" in
     glm-antirez-q4)
         REPO=$GLM_ANTIREZ_REPO
         MODEL_FILE=$GLM_ANTIREZ_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    glm53-full-q2)
+        REPO=$GLM53_FULL_REPO
+        MODEL_FILE=$GLM53_FULL_Q2_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
     glm53-q2)

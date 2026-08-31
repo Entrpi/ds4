@@ -3,7 +3,7 @@
 </p>
 
 **DwarfStar** is a small native inference engine optimized first for
-**DeepSeek V4 Flash**. It also supports **GLM 5.2**, **GLM 5.3 Flash**, and,
+**DeepSeek V4 Flash**. It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, and,
 on very high-memory machines, **DeepSeek V4 PRO**. It is self-contained and
 deliberately narrow, not a general GGUF runner. Model loading, prompt rendering,
 tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
@@ -158,6 +158,14 @@ GLM 5.2 support is limited to the GGUF files tested by this branch:
 
 GLM 5.3 Flash has its own graph, artifacts, and run instructions in the
 [GLM 5.3 Flash](#glm-53-flash) section below.
+
+The full GLM 5.3 Q2 model is about 197 GiB. It can run resident on a 256 GB
+machine, or with SSD streaming on a smaller system:
+
+```sh
+./download_model.sh glm53-full-q2
+./ds4 -m gguf/GLM-5.3-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf --ssd-streaming
+```
 
 The supported GLM 5.2 layout keeps dense/model-control tensors in the existing
 Q8/F32 paths and supports routed expert gate/up tensors in `Q2_K`, `Q4_K`, or
