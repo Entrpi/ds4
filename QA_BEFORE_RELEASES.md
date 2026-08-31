@@ -37,6 +37,10 @@ in this system.
 
 - Start from a clean tree except intentional release notes:
   `git status --short`.
+- After fetching a bundle, rewriting commits, or resetting a remote test tree,
+  force a clean build. Do not trust incremental `make`: restored source mtimes
+  can be older than a stale executable. Record the tested binary's commit or
+  verify it was rebuilt from the selected tree before running remote QA.
 - Build the normal local target:
   `make clean && make`.
 - Build CPU-only binaries as a compile check only:

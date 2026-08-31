@@ -636,7 +636,7 @@ int ds4_mmq_dense_impl(
         GGML_CUDA_CC_IS_CDNA(cc);
 
     if (out_memset_enabled()) {
-        cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
+        (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
     }
 
     const mmq_args args = {
@@ -689,7 +689,7 @@ extern "C" int ds4_mmq_q8_0_quantize_ref(
     ds4_pool_set_stream(stream);
     const size_t need = (size_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1;
     if (y_bytes < need) return -1;
-    cudaMemsetAsync(y, 0, y_bytes, stream);
+    (void)cudaMemsetAsync(y, 0, y_bytes, stream);
     quantize_mmq_q8_1_cuda(
         X, /*ids=*/nullptr, y, GGML_TYPE_Q8_0,
         /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
@@ -742,7 +742,7 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
     }
     /* Tail-tile slack: deterministic zeros (S1.1a).  ~18 KiB, stream-ordered
      * after the producer's emit on the same stream. */
-    cudaMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
+    (void)cudaMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
 
     const int64_t s01 = (int64_t)K / QK8_0;
     const int64_t s12 = (int64_t)N * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
@@ -752,7 +752,7 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
         GGML_CUDA_CC_IS_CDNA(cc);
 
     if (out_memset_enabled()) {
-        cudaMemsetAsync(out, 0, (size_t)M * (size_t)N * sizeof(float), stream);
+        (void)cudaMemsetAsync(out, 0, (size_t)M * (size_t)N * sizeof(float), stream);
     }
 
     const mmq_args args = {
@@ -872,7 +872,7 @@ extern "C" int ds4_mmq_q8_0_dense_d2r_preq(
     if (y_bytes < data_bytes + slack_bytes) {
         return -1;
     }
-    cudaMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
+    (void)cudaMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
     return ds4_mmq_q8_0_dense_d2r_launch(W_aligned, Y_q8_mmq, out_f32,
                                          M, N, K, stream);
 }
@@ -995,8 +995,8 @@ int ds4_mmq_moe_impl(
     // Zero both id maps so unwritten tail slots gather/scatter row 0 instead:
     // those lanes' output is never consumed (the mmq write-back loop is
     // expert_bounds-bounded), the cost is a few KB of memset on-stream.
-    cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows * sizeof(int32_t), stream);
-    cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows * sizeof(int32_t), stream);
+    (void)cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows * sizeof(int32_t), stream);
+    (void)cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows * sizeof(int32_t), stream);
 
     // si1 = stride between tokens in the ids tensor, in elements. Our ids is
     // contiguous [n_tokens, n_expert_used] so si1 = n_expert_used.
@@ -1100,7 +1100,7 @@ int ds4_mmq_moe_impl(
         GGML_CUDA_CC_IS_CDNA(cc);
 
     if (out_memset_enabled()) {
-        cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+        (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
     }
 
     if (type == GGML_TYPE_Q2_K && x_soa != nullptr && d2r_enabled() &&
@@ -1439,8 +1439,8 @@ int ds4_mmq_moe_pair_impl(
                 nvtx_prefill);
         // Task #22 root-cause fix (same as ds4_mmq_moe_impl): zero the id maps
         // so entries dropped by mm_ids_helper never expose stale pool memory.
-        cudaMemsetAsync(ids_src1, 0, ne_get_rows * sizeof(int32_t), stream);
-        cudaMemsetAsync(ids_dst,  0, ne_get_rows * sizeof(int32_t), stream);
+        (void)cudaMemsetAsync(ids_src1, 0, ne_get_rows * sizeof(int32_t), stream);
+        (void)cudaMemsetAsync(ids_dst,  0, ne_get_rows * sizeof(int32_t), stream);
         ggml_cuda_launch_mm_ids_helper(
             ids, ids_src1, ids_dst, expert_bounds,
             n_experts, n_tokens, n_expert_used, /*nchannels_y=*/(int)ne11,
@@ -1568,11 +1568,11 @@ int ds4_mmq_moe_pair_impl(
                 char *h_cmp = (char *)malloc(cmp_payload);
                 int32_t *h_ids = (int32_t *)malloc((size_t)ne_get_rows * sizeof(int32_t));
                 if (h_ref && h_cmp && h_ids) {
-                    cudaMemcpyAsync(h_ref, ref, ref_payload, cudaMemcpyDeviceToHost, stream);
-                    cudaMemcpyAsync(h_cmp, src1_q8_1, cmp_payload, cudaMemcpyDeviceToHost, stream);
-                    cudaMemcpyAsync(h_ids, ids_src1, (size_t)ne_get_rows * sizeof(int32_t),
-                                    cudaMemcpyDeviceToHost, stream);
-                    cudaStreamSynchronize(stream);
+                    (void)cudaMemcpyAsync(h_ref, ref, ref_payload, cudaMemcpyDeviceToHost, stream);
+                    (void)cudaMemcpyAsync(h_cmp, src1_q8_1, cmp_payload, cudaMemcpyDeviceToHost, stream);
+                    (void)cudaMemcpyAsync(h_ids, ids_src1, (size_t)ne_get_rows * sizeof(int32_t),
+                                          cudaMemcpyDeviceToHost, stream);
+                    (void)cudaStreamSynchronize(stream);
                     long long bad = 0;
                     long long first_slot = -1, first_kseg = -1;
                     for (int ks = 0; ks < nkseg; ++ks) {
@@ -1592,7 +1592,7 @@ int ds4_mmq_moe_pair_impl(
                             first_slot, first_kseg);
                 }
                 free(h_ref); free(h_cmp); free(h_ids);
-                cudaFree(ref);
+                (void)cudaFree(ref);
             }
         }
         ybuf_memset(fused_down->q8_scratch, direct_down_q8_bytes, stream);
@@ -1622,9 +1622,9 @@ int ds4_mmq_moe_pair_impl(
         }
 
         if (out_memset_enabled()) {
-            cudaMemsetAsync(fused_down->out, 0,
-                    (size_t)fused_down->out_dim * (size_t)ne_get_rows * sizeof(float),
-                    stream);
+            (void)cudaMemsetAsync(fused_down->out, 0,
+                                  (size_t)fused_down->out_dim * (size_t)ne_get_rows * sizeof(float),
+                                  stream);
         }
         const size_t down_work_bytes =
             ds4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
@@ -1658,8 +1658,8 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s13_mmq = ne12 * s12_mmq;
 
     if (out_memset_enabled()) {
-        cudaMemsetAsync(out_a, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
-        cudaMemsetAsync(out_b, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+        (void)cudaMemsetAsync(out_a, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
+        (void)cudaMemsetAsync(out_b, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
     }
 
     bool gate_up_done = false;
@@ -1796,9 +1796,9 @@ int ds4_mmq_moe_pair_impl(
         }
 
         if (out_memset_enabled()) {
-            cudaMemsetAsync(fused_down->out, 0,
-                    (size_t)fused_down->out_dim * (size_t)ne_get_rows * sizeof(float),
-                    stream);
+            (void)cudaMemsetAsync(fused_down->out, 0,
+                                  (size_t)fused_down->out_dim * (size_t)ne_get_rows * sizeof(float),
+                                  stream);
         }
         const int64_t down_s01 = (int64_t)M / ggml_blck_size(GGML_TYPE_Q2_K);
         const int64_t down_s02 = (int64_t)fused_down->out_dim * down_s01;
@@ -2362,7 +2362,7 @@ int ds4_mmq_moe_vec_impl(
 
     ggml_cuda_mm_fusion_args_device fusion = {};
 
-    cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)n_tokens * (size_t)n_expert_used * sizeof(float), stream);
+    (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)n_tokens * (size_t)n_expert_used * sizeof(float), stream);
 
     // FD Inc2a: one mmvq launch serves at most col_cap columns -- the moe
     // kernel runs one warp per column (block.y = ncols_dst) under
@@ -2870,8 +2870,8 @@ int ds4_mmq_moe_pair_raw_vec_impl(
     ggml_cuda_mm_fusion_args_device fusion = {};
 
     const size_t out_bytes = (size_t)M * (size_t)n_tokens * (size_t)n_expert_used * sizeof(float);
-    cudaMemsetAsync(out_a, 0, out_bytes, stream);
-    cudaMemsetAsync(out_b, 0, out_bytes, stream);
+    (void)cudaMemsetAsync(out_a, 0, out_bytes, stream);
+    (void)cudaMemsetAsync(out_b, 0, out_bytes, stream);
 
     for (int c0 = 0; c0 < n_tokens; c0 += col_cap) {
         const int ncols = (n_tokens - c0 < col_cap) ? (n_tokens - c0) : col_cap;
@@ -3016,7 +3016,7 @@ int ds4_mmq_moe_pair_vec_impl(
     fusion.gate   = W_b;
     fusion.glu_op = GGML_GLU_OP_SWIGLU;
 
-    cudaMemsetAsync(out_silu, 0, (size_t)M * (size_t)n_expert_used * sizeof(float), stream);
+    (void)cudaMemsetAsync(out_silu, 0, (size_t)M * (size_t)n_expert_used * sizeof(float), stream);
 
     mul_mat_vec_q_switch_type(
         /*vx=*/W_a, /*type_x=*/type,
@@ -3122,7 +3122,7 @@ int ds4_mmq_dense_vec_impl(
 
     ggml_cuda_mm_fusion_args_device fusion = {};
 
-    cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
+    (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
 
     mul_mat_vec_q_switch_type(
         /*vx=*/W, /*type_x=*/type,
@@ -4505,7 +4505,7 @@ extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
     const int64_t s12_y  = ne10_padded / QK8_1;
     const int64_t s2_dst = (int64_t)M;   /* n_expert_used == 1 */
 
-    cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)n_tokens * sizeof(float), stream);
+    (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)n_tokens * sizeof(float), stream);
 
     const uint64_t npair = (uint64_t)n_experts * (uint64_t)(M/2) * (uint64_t)(K / 256);
     const uint64_t dm_bytes = (npair * 8u + 63u) & ~63ull;

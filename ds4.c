@@ -44763,7 +44763,7 @@ static bool glm_graph_use_flash_attention_prefill(uint32_t n_tokens) {
            n_tokens >= glm_graph_flash_attention_prefill_min_tokens();
 }
 
-static bool glm_graph_use_dense_compact_attention_prefill(
+static DS4_MAYBE_UNUSED bool glm_graph_use_dense_compact_attention_prefill(
         uint32_t n_tokens) {
     if (!glm_graph_use_flash_attention_prefill(n_tokens)) return false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)

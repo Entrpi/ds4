@@ -81,13 +81,13 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 int ggml_cuda_get_device() {
     int dev = 0;
-    cudaGetDevice(&dev);
+    (void)cudaGetDevice(&dev);
     return dev;
 }
 
 void ggml_cuda_set_device(int device) {
     int cur = -1;
-    cudaGetDevice(&cur);
+    (void)cudaGetDevice(&cur);
     if (cur != device) {
         CUDA_CHECK(cudaSetDevice(device));
     }
@@ -166,7 +166,7 @@ std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(i
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event) {
-        cudaEventDestroy(copy_event);
+        (void)cudaEventDestroy(copy_event);
         copy_event = nullptr;
     }
     // streams[][], cublas_handles[], and pools[][] are owned-by-value
