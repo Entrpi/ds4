@@ -6785,19 +6785,17 @@ static bool glm_stream_selected_expert_cache_supported(
         return false;
     }
 
-#ifdef __APPLE__
-    /* Metal's selected-slot IQ2/Q2 decode kernels currently bind six experts.
-     * Keep eight-expert models on the full-layer mapping until matching slots8
-     * kernels exist; otherwise the fallback dispatch sees unmapped weights. */
-    if (DS4_N_EXPERT_USED != 6) return false;
-#endif
-
     if (l->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
         l->ffn_up_exps->type != DS4_TENSOR_IQ2_XXS) {
         return false;
     }
 
     if (l->ffn_down_exps->type == DS4_TENSOR_Q2_K) {
+#ifdef __APPLE__
+        /* Metal's IQ2/Q2 selected-slot down kernel sums six experts. The
+         * separate IQ2/IQ2 address-table path below supports up to eight. */
+        if (DS4_N_EXPERT_USED != 6) return false;
+#endif
         return !glm_graph_env_present("DS4_ROCM_DISABLE_IQ2_SELECTED_EXPERT_VIEWS",
                                       "DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS");
     }
@@ -6815,6 +6813,28 @@ static bool glm_stream_decode_experts_are_streamed(
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA) return false;
     return glm_stream_expert_cache_addr_layout_supported(w, l, il) ||
            glm_stream_selected_expert_cache_supported(l, il);
+}
+
+static bool glm_stream_decode_expert_cache_ready(
+        const ds4_weights       *w,
+        const ds4_layer_weights *l,
+        uint32_t                 il) {
+    if (glm_stream_expert_cache_addr_supported(w, l, il)) return true;
+    if (!glm_stream_selected_expert_cache_supported(l, il)) return false;
+#ifdef DS4_NO_GPU
+    return false;
+#else
+    uint64_t gate_expert_bytes = 0;
+    uint64_t down_expert_bytes = 0;
+    if (!streaming_layer_gate_down_expert_bytes(l,
+                                                &gate_expert_bytes,
+                                                &down_expert_bytes)) {
+        return false;
+    }
+    return ds4_gpu_stream_expert_cache_budget_for_expert_size(
+                   gate_expert_bytes,
+                   down_expert_bytes) >= DS4_N_EXPERT_USED;
+#endif
 }
 
 /*
@@ -6838,6 +6858,21 @@ static void model_map_span_vec_include_layer_decode(
         model_map_span_vec_include_one(spans, l->ffn_up_exps);
         model_map_span_vec_include_one(spans, l->ffn_down_exps);
     }
+}
+
+static bool weights_model_map_decode_static_supported(const ds4_weights *w) {
+    if (!w) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps) continue;
+        if (!weights_streaming_layer_experts_uniform(w, il) ||
+            (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+             !glm_stream_decode_expert_cache_ready(w, l, il)) ||
+            glm_stream_resident_decode_layer_enabled(l, il)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void model_map_span_vec_include_output(ds4_model_map_span_vec *spans, const ds4_weights *w) {
@@ -6966,7 +7001,7 @@ static DS4_MAYBE_UNUSED bool weights_model_map_decode_static_spans(
     memset(spans, 0, sizeof(*spans));
     if (include_token) model_map_span_vec_include_one(spans, w->token_embd);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        model_map_span_vec_include_layer_decode(spans, w, il);
+        model_map_span_vec_include_layer_decode_static(spans, &w->layer[il]);
     }
     if (include_output) model_map_span_vec_include_output(spans, w);
     return model_map_span_vec_finish(spans);
@@ -6987,7 +7022,7 @@ static DS4_MAYBE_UNUSED bool weights_model_map_decode_static_slice_spans(
     memset(spans, 0, sizeof(*spans));
     if (include_token) model_map_span_vec_include_one(spans, w->token_embd);
     for (uint32_t il = layer_start; il <= layer_end; il++) {
-        model_map_span_vec_include_layer_decode(spans, w, il);
+        model_map_span_vec_include_layer_decode_static(spans, &w->layer[il]);
     }
     if (include_output) model_map_span_vec_include_output(spans, w);
     return model_map_span_vec_finish(spans);
@@ -21272,18 +21307,15 @@ static uint32_t metal_graph_streaming_expert_preload_count(
         const char *env = glm_graph_env_value(
                 "DS4_ROCM_STREAMING_EXPERT_AUTO_PRELOAD_CAP",
                 "DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP");
-#ifdef DS4_ROCM_BUILD
         if (g_ds4_shape.variant == DS4_VARIANT_GLM52 &&
             (!env || !env[0])) {
             return 0;
         }
-#endif
         /* Auto mode is a hot seed, not a request to synchronously fill the
          * whole cache. Large Flash caches can otherwise spend startup doing
-         * thousands of preads into shared Metal buffers and trip the system
-         * watchdog before decode begins. ROCm GLM52 uses indexed batch prefill
-         * by default, which already populates the cache; explicit CLI preload
-         * counts and auto-preload env caps bypass that default. */
+         * thousands of preads into shared buffers and trip the system watchdog
+         * before decode begins. GLM demand-fills by default; explicit CLI
+         * preload counts and auto-preload env caps bypass that default. */
         uint32_t cap = 4096;
         if (env && env[0]) {
             char *end = NULL;
@@ -31133,7 +31165,9 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
     metal_graph_dspark_capture_begin(g);
 
-    const bool static_decode_map = metal_graph_stream_decode_static_map_enabled();
+    const bool static_decode_map =
+        metal_graph_stream_decode_static_map_enabled() &&
+        weights_model_map_decode_static_supported(weights);
     const bool static_map_state_cache =
         static_decode_map && metal_graph_stream_decode_static_map_state_cache_enabled();
     const bool batch_static_decode =
@@ -34566,24 +34600,29 @@ static float *imatrix_down_ptr(ds4_imatrix_collector *c, uint32_t il, uint32_t e
     return c->down_sum2 + ((size_t)il * DS4_N_EXPERT + expert) * DS4_N_FF_EXP;
 }
 
-static bool imatrix_collect_layer_batch(
+static bool imatrix_collect_tensor_batch(
         ds4_imatrix_collector *c,
-        ds4_gpu_graph         *g,
+        ds4_gpu_tensor        *ffn_norm,
+        ds4_gpu_tensor        *routed_mid,
+        ds4_gpu_tensor        *router_selected,
+        bool                   routed_mid_is_f16,
         uint32_t               il,
         uint32_t               n_tokens) {
     if (!c || n_tokens == 0) return true;
-    if (n_tokens > c->cap_tokens) return false;
+    if (!ffn_norm || !routed_mid || !router_selected ||
+        n_tokens > c->cap_tokens) return false;
 
     const uint64_t norm_bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
     const uint64_t mid_elems = (uint64_t)n_tokens * DS4_N_EXPERT_USED * DS4_N_FF_EXP;
-    const uint64_t mid_bytes = mid_elems * (g->batch_routed_mid_is_f16 ? sizeof(uint16_t) : sizeof(float));
+    const uint64_t mid_bytes = mid_elems *
+        (routed_mid_is_f16 ? sizeof(uint16_t) : sizeof(float));
     const uint64_t sel_bytes = (uint64_t)n_tokens * DS4_N_EXPERT_USED * sizeof(int);
-    void *mid_dst = g->batch_routed_mid_is_f16
+    void *mid_dst = routed_mid_is_f16
         ? (void *)c->routed_mid_f16_buf
         : (void *)c->routed_mid_buf;
-    if (ds4_gpu_tensor_read(metal_graph_batch_ffn_norm(g), 0, c->ffn_norm_buf, norm_bytes) == 0 ||
-        ds4_gpu_tensor_read(metal_graph_batch_routed_mid(g), 0, mid_dst, mid_bytes) == 0 ||
-        ds4_gpu_tensor_read(metal_graph_batch_router_selected(g), 0, c->selected_buf, sel_bytes) == 0)
+    if (ds4_gpu_tensor_read(ffn_norm, 0, c->ffn_norm_buf, norm_bytes) == 0 ||
+        ds4_gpu_tensor_read(routed_mid, 0, mid_dst, mid_bytes) == 0 ||
+        ds4_gpu_tensor_read(router_selected, 0, c->selected_buf, sel_bytes) == 0)
     {
         return false;
     }
@@ -34602,7 +34641,7 @@ static bool imatrix_collect_layer_batch(
 
             float *down = imatrix_down_ptr(c, il, (uint32_t)expert);
             const size_t mid_off = ((size_t)t * DS4_N_EXPERT_USED + slot) * DS4_N_FF_EXP;
-            if (g->batch_routed_mid_is_f16) {
+            if (routed_mid_is_f16) {
                 const uint16_t *mid = c->routed_mid_f16_buf + mid_off;
                 for (uint32_t i = 0; i < DS4_N_FF_EXP; i++) {
                     const float v = f16_to_f32(mid[i]);
@@ -34619,6 +34658,21 @@ static bool imatrix_collect_layer_batch(
     c->observed_tokens += n_tokens;
     c->chunks++;
     return true;
+}
+
+static bool imatrix_collect_layer_batch(
+        ds4_imatrix_collector *c,
+        ds4_gpu_graph         *g,
+        uint32_t               il,
+        uint32_t               n_tokens) {
+    if (!g) return false;
+    return imatrix_collect_tensor_batch(c,
+                                        metal_graph_batch_ffn_norm(g),
+                                        metal_graph_batch_routed_mid(g),
+                                        metal_graph_batch_router_selected(g),
+                                        g->batch_routed_mid_is_f16,
+                                        il,
+                                        n_tokens);
 }
 
 static void imatrix_write_i32(FILE *fp, int32_t v) {
@@ -34645,7 +34699,7 @@ static void imatrix_write_entry(
         const uint32_t count = counts[e];
         const float *src = sum2 + (size_t)e * n_col;
         if (count == 0) {
-            for (uint32_t i = 0; i < n_col; i++) tmp[i] = 1.0f;
+            memset(tmp, 0, (size_t)n_col * sizeof(tmp[0]));
         } else {
             const float inv = 1.0f / (float)count;
             for (uint32_t i = 0; i < n_col; i++) tmp[i] = src[i] * inv;
@@ -34711,22 +34765,56 @@ static bool imatrix_collector_save(
     return true;
 }
 
+static uint32_t imatrix_collector_min_samples(
+        const ds4_imatrix_collector *c,
+        const ds4_weights           *weights,
+        uint32_t                     layer_limit) {
+    bool found = false;
+    uint32_t min_samples = UINT32_MAX;
+    if (layer_limit > DS4_N_LAYER) layer_limit = DS4_N_LAYER;
+    for (uint32_t il = 0; il < layer_limit; il++) {
+        if (!weights->layer[il].ffn_gate_exps) continue;
+        for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+            uint32_t samples = c->gate_up_count[il][expert];
+            if (c->down_count[il][expert] < samples) {
+                samples = c->down_count[il][expert];
+            }
+            if (samples < min_samples) min_samples = samples;
+            found = true;
+        }
+    }
+    return found ? min_samples : 0;
+}
+
 static void imatrix_collector_report_coverage(
         const ds4_imatrix_collector *c,
-        const ds4_weights           *weights) {
+        const ds4_weights           *weights,
+        uint32_t                     layer_limit) {
     uint32_t layers = 0;
     uint32_t covered = 0;
     uint32_t possible = 0;
     uint32_t min_layer = DS4_N_EXPERT;
     uint32_t max_layer = 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    uint32_t min_samples = UINT32_MAX;
+    uint32_t max_samples = 0;
+    uint32_t under_four = 0;
+    uint32_t under_eight = 0;
+    if (layer_limit > DS4_N_LAYER) layer_limit = DS4_N_LAYER;
+    for (uint32_t il = 0; il < layer_limit; il++) {
         if (!weights->layer[il].ffn_gate_exps) continue;
         uint32_t layer_covered = 0;
         for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
-            if (c->gate_up_count[il][expert] != 0 &&
-                c->down_count[il][expert] != 0) {
+            uint32_t samples = c->gate_up_count[il][expert];
+            if (c->down_count[il][expert] < samples) {
+                samples = c->down_count[il][expert];
+            }
+            if (samples != 0) {
                 layer_covered++;
             }
+            if (samples < min_samples) min_samples = samples;
+            if (samples > max_samples) max_samples = samples;
+            if (samples < 4) under_four++;
+            if (samples < 8) under_eight++;
         }
         layers++;
         covered += layer_covered;
@@ -34734,15 +34822,47 @@ static void imatrix_collector_report_coverage(
         if (layer_covered < min_layer) min_layer = layer_covered;
         if (layer_covered > max_layer) max_layer = layer_covered;
     }
-    if (layers == 0) min_layer = 0;
+    if (layers == 0) {
+        min_layer = 0;
+        min_samples = 0;
+    }
     fprintf(stderr,
             "ds4: imatrix expert coverage %u/%u (%.2f%%), "
-            "per sparse layer min=%u max=%u\n",
+            "per sparse layer min=%u max=%u, samples min=%u max=%u, "
+            "under4=%u under8=%u\n",
             covered,
             possible,
             possible ? 100.0 * (double)covered / (double)possible : 0.0,
             min_layer,
-            max_layer);
+            max_layer,
+            min_samples,
+            max_samples,
+            under_four,
+            under_eight);
+    if (under_eight != 0) {
+        uint32_t shown = 0;
+        fprintf(stderr, "ds4: imatrix expert slots under 8 samples:");
+        for (uint32_t samples = 0; samples < 8 && shown < 256; samples++) {
+            for (uint32_t il = 0; il < layer_limit && shown < 256; il++) {
+                if (!weights->layer[il].ffn_gate_exps) continue;
+                for (uint32_t expert = 0;
+                     expert < DS4_N_EXPERT && shown < 256;
+                     expert++) {
+                    uint32_t count = c->gate_up_count[il][expert];
+                    if (c->down_count[il][expert] < count) {
+                        count = c->down_count[il][expert];
+                    }
+                    if (count != samples) continue;
+                    fprintf(stderr, " %u:%u=%u", il, expert, count);
+                    shown++;
+                }
+            }
+        }
+        if (shown < under_eight) {
+            fprintf(stderr, " ... (%u more)", under_eight - shown);
+        }
+        fputc('\n', stderr);
+    }
 }
 
 static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
@@ -35752,7 +35872,8 @@ static bool metal_graph_prefill_layer_major(
     }
     if (ok && logits && g->ssd_streaming) {
         const bool static_decode_map =
-            metal_graph_stream_decode_static_map_enabled();
+            metal_graph_stream_decode_static_map_enabled() &&
+            weights_model_map_decode_static_supported(weights);
         const bool static_map_state_cache =
             static_decode_map &&
             metal_graph_stream_decode_static_map_state_cache_enabled();
@@ -37727,6 +37848,7 @@ struct ds4_engine {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
+    bool ssd_streaming_budget_finalized;
     ds4_distributed_options distributed;
     ds4_engine_tp_state tp;
     bool metal_ready;
@@ -40328,48 +40450,14 @@ static bool imatrix_collect_glm_one(
         ds4_imatrix_collector    *c,
         struct ds4_glm_gpu_graph *g,
         uint32_t                  il) {
-    if (!c || !g || il >= DS4_N_LAYER || !g->ffn_norm ||
-        !g->ffn_mid || !g->router_selected) return false;
-
-    const uint64_t norm_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
-    const uint64_t mid_values = (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP;
-    const uint64_t mid_bytes = mid_values * sizeof(float);
-    const uint64_t selected_bytes =
-        (uint64_t)DS4_N_EXPERT_USED * sizeof(c->selected_buf[0]);
-    if (ds4_gpu_tensor_read(g->ffn_norm, 0, c->ffn_norm_buf,
-                            norm_bytes) == 0 ||
-        ds4_gpu_tensor_read(g->ffn_mid, 0, c->routed_mid_buf,
-                            mid_bytes) == 0 ||
-        ds4_gpu_tensor_read(g->router_selected, 0, c->selected_buf,
-                            selected_bytes) == 0) {
-        return false;
-    }
-
-    for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
-        const float v = c->ffn_norm_buf[i];
-        c->sq_tmp[i] = v * v;
-    }
-    for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
-        const int expert = c->selected_buf[slot];
-        if (expert < 0 || (uint32_t)expert >= DS4_N_EXPERT) continue;
-        float *gate_up = imatrix_gate_up_ptr(c, il, (uint32_t)expert);
-        for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
-            gate_up[i] += c->sq_tmp[i];
-        }
-        c->gate_up_count[il][expert]++;
-
-        float *down = imatrix_down_ptr(c, il, (uint32_t)expert);
-        const float *mid = c->routed_mid_buf +
-                           (uint64_t)slot * DS4_N_FF_EXP;
-        for (uint32_t i = 0; i < DS4_N_FF_EXP; i++) {
-            down[i] += mid[i] * mid[i];
-        }
-        c->down_count[il][expert]++;
-        c->observed_routes++;
-    }
-    c->observed_tokens++;
-    c->chunks++;
-    return true;
+    if (!g || il >= DS4_N_LAYER) return false;
+    return imatrix_collect_tensor_batch(c,
+                                        g->ffn_norm,
+                                        g->ffn_mid,
+                                        g->router_selected,
+                                        false,
+                                        il,
+                                        1);
 }
 
 static bool glm_graph_reset_kda_state(ds4_glm_gpu_graph *g) {
@@ -40430,17 +40518,23 @@ static uint64_t glm_graph_streaming_active_model_bytes(
     if (!weights) return 0;
 
     uint64_t max_bytes = 0;
+    const char *max_group = "none";
+    uint32_t max_layer = UINT32_MAX;
     ds4_model_map_span_vec spans;
 
     if (weights_layer_has_required(&weights->layer[0], 0) &&
         weights_model_map_token_spans(weights, &spans)) {
         max_bytes = model_map_span_vec_total_bytes(&spans);
+        max_group = "token";
         free(spans.v);
     }
     if (weights_have_output_head(weights) &&
         weights_model_map_output_spans(weights, &spans)) {
         const uint64_t bytes = model_map_span_vec_total_bytes(&spans);
-        if (bytes > max_bytes) max_bytes = bytes;
+        if (bytes > max_bytes) {
+            max_bytes = bytes;
+            max_group = "output";
+        }
         free(spans.v);
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -40448,8 +40542,27 @@ static uint64_t glm_graph_streaming_active_model_bytes(
             continue;
         }
         const uint64_t bytes = model_map_span_vec_total_bytes(&spans);
-        if (bytes > max_bytes) max_bytes = bytes;
+        if (bytes > max_bytes) {
+            max_bytes = bytes;
+            max_group = "layer";
+            max_layer = il;
+        }
         free(spans.v);
+    }
+
+    const char *report = getenv("DS4_GLM_MEMORY_GUARD_REPORT");
+    if (report && report[0]) {
+        if (max_layer == UINT32_MAX) {
+            fprintf(stderr,
+                    "ds4: GLM streaming largest active model group %s: %.2f GiB\n",
+                    max_group,
+                    glm_graph_bytes_to_gib(max_bytes));
+        } else {
+            fprintf(stderr,
+                    "ds4: GLM streaming largest active model group layer %u: %.2f GiB\n",
+                    max_layer,
+                    glm_graph_bytes_to_gib(max_bytes));
+        }
     }
 
     return max_bytes;
@@ -41153,7 +41266,7 @@ static bool glm_graph_stream_layer_expert_cache_supported(
         uint32_t                 il) {
     if (!weights || !l) return false;
     if (il < DS4_N_LEADING_DENSE) return true;
-    return glm_stream_decode_experts_are_streamed(weights, l, il);
+    return glm_stream_decode_expert_cache_ready(weights, l, il);
 }
 
 static bool glm_graph_stream_prefill_expert_addr_supported(
@@ -49211,7 +49324,8 @@ static bool glm_graph_forward_indexed_tokens(
                     slice = dense_limit - slice_pos;
                 }
                 const uint32_t attention_selected_count = slice_causal ?
-                    dense_limit : last_indexer_selected_count;
+                    (n_rows < dense_limit ? n_rows : dense_limit) :
+                    last_indexer_selected_count;
 
                 ds4_gpu_tensor *q_view =
                     ds4_gpu_tensor_view(g->batch_q,
@@ -49261,6 +49375,8 @@ static bool glm_graph_forward_indexed_tokens(
                     } else
 #endif
                     if (slice_causal) {
+                        /* The compact causal score includes both absorbed MLA
+                         * and the separate RoPE query/key contribution. */
                         rc = ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
                                 attn_lora_view,
                                 q_view,
@@ -50446,7 +50562,8 @@ static bool glm_graph_forward_token(
         !input_hc &&
         g->has_token_embd &&
         g->ssd_streaming &&
-        metal_graph_stream_decode_static_map_enabled();
+        metal_graph_stream_decode_static_map_enabled() &&
+        weights_model_map_decode_static_supported(weights);
     const bool static_map_state_cache =
         static_decode_map && metal_graph_stream_decode_static_map_state_cache_enabled();
     const bool streaming_decode_sync_each_layer =
@@ -56312,7 +56429,7 @@ static char *imatrix_find_marker(char *dataset, char *cursor, const char *marker
     return NULL;
 }
 
-static int ds4_engine_collect_glm53_imatrix(
+static int ds4_engine_collect_glm_imatrix(
         ds4_engine *e,
         char       *dataset,
         size_t      dataset_len,
@@ -56320,31 +56437,33 @@ static int ds4_engine_collect_glm53_imatrix(
         const char *output_path,
         int         ctx_size,
         int         max_prompts,
-        int         max_tokens) {
+        int         max_tokens,
+        int         min_expert_samples) {
     ds4_glm_gpu_graph g;
     if (!glm_graph_alloc(&g, &e->model, &e->weights, ctx_size,
                          e->ssd_streaming, e->ssd_streaming_cold)) {
-        fprintf(stderr, "ds4: failed to allocate GLM 5.3 imatrix graph\n");
+        fprintf(stderr, "ds4: failed to allocate GLM imatrix graph\n");
         return 1;
     }
     g.quality = e->quality;
 
     ds4_imatrix_collector collector;
     if (!imatrix_collector_init(&collector, 1, dataset_path)) {
-        fprintf(stderr, "ds4: failed to allocate GLM 5.3 imatrix collector\n");
+        fprintf(stderr, "ds4: failed to allocate GLM imatrix collector\n");
         glm_graph_free(&g);
         return 1;
     }
     g.imatrix = &collector;
 
     fprintf(stderr,
-            "ds4: collecting GLM 5.3 routed imatrix from %s "
+            "ds4: collecting GLM routed imatrix from %s "
             "(layers=%u experts=%u ctx=%d)\n",
             dataset_path, DS4_N_LAYER, DS4_N_EXPERT, ctx_size);
 
     bool ok = true;
     int prompts_done = 0;
     int tokens_done = 0;
+    bool sample_target_reached = false;
     char *cursor = dataset;
     const char *marker_lit = "===== DS4_IMATRIX_PROMPT";
     while (ok && *cursor) {
@@ -56371,7 +56490,7 @@ static int ds4_engine_collect_glm53_imatrix(
             }
             if (prompt.len > 0) {
                 if (!glm_graph_reset_kda_state(&g)) {
-                    fprintf(stderr, "ds4: failed to reset GLM 5.3 imatrix KDA state\n");
+                    fprintf(stderr, "ds4: failed to reset GLM imatrix state\n");
                     ok = false;
                 }
                 for (int pos = 0; ok && pos < prompt.len; pos++) {
@@ -56386,22 +56505,32 @@ static int ds4_engine_collect_glm53_imatrix(
                                                  false);
                 }
                 if (!ok) {
-                    fprintf(stderr, "ds4: GLM 5.3 imatrix failed at prompt %d\n",
+                    fprintf(stderr, "ds4: GLM imatrix failed at prompt %d\n",
                             prompts_done + 1);
                 } else {
                     prompts_done++;
                     tokens_done += prompt.len;
                     fprintf(stderr,
-                            "ds4: GLM 5.3 imatrix prompts=%d tokens=%d routes=%llu\r",
+                            "ds4: GLM imatrix prompts=%d tokens=%d routes=%llu "
+                            "min_samples=%u\r",
                             prompts_done,
                             tokens_done,
-                            (unsigned long long)collector.observed_routes);
+                            (unsigned long long)collector.observed_routes,
+                            imatrix_collector_min_samples(&collector,
+                                                         &e->weights,
+                                                         g.normal_layers));
                     fflush(stderr);
+                    sample_target_reached = min_expert_samples > 0 &&
+                        imatrix_collector_min_samples(&collector,
+                                                     &e->weights,
+                                                     g.normal_layers) >=
+                            (uint32_t)min_expert_samples;
                 }
             }
             token_vec_free(&prompt);
         }
         *end = saved;
+        if (sample_target_reached) break;
         if (!next) break;
         cursor = next;
         if (max_prompts > 0 && prompts_done >= max_prompts) break;
@@ -56411,12 +56540,23 @@ static int ds4_engine_collect_glm53_imatrix(
 
     g.imatrix = NULL;
     if (ok) {
-        imatrix_collector_report_coverage(&collector, &e->weights);
+        imatrix_collector_report_coverage(&collector,
+                                          &e->weights,
+                                          g.normal_layers);
+        if (min_expert_samples > 0 && !sample_target_reached) {
+            fprintf(stderr,
+                    "ds4: GLM imatrix minimum expert sample target %d "
+                    "was not reached\n",
+                    min_expert_samples);
+            ok = false;
+        }
+    }
+    if (ok) {
         ok = imatrix_collector_save(&collector, &e->weights, output_path);
     }
     if (ok) {
         fprintf(stderr,
-                "ds4: wrote GLM 5.3 imatrix %s from %d prompts, %d tokens, "
+                "ds4: wrote GLM imatrix %s from %d prompts, %d tokens, "
                 "%llu routes\n",
                 output_path,
                 prompts_done,
@@ -56434,7 +56574,8 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                const char *output_path,
                                int ctx_size,
                                int max_prompts,
-                               int max_tokens) {
+                               int max_tokens,
+                               int min_expert_samples) {
 #ifdef DS4_NO_GPU
     (void)e;
     (void)dataset_path;
@@ -56442,6 +56583,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     (void)ctx_size;
     (void)max_prompts;
     (void)max_tokens;
+    (void)min_expert_samples;
     fprintf(stderr, "ds4: imatrix collection requires a graph backend build\n");
     return 1;
 #else
@@ -56456,15 +56598,16 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     size_t dataset_len = 0;
     if (!imatrix_read_text_file(dataset_path, &dataset, &dataset_len)) return 1;
 
-    if (ds4_model_is_glm53()) {
-        const int rc = ds4_engine_collect_glm53_imatrix(e,
-                                                        dataset,
-                                                        dataset_len,
-                                                        dataset_path,
-                                                        output_path,
-                                                        ctx_size,
-                                                        max_prompts,
-                                                        max_tokens);
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        const int rc = ds4_engine_collect_glm_imatrix(e,
+                                                      dataset,
+                                                      dataset_len,
+                                                      dataset_path,
+                                                      output_path,
+                                                      ctx_size,
+                                                      max_prompts,
+                                                      max_tokens,
+                                                      min_expert_samples);
         free(dataset);
         return rc;
     }
@@ -56505,6 +56648,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
 
     int prompts_done = 0;
     int tokens_done = 0;
+    bool sample_target_reached = false;
     char *cursor = dataset;
     const char *marker_lit = "===== DS4_IMATRIX_PROMPT";
     while (*cursor) {
@@ -56558,18 +56702,28 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                 }
                 prompts_done++;
                 tokens_done += prompt.len;
+                sample_target_reached = min_expert_samples > 0 &&
+                    imatrix_collector_min_samples(&collector,
+                                                 weights,
+                                                 DS4_N_LAYER) >=
+                        (uint32_t)min_expert_samples;
                 if (prompts_done % 10 == 0) {
                     fprintf(stderr,
-                            "ds4: imatrix prompts=%d tokens=%d routes=%llu\r",
+                            "ds4: imatrix prompts=%d tokens=%d routes=%llu "
+                            "min_samples=%u\r",
                             prompts_done,
                             tokens_done,
-                            (unsigned long long)collector.observed_routes);
+                            (unsigned long long)collector.observed_routes,
+                            imatrix_collector_min_samples(&collector,
+                                                         weights,
+                                                         DS4_N_LAYER));
                     fflush(stderr);
                 }
             }
             token_vec_free(&prompt);
         }
         *end = saved;
+        if (sample_target_reached) break;
         if (!next) break;
         cursor = next;
         if (max_prompts > 0 && prompts_done >= max_prompts) break;
@@ -56578,7 +56732,16 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     fputc('\n', stderr);
 
     if (ok) {
-        imatrix_collector_report_coverage(&collector, weights);
+        imatrix_collector_report_coverage(&collector, weights, DS4_N_LAYER);
+        if (min_expert_samples > 0 && !sample_target_reached) {
+            fprintf(stderr,
+                    "ds4: imatrix minimum expert sample target %d "
+                    "was not reached\n",
+                    min_expert_samples);
+            ok = false;
+        }
+    }
+    if (ok) {
         ok = imatrix_collector_save(&collector, weights, output_path);
         if (ok) {
             fprintf(stderr,
@@ -59863,6 +60026,154 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
 #endif
 }
 
+static void ds4_engine_fit_glm_streaming_budget(
+        ds4_engine *e,
+        bool        load_slice,
+        uint32_t    load_layer_start,
+        uint32_t    load_layer_end,
+        bool        load_output,
+        int         ctx_size) {
+#if defined(DS4_NO_GPU)
+    (void)e;
+    (void)load_slice;
+    (void)load_layer_start;
+    (void)load_layer_end;
+    (void)load_output;
+    (void)ctx_size;
+#else
+    if (!e || !e->ssd_streaming ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA ||
+        ctx_size <= 0 || glm_graph_memory_guard_disabled()) {
+        return;
+    }
+
+    uint32_t guard_ctx = 0;
+    if (!glm_graph_context_request(ctx_size, &guard_ctx)) return;
+    const uint32_t work_ctx =
+        glm_graph_full_attention_cap(guard_ctx, true);
+    const uint32_t compact_cap =
+        glm_graph_compact_cache_initial_cap(guard_ctx, work_ctx);
+    const ds4_context_memory graph_mem = load_slice ?
+        glm_graph_context_memory_estimate_for_compact_cap_slice(
+                guard_ctx,
+                work_ctx,
+                compact_cap,
+                true,
+                load_layer_start,
+                load_layer_end) :
+        glm_graph_context_memory_estimate_for_compact_cap(
+                guard_ctx, work_ctx, compact_cap, true);
+    const uint64_t model_bytes =
+        glm_graph_model_bytes_for_guard(&e->model,
+                                        &e->weights,
+                                        true,
+                                        load_slice,
+                                        load_layer_start,
+                                        load_layer_end,
+                                        !load_slice || load_layer_start == 0,
+                                        !load_slice || load_output);
+    uint64_t budget_base = glm_graph_host_memory_bytes();
+    if (budget_base == 0) {
+        budget_base = ds4_gpu_recommended_working_set_size();
+    }
+    if (budget_base == 0) return;
+
+    const double fraction =
+        glm_graph_env_double("DS4_GLM_MEMORY_GUARD_FRACTION", 0.99, 0.50, 1.00);
+    const double reserve_gib =
+        glm_graph_env_double(
+                "DS4_GLM_MEMORY_GUARD_RESERVE_GB",
+                glm_graph_memory_guard_default_reserve_gib(
+                        budget_base, model_bytes, ds4_model_is_glm53()),
+                0.0,
+                1024.0);
+    const uint64_t budget = glm_graph_memory_guard_budget_bytes(
+            budget_base,
+            glm_graph_wired_limit_bytes(),
+            fraction,
+            reserve_gib);
+    const uint64_t fixed_bytes = glm_graph_saturating_add_u64(
+            model_bytes, graph_mem.total_bytes);
+    if (budget <= fixed_bytes) return;
+
+    const uint64_t available = budget - fixed_bytes;
+    const uint64_t current = ds4_engine_streaming_transient_guard_bytes(e);
+    if (current <= available) return;
+
+    uint64_t per_expert_bytes = 0;
+    if (!ds4_streaming_routed_expert_bytes(&e->weights,
+                                           &per_expert_bytes) ||
+        per_expert_bytes == 0) {
+        return;
+    }
+
+    const uint32_t old_full_layers = e->ssd_streaming_full_layers;
+    const uint32_t old_cache_experts = e->ssd_streaming_cache_experts;
+    const uint64_t old_prefill_headroom =
+        e->ssd_streaming_prefill_headroom_bytes;
+
+    uint32_t full_layers = old_full_layers;
+    uint64_t full_layers_bytes = e->ssd_streaming_full_layer_bytes;
+    const uint64_t min_dynamic_bytes = old_cache_experts != 0 ?
+        per_expert_bytes : 0;
+    while (full_layers != 0 &&
+           glm_graph_saturating_add_u64(
+                   glm_graph_saturating_add_u64(full_layers_bytes,
+                                                old_prefill_headroom),
+                   min_dynamic_bytes) > available) {
+        full_layers--;
+        if (full_layers == 0) {
+            full_layers_bytes = 0;
+        } else if (!ds4_glm_streaming_resident_prefix_bytes(
+                           &e->weights,
+                           g_glm_streaming_full_resident_start,
+                           full_layers,
+                           &full_layers_bytes)) {
+            return;
+        }
+    }
+
+    uint64_t prefill_headroom = old_prefill_headroom;
+    if (full_layers_bytes < available) {
+        const uint64_t after_full = available - full_layers_bytes;
+        const uint64_t max_headroom = after_full > min_dynamic_bytes ?
+            after_full - min_dynamic_bytes : 0;
+        if (prefill_headroom > max_headroom) prefill_headroom = max_headroom;
+    } else {
+        prefill_headroom = 0;
+    }
+
+    uint64_t dynamic_bytes = available - full_layers_bytes - prefill_headroom;
+    uint64_t cache_experts_u64 = dynamic_bytes / per_expert_bytes;
+    if (cache_experts_u64 > old_cache_experts) {
+        cache_experts_u64 = old_cache_experts;
+    }
+    const uint32_t cache_experts = cache_experts_u64 > UINT32_MAX ?
+        UINT32_MAX : (uint32_t)cache_experts_u64;
+    dynamic_bytes = (uint64_t)cache_experts * per_expert_bytes;
+
+    e->ssd_streaming_full_layers = full_layers;
+    e->ssd_streaming_full_layer_bytes = full_layers_bytes;
+    e->ssd_streaming_prefill_headroom_bytes = prefill_headroom;
+    e->ssd_streaming_cache_experts = cache_experts;
+    if (e->ssd_streaming_cache_bytes != 0) {
+        e->ssd_streaming_cache_bytes = dynamic_bytes;
+    }
+    g_glm_streaming_full_resident_layers = full_layers;
+
+    fprintf(stderr,
+            "ds4: GLM SSD streaming request reduced to fit memory: "
+            "full layers %u -> %u, cache %u -> %u experts, "
+            "prefill reserve %.2f -> %.2f GiB\n",
+            old_full_layers,
+            full_layers,
+            old_cache_experts,
+            cache_experts,
+            glm_graph_bytes_to_gib(old_prefill_headroom),
+            glm_graph_bytes_to_gib(prefill_headroom));
+#endif
+}
+
 static bool ds4_engine_glm_streaming_memory_guard(
         const ds4_engine *e,
         bool              load_slice,
@@ -61967,6 +62278,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
+        ds4_engine_fit_glm_streaming_budget(
+                e,
+                load_slice,
+                load_layer_start,
+                load_layer_end,
+                load_output ||
+                    (load_output_optional && weights_have_output_head(&e->weights)),
+                opt->context_size);
         if (!ds4_engine_glm_streaming_memory_guard(
                     e,
                     load_slice,
@@ -63064,6 +63383,17 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             fprintf(stderr, "ds4: invalid GLM layer slice %u:%u\n", layer_start, layer_end);
             free(s);
             return 1;
+        }
+        if (e->ssd_streaming && !e->ssd_streaming_budget_finalized) {
+            ds4_engine_fit_glm_streaming_budget(e,
+                                                true,
+                                                layer_start,
+                                                layer_end,
+                                                require_output,
+                                                ctx_size);
+            ds4_gpu_set_streaming_expert_cache_budget(
+                    e->ssd_streaming_cache_experts);
+            e->ssd_streaming_budget_finalized = true;
         }
         s->glm_graph.placement = e->multi_tier ? e->placement : NULL;
         if (!glm_graph_alloc_slice(&s->glm_graph,

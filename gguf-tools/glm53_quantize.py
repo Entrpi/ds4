@@ -276,6 +276,7 @@ class TensorPlan:
     row_count: int | None = None
     expert_layer: int | None = None
     expert_part: str | None = None
+    expert_count: int | None = None
     transform: str | None = None
     raw_copy: bool = False
     expert_scale: bool = False
@@ -288,11 +289,11 @@ class TensorPlan:
 
 
 class SourceDB:
-    def __init__(self, hf_dir):
+    def __init__(self, hf_dir, index_validator=validate_glm53_index):
         self.hf_dir = hf_dir
         index_path = os.path.join(hf_dir, "model.safetensors.index.json")
         document, self.weight_map = load_index(index_path)
-        validate_glm53_index(self.weight_map)
+        index_validator(self.weight_map)
         self.declared_bytes = document.get("metadata", {}).get("total_size")
         self.tensors = {}
         self._fds = {}
@@ -405,8 +406,10 @@ def add_experts(plan, db, layer, part, qtype):
         (shape[1], shape[0], 288),
         qtype,
         f"routed_{part}",
+        source=f"{source_prefix(layer)}.mlp.experts.{{expert}}.{part}_proj.weight",
         expert_layer=layer,
         expert_part=part,
+        expert_count=288,
     )
     item.nbytes = qtype_nbytes(qtype, item.shape)
     plan.append(item)
@@ -545,10 +548,8 @@ def native_fp8_plan(db, plan):
     covered = set()
     for item in plan:
         if item.is_expert:
-            first = (
-                f"{source_prefix(item.expert_layer)}.mlp.experts.0."
-                f"{item.expert_part}_proj.weight"
-            )
+            expert_count = item.expert_count or 288
+            first = item.source.format(expert=0)
             info = db.info(first)
             if info["dtype"] != "F8_E4M3":
                 fail(f"native expert source is not FP8 E4M3: {first}")
@@ -561,21 +562,20 @@ def native_fp8_plan(db, plan):
                 fail(f"native FP8 scale is not F32: {first}_scale_inv")
             scale = TensorPlan(
                 item.name + "_scale_inv",
-                (scale_info["shape"][1], scale_info["shape"][0], 288),
+                (scale_info["shape"][1], scale_info["shape"][0], expert_count),
                 QTYPE_F32,
                 item.role + "_scale",
+                source=item.source,
                 expert_layer=item.expert_layer,
                 expert_part=item.expert_part,
+                expert_count=expert_count,
                 raw_copy=True,
                 expert_scale=True,
             )
             scale.nbytes = qtype_nbytes(scale.qtype, scale.shape)
             native.append(scale)
-            for expert in range(288):
-                source = (
-                    f"{source_prefix(item.expert_layer)}.mlp.experts.{expert}."
-                    f"{item.expert_part}_proj.weight"
-                )
+            for expert in range(expert_count):
+                source = item.source.format(expert=expert)
                 if db.info(source)["dtype"] != "F8_E4M3":
                     fail(f"native expert source is not FP8 E4M3: {source}")
                 if db.info(source)["shape"] != info["shape"]:
@@ -796,7 +796,7 @@ class Quantizer:
         elif info["dtype"] == "F16":
             array = np.frombuffer(raw, dtype="<f2").astype(np.float32).reshape(shape)
         elif info["dtype"] == "F8_E4M3":
-            if len(shape) != 2 or shape[0] % 128 or shape[1] % 128:
+            if len(shape) != 2:
                 fail(f"unsupported FP8 shape for {name}: {shape}")
             codes = np.frombuffer(raw, dtype=np.uint8).reshape(shape)
             if np.any((codes & 0x7F) == 0x7F):
@@ -805,8 +805,15 @@ class Quantizer:
             scale_info = db.info(scale_name)
             if scale_info["dtype"] != "F32":
                 fail(f"{scale_name} is not F32")
+            expected_scale_shape = [(dim + 127) // 128 for dim in shape]
+            if scale_info["shape"] != expected_scale_shape:
+                fail(
+                    f"{scale_name} has shape {scale_info['shape']}, "
+                    f"expected {expected_scale_shape}"
+                )
             scales = np.frombuffer(db.read(scale_name), dtype="<f4").reshape(scale_info["shape"])
             expanded = np.repeat(np.repeat(scales, 128, axis=0), 128, axis=1)
+            expanded = expanded[: shape[0], : shape[1]]
             array = self.fp8_lut[codes] * expanded
         else:
             fail(f"unsupported source dtype {info['dtype']} for {name}")
@@ -879,11 +886,11 @@ class Imatrix:
                     fail(f"nonfinite imatrix values for {name}")
                 self.entries[name] = values
 
-    def expert(self, tensor_name, expert, width):
+    def expert(self, tensor_name, expert, width, expert_count=288):
         values = self.entries.get(tensor_name)
         if values is None:
             return None
-        expected = 288 * width
+        expected = expert_count * width
         if values.size != expected:
             fail(f"imatrix {tensor_name} has {values.size} values, expected {expected}")
         result = values[expert * width : (expert + 1) * width]
@@ -928,23 +935,32 @@ def transform_regular(values, item):
         return values
     if item.transform not in ("kv_b_k", "kv_b_v"):
         fail(f"unknown transform {item.transform} for {item.name}")
-    if values.shape != (64 * 512, 512):
-        fail(f"{item.name}: expected combined kv_b shape (32768, 512), got {values.shape}")
-    per_head = values.reshape(64, 512, 512)
+    if values.ndim != 2 or len(item.shape) != 3:
+        fail(f"{item.name}: invalid combined kv_b shapes {values.shape} -> {item.shape}")
+    n_head = item.shape[2]
+    rank = item.shape[1] if item.transform == "kv_b_k" else item.shape[0]
+    selected = item.shape[0] if item.transform == "kv_b_k" else item.shape[1]
+    if values.shape[1] != rank or values.shape[0] % n_head:
+        fail(f"{item.name}: invalid combined kv_b shape {values.shape}")
+    combined = values.shape[0] // n_head
+    other = combined - selected
+    if other <= 0:
+        fail(f"{item.name}: invalid combined kv_b dimensions {combined} and {selected}")
+    k_dim = selected if item.transform == "kv_b_k" else other
+    v_dim = other if item.transform == "kv_b_k" else selected
+    per_head = values.reshape(n_head, k_dim + v_dim, rank)
     if item.transform == "kv_b_k":
-        return per_head[:, :256, :].transpose(0, 2, 1).copy()
-    return per_head[:, 256:, :].copy()
+        return per_head[:, :k_dim, :].transpose(0, 2, 1).copy()
+    return per_head[:, k_dim:, :].copy()
 
 
 def iter_native_tensor_bytes(item, db, np):
     if not item.raw_copy:
         fail(f"{item.name}: tensor is not a native payload")
     if item.is_expert:
-        for expert in range(288):
-            source = (
-                f"{source_prefix(item.expert_layer)}.mlp.experts.{expert}."
-                f"{item.expert_part}_proj.weight"
-            )
+        expert_count = item.expert_count or 288
+        for expert in range(expert_count):
+            source = item.source.format(expert=expert)
             if item.expert_scale:
                 source += "_scale_inv"
             yield from db.iter_read(source)
@@ -981,26 +997,25 @@ def write_regular(fp, item, db, quantizer):
 
 
 def write_experts(fp, item, db, quantizer, imatrix, threads):
-    layer = item.expert_layer
-    part = item.expert_part
+    expert_count = item.expert_count or 288
     width = item.shape[0]
 
     def convert(expert):
-        source = f"{source_prefix(layer)}.mlp.experts.{expert}.{part}_proj.weight"
+        source = item.source.format(expert=expert)
         if item.raw_copy:
             if item.expert_scale:
                 source += "_scale_inv"
             return db.read(source), False
         values = quantizer.to_f32(db, source)
-        weights = imatrix.expert(item.name, expert, width)
+        weights = imatrix.expert(item.name, expert, width, expert_count)
         return quantizer.encode(values, item.qtype, weights), weights is None
 
-    per_expert = item.nbytes // 288
+    per_expert = item.nbytes // expert_count
     fallback_count = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
         window = max(threads * 2, 1)
-        for start in range(0, 288, window):
-            futures = [executor.submit(convert, expert) for expert in range(start, min(start + window, 288))]
+        for start in range(0, expert_count, window):
+            futures = [executor.submit(convert, expert) for expert in range(start, min(start + window, expert_count))]
             for future in futures:
                 data, fallback = future.result()
                 fallback_count += int(fallback)
@@ -1010,12 +1025,22 @@ def write_experts(fp, item, db, quantizer, imatrix, threads):
     if imatrix.entries and fallback_count:
         print(
             f"glm53-quantize: {item.name} used weight-based fallback for "
-            f"{fallback_count}/288 unobserved experts",
+            f"{fallback_count}/{expert_count} unobserved experts",
             file=sys.stderr,
         )
 
 
-def conversion_signature(plan, kv_records, tokenizer_records):
+def file_sha256(path):
+    if not path:
+        return None
+    digest = hashlib.sha256()
+    with open(path, "rb") as fp:
+        while chunk := fp.read(8 << 20):
+            digest.update(chunk)
+    return digest.digest()
+
+
+def conversion_signature(plan, kv_records, tokenizer_records, imatrix_path=None):
     digest = hashlib.sha256()
     for record in kv_records + tokenizer_records:
         digest.update(record)
@@ -1023,7 +1048,12 @@ def conversion_signature(plan, kv_records, tokenizer_records):
         digest.update(tensor_header(item))
         digest.update((item.source or "").encode())
         digest.update((item.transform or "").encode())
+        digest.update(struct.pack("<I", item.expert_count or 0))
         digest.update(bytes((item.raw_copy, item.expert_scale)))
+    imatrix_digest = file_sha256(imatrix_path)
+    if imatrix_digest is not None:
+        digest.update(b"imatrix\0")
+        digest.update(imatrix_digest)
     return digest.hexdigest()
 
 
@@ -1066,7 +1096,7 @@ def write_gguf(args, plan, kv_records, tokenizer_records, db):
 
     partial = args.out + ".partial"
     resume_path = partial + ".resume.json"
-    signature = conversion_signature(plan, kv_records, tokenizer_records)
+    signature = conversion_signature(plan, kv_records, tokenizer_records, args.imatrix)
     if os.path.exists(args.out) and not args.overwrite:
         fail(f"output exists: {args.out}; use --overwrite")
     if args.overwrite:

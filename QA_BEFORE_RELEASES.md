@@ -672,6 +672,38 @@ SSD streaming is a capacity path, so test both correctness and user experience.
   repeated expert misses for a small interactive prompt.
 - If streaming cache internals changed, test the same prompt twice and compare
   first-token/logprob sanity between runs.
+- On an idle M5 Max, run the full GLM 5.3 Q2 SSD-streaming regression with the
+  16 GiB expert budget. Use the release GGUF and verify its checksum before
+  comparing results. The current reference file is
+  `GLM-5.3-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf`, SHA-256
+  `059b36accd4c9acf73099da9f703b574d627869d619b7c4c316aa856e33d472e`.
+  Discard one warm-up run, then take the median of three runs of each command:
+
+  ```sh
+  GLM_SSD_MODEL=/path/to/GLM-5.3-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf
+
+  ./ds4 -m "$GLM_SSD_MODEL" --ssd-streaming \
+    --ssd-streaming-cache-experts 16GB --ctx 1024 --tokens 16 \
+    --nothink --temp 0 --seed 1 \
+    -p "$(head -c 2500 tests/test-vectors/glm-openrouter/prompts/long_memory_archive.txt)"
+
+  ./ds4 -m "$GLM_SSD_MODEL" --ssd-streaming \
+    --ssd-streaming-cache-experts 16GB --ctx 1024 --tokens 64 \
+    --nothink --temp 0 --seed 1 \
+    -p "Write the word apple exactly 100 times, separated by one space. Do not stop early and output nothing else."
+  ```
+
+  The first command must report 463 input tokens, produce a coherent answer
+  about component gamma, and keep median prefill at or above 11.3 t/s. The
+  second must emit all 64 requested output tokens and keep median generation at
+  or above 5.5 t/s. The M5 Max reference medians are 12.59 and 6.14 t/s. Startup
+  should plan about 18.03 GiB at this context and initially restrict the model
+  map to the token embedding. GLM must demand-fill its expert cache by default;
+  an ordinary run and `--ssd-streaming-cold` should have comparable cache-miss
+  counts and speed unless an explicit preload count or diagnostic cap is used.
+  A memory guard or static decode map that accounts nearly the full 196.58 GiB
+  GGUF, a Metal OOM, repeated garbage tokens, or a compact-attention result
+  that omits the RoPE score is a release blocker.
 
 ## 8. CUDA / DGX Spark
 
@@ -966,6 +998,7 @@ claims across different models or contexts.
 | Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.2 IQ2_XXS, 4,096-token prefill and 256-token teacher-forced decode | about 214 t/s | about 16.7 t/s |
 | MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, resident short prompt | 86.68 t/s | 34.45 t/s; 41.97 t/s greedy MTP |
 | MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, 8,192-token compact-attention prompt | 479.09 t/s | 29.89 t/s steady |
+| MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 full Q2, SSD streaming with 16 GiB expert budget; 463-token prefill / forced 64-token decode | 12.59 t/s median | 6.14 t/s median |
 | Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.3 Flash Q2, short prompt | 29.06 t/s | 32.70 t/s |
 | MacBook Pro M5 Max 128 GB, Metal | GLM 5.3 Flash Q2, 24,988/49,948-token long prompts | 424.80 / 421.75 t/s | 29.50 / 28.10 t/s |
 | Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.3 Flash Q2, 10,819-token prompt | 468.97 t/s | 22.85 t/s |

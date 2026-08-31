@@ -240,6 +240,62 @@ def validate_glm53_index(weight_map):
         fail(f"missing required tensors: {missing}")
 
 
+def validate_glm53_full_index(weight_map):
+    names = set(weight_map)
+    layers = set()
+    indexer_layers = set()
+    sparse_layers = set()
+    expert_ids = {}
+    expert_parts = {}
+    layer_re = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
+    expert_re = re.compile(r"^mlp\.experts\.(\d+)\.(gate|up|down)_proj\.weight$")
+
+    allowed_top = {"model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"}
+    for name in names:
+        match = layer_re.match(name)
+        if not match:
+            if name not in allowed_top and not name.endswith("_scale_inv"):
+                fail(f"unknown full GLM-5.3 tensor: {name}")
+            continue
+        layer = int(match.group(1))
+        tail = match.group(2)
+        layers.add(layer)
+        if tail == "self_attn.indexer.wk.weight":
+            indexer_layers.add(layer)
+        expert = expert_re.match(tail)
+        if expert:
+            sparse_layers.add(layer)
+            expert_id = int(expert.group(1))
+            expert_ids.setdefault(layer, set()).add(expert_id)
+            expert_parts.setdefault((layer, expert_id), set()).add(expert.group(2))
+
+    expect_equal(layers, set(range(79)), "full GLM-5.3 layer set")
+    expect_equal(sparse_layers, set(range(3, 79)), "full GLM-5.3 sparse FFN layer set")
+    expected_indexers = {0, 1, 2, 78} | set(range(6, 78, 4))
+    expect_equal(indexer_layers, expected_indexers, "full GLM-5.3 indexer owner layers")
+    for layer in range(3, 79):
+        expect_equal(expert_ids.get(layer), set(range(256)), f"layer {layer} expert ids")
+        for expert in range(256):
+            expect_equal(
+                expert_parts.get((layer, expert)),
+                {"gate", "up", "down"},
+                f"layer {layer} expert {expert} projections",
+            )
+
+    required = {
+        "model.embed_tokens.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+        "model.layers.78.eh_proj.weight",
+        "model.layers.78.enorm.weight",
+        "model.layers.78.hnorm.weight",
+        "model.layers.78.shared_head.norm.weight",
+    }
+    missing = sorted(required - names)
+    if missing:
+        fail(f"missing required full GLM-5.3 tensors: {missing}")
+
+
 def validate_fp8_scales(tensors):
     for name, info in tensors.items():
         if info["dtype"] != "F8_E4M3" or not name.endswith(".weight"):

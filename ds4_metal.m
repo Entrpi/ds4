@@ -28513,7 +28513,7 @@ int ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
     if (!lora_out || !qk_low || !kv_lora_cache ||
         n_q == 0 || n_kv == 0 || n_kv > cache_cap ||
         q_row0 >= n_kv || n_q > n_kv - q_row0 ||
-        !cache_f16 || n_head == 0 || kv_lora_dim != 512u || qk_dim == 0) {
+        n_head == 0 || kv_lora_dim != 512u || qk_dim == 0) {
         return 0;
     }
 
@@ -28535,7 +28535,7 @@ int ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
                 0,
                 n_head,
                 kv_lora_dim,
-                true,
+                cache_f16,
                 false,
                 1.0f / sqrtf((float)qk_dim))) {
             return 0;
@@ -35635,7 +35635,7 @@ int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
         pos0 > n_selected || n_tokens > n_selected - pos0 ||
         n_head == 0 || kv_lora_dim != 512u ||
         qk_nope == 0 || (qk_rope != 0u && qk_rope != 64u) ||
-        qk_dim < qk_nope || !cache_f16 ||
+        qk_dim < qk_nope ||
         (qk_rope != 0u && (!isfinite(freq_base) || freq_base <= 0.0f)) ||
         (qk_rope != 0u && (!isfinite(freq_scale) || freq_scale <= 0.0f)) ||
         !isfinite(ext_factor) || !isfinite(attn_factor) ||
@@ -35649,7 +35649,8 @@ int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
         id<MTLBuffer> lowbuf = ds4_gpu_tensor_buffer(qk_low);
         id<MTLBuffer> kvcachebuf = ds4_gpu_tensor_buffer(kv_lora_cache);
         id<MTLBuffer> ropecachebuf = ds4_gpu_tensor_buffer(k_rope_cache);
-        const uint64_t cache_elem_bytes = sizeof(uint16_t);
+        const uint64_t cache_elem_bytes =
+            cache_f16 ? sizeof(uint16_t) : sizeof(float);
         const uint64_t lora_bytes =
             (uint64_t)n_tokens * n_head * kv_lora_dim * sizeof(float);
         const uint64_t q_bytes =
@@ -35688,7 +35689,7 @@ int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
             .n_tokens = n_tokens,
             .n_selected = n_selected,
             .cache_cap = cache_cap,
-            .cache_f16 = 1u,
+            .cache_f16 = cache_f16 ? 1u : 0u,
             .n_head = n_head,
             .kv_lora_dim = kv_lora_dim,
             .qk_nope = qk_nope,

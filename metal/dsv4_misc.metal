@@ -3993,7 +3993,6 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_causal_impl(
     const uint head = tgpig.x * group_heads + head_in_group + args.head_base;
     if (token >= args.n_tokens ||
         args.n_selected == 0u ||
-        args.cache_f16 == 0u ||
         args.kv_lora_dim != 512u ||
         (args.qk_rope != 0u && args.qk_rope != 64u)) {
         return;
@@ -4062,10 +4061,17 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_causal_impl(
             const uint rr = off / kv_vecs;
             const uint vv = off - rr * kv_vecs;
             const uint row = base + rr;
-            device const half4 *src =
-                (device const half4 *)((device const half *)kv_lora_cache +
-                    (uint64_t)row * args.kv_lora_dim);
-            kv_shared[off] = src[vv];
+            if (args.cache_f16 != 0u) {
+                device const half4 *src =
+                    (device const half4 *)((device const half *)kv_lora_cache +
+                        (uint64_t)row * args.kv_lora_dim);
+                kv_shared[off] = src[vv];
+            } else {
+                device const float4 *src =
+                    (device const float4 *)((device const float *)kv_lora_cache +
+                        (uint64_t)row * args.kv_lora_dim);
+                kv_shared[off] = (half4)src[vv];
+            }
         }
         for (uint off = tid; off < rows * rope_vecs; off += 256u) {
             const uint rr = off / rope_vecs;
@@ -4074,29 +4080,31 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_causal_impl(
             const uint row = base + rr;
             const uint64_t rope_base = (uint64_t)row * args.qk_rope;
             const float2 y0 =
-                glm_cache_load_rotated_rope_pair_f16_only(k_rope_cache,
-                                                          rope_base,
-                                                          r,
-                                                          row,
-                                                          args.qk_rope,
-                                                          args.freq_base,
-                                                          args.freq_scale,
-                                                          args.ext_factor,
-                                                          args.attn_factor,
-                                                          corr_dims[0],
-                                                          corr_dims[1]);
+                glm_cache_load_rotated_rope_pair(k_rope_cache,
+                                                 rope_base,
+                                                 r,
+                                                 row,
+                                                 args.qk_rope,
+                                                 args.cache_f16,
+                                                 args.freq_base,
+                                                 args.freq_scale,
+                                                 args.ext_factor,
+                                                 args.attn_factor,
+                                                 corr_dims[0],
+                                                 corr_dims[1]);
             const float2 y1 =
-                glm_cache_load_rotated_rope_pair_f16_only(k_rope_cache,
-                                                          rope_base,
-                                                          r + 2u,
-                                                          row,
-                                                          args.qk_rope,
-                                                          args.freq_base,
-                                                          args.freq_scale,
-                                                          args.ext_factor,
-                                                          args.attn_factor,
-                                                          corr_dims[0],
-                                                          corr_dims[1]);
+                glm_cache_load_rotated_rope_pair(k_rope_cache,
+                                                 rope_base,
+                                                 r + 2u,
+                                                 row,
+                                                 args.qk_rope,
+                                                 args.cache_f16,
+                                                 args.freq_base,
+                                                 args.freq_scale,
+                                                 args.ext_factor,
+                                                 args.attn_factor,
+                                                 corr_dims[0],
+                                                 corr_dims[1]);
             rope_shared[off] = float4(y0.x, y0.y, y1.x, y1.y);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
