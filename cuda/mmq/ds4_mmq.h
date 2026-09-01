@@ -882,11 +882,12 @@ int ds4_mmq_q4_K_dense_pair_vec(
     int           K,
     cudaStream_t  stream);
 
-// Set the thread-local stream that the internal cuda pool uses for
-// cudaMallocAsync / cudaFreeAsync.  Defaults to cudaStreamPerThread.
+// Set the thread-local stream used for internal stream-ordered scratch.
+// Defaults to cudaStreamPerThread.
 // Step 8 (CUDA Graphs) calls this with the capture stream so pool
 // allocations land on the captured stream and don't invalidate capture.
-// Pass NULL to reset to cudaStreamPerThread.
+// Pass cudaStreamPerThread to restore the default; NULL selects the legacy
+// default stream.
 void ds4_pool_set_stream(cudaStream_t stream);
 
 #ifdef __cplusplus

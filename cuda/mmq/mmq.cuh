@@ -3692,6 +3692,10 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int ITER_K          = get_iter_k(type);
     constexpr int blocks_per_iter = ITER_K / qk;
+    // Invalid columns must be zero before the matrix instruction. Masking
+    // only write-back is too late: stale or NaN tail blocks can contaminate
+    // other values in the same hardware matrix fragment.
+    const int valid_y_words = min(mmq_x, tile_y_max_j + 1) * MMQ_TILE_Y_K;
 
     float sum[mmq_x*mmq_y / (nwarps*warp_size)] = {0.0f};
 
@@ -3725,7 +3729,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                tile_y[l] = l < valid_y_words ? by0[l] : 0;
             }
         }
 
@@ -3741,7 +3745,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
             for (int l0 = 0; l0 < mmq_x * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                tile_y[l] = l < valid_y_words ? by0[l] : 0;
             }
         }
 

@@ -4,8 +4,8 @@
 // new_pool_for_device that the vendored common.cuh declares without
 // defining.
 //
-// Phase 0: pool is plain cudaMallocAsync / cudaFreeAsync. Phase 4 swaps
-// in ds4's existing cuda_tmp_alloc slab allocator.
+// CUDA uses stream-ordered allocation. HIP retains stream-local allocations
+// because returning live MMQ scratch to its asynchronous pool is unreliable.
 
 #include "common.cuh"   // pulls in ds4_ggml_stubs.h via redirect headers
 
@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 // ----------------------------------------------------------------------------
 // Device info singleton.
@@ -112,7 +113,7 @@ int64_t ggml_time_us() {
 }
 
 // ----------------------------------------------------------------------------
-// Concrete pool wrapping cudaMallocAsync / cudaFreeAsync.
+// Concrete device scratch pool.
 // ----------------------------------------------------------------------------
 
 namespace {
@@ -143,19 +144,77 @@ struct ds4_naive_pool : public ggml_cuda_pool {
 
     explicit ds4_naive_pool(int device) : device(device) {}
 
+#if defined(GGML_USE_HIP)
+    struct cached_block {
+        void *ptr;
+        size_t size;
+        cudaStream_t stream;
+    };
+
+    std::mutex mutex;
+    std::vector<cached_block> available;
+    std::vector<void *> owned;
+#endif
+
     void * alloc(size_t size, size_t * actual_size) override {
         ggml_cuda_set_device(device);
+#if defined(GGML_USE_HIP)
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            size_t best = available.size();
+            for (size_t i = 0; i < available.size(); i++) {
+                if (available[i].stream != t_ds4_pool_stream ||
+                    available[i].size < size) {
+                    continue;
+                }
+                if (best == available.size() ||
+                    available[i].size < available[best].size) {
+                    best = i;
+                }
+            }
+            if (best != available.size()) {
+                const cached_block block = available[best];
+                available[best] = available.back();
+                available.pop_back();
+                if (actual_size) *actual_size = block.size;
+                return block.ptr;
+            }
+        }
+
+        void * ptr = nullptr;
+        CUDA_CHECK(cudaMallocAsync(&ptr, size, t_ds4_pool_stream));
+        {
+            std::lock_guard<std::mutex> guard(mutex);
+            owned.push_back(ptr);
+        }
+        if (actual_size) *actual_size = size;
+        return ptr;
+#else
         void * ptr = nullptr;
         CUDA_CHECK(cudaMallocAsync(&ptr, size, t_ds4_pool_stream));
         if (actual_size) *actual_size = size;
         return ptr;
+#endif
     }
 
-    void free(void * ptr, size_t /*size*/) override {
+    void free(void * ptr, size_t size) override {
         if (!ptr) return;
         ggml_cuda_set_device(device);
+#if defined(GGML_USE_HIP)
+        std::lock_guard<std::mutex> guard(mutex);
+        available.push_back({ptr, size, t_ds4_pool_stream});
+#else
         CUDA_CHECK(cudaFreeAsync(ptr, t_ds4_pool_stream));
+#endif
     }
+
+#if defined(GGML_USE_HIP)
+    ~ds4_naive_pool() override {
+        ggml_cuda_set_device(device);
+        (void)cudaDeviceSynchronize();
+        for (void *ptr : owned) (void)cudaFree(ptr);
+    }
+#endif
 };
 
 } // anonymous namespace

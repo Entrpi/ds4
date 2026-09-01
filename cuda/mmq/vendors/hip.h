@@ -115,6 +115,7 @@
 #define CUmemAllocationProp hipMemAllocationProp
 #define cuDeviceGetAttribute hipDeviceGetAttribute
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
+#define cudaStreamCreate hipStreamCreate
 #define cudaStreamDestroy hipStreamDestroy
 #define cudaStreamFireAndForget hipStreamFireAndForget
 #define cudaStreamNonBlocking hipStreamNonBlocking
