@@ -10330,6 +10330,12 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     pthread_mutex_lock(&s->inference_mu);
+    /* Disk payloads intentionally carry no image identity. If this slot held
+     * vision state, discard it before restoring a text-only checkpoint so the
+     * next sync does not reject the fresh payload as a stale image match. */
+    if (ds4_session_has_vision_state(slot->session)) {
+        ds4_session_invalidate(slot->session);
+    }
     pthread_mutex_lock(&s->kv_mu);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
                                            prompt_text, effective_prompt, &lr,
@@ -12045,13 +12051,26 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         if (rewind_to >= 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_rewind(slot->session, rewind_to);
+            const bool rewind_valid =
+                ds4_session_common_prefix(slot->session, &j->req.prompt) ==
+                    rewind_to &&
+                (!multimodal ||
+                 ds4_session_vision_state_matches(slot->session,
+                                                  j->req.images,
+                                                  j->req.image_count));
             pthread_mutex_unlock(&s->inference_mu);
-            cached = rewind_to;
-            cache_source = "memory-rewind";
-            cache_diag.rewind_to = rewind_to;
-            server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
-                       old_pos, rewind_to);
+            if (rewind_valid) {
+                cached = rewind_to;
+                cache_source = "memory-rewind";
+                cache_diag.rewind_to = rewind_to;
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
+                           old_pos, rewind_to);
+            } else {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: GLM live prefix rewind from %d to %d requires rebuild",
+                           old_pos, rewind_to);
+            }
         } else {
             cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
             cache_source = cached > 0 ? "memory-token" : "none";

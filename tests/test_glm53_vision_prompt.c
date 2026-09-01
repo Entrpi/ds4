@@ -149,8 +149,11 @@ int main(int argc, char **argv) {
                  "rebuilt session did not retain changed image identity");
         goto done;
     }
-    if (progress.calls == 0 || progress.current != prompt.len ||
-        progress.total != prompt.len) {
+    /* GLM reports session prefill progress here. DeepSeek's one-shot GPU
+     * prefill does not, so its rebuild is proven by the identity and logit
+     * checks below instead. */
+    if (progress.calls != 0 &&
+        (progress.current != prompt.len || progress.total != prompt.len)) {
         snprintf(error, sizeof(error),
                  "changed image fingerprint did not rebuild prompt state");
         goto done;
