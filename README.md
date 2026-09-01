@@ -3,7 +3,8 @@
 </p>
 
 **DwarfStar** is a small native inference engine optimized first for
-**DeepSeek V4 Flash**. It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, and,
+**DeepSeek V4 Flash** (including the experimental vision model).
+It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, and,
 on very high-memory machines, **DeepSeek V4 PRO**. It is self-contained and
 deliberately narrow, not a general GGUF runner. Model loading, prompt rendering,
 tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
@@ -23,6 +24,12 @@ other contributors.
 Model support is intentionally opportunistic. The project follows the best open
 weights for useful local machine sizes, especially 128 GB laptops and 512 GB
 workstations. A model may be removed when a better replacement arrives.
+
+The project has first class support for SSD streaming of weights, so it is
+possible to run models bigger than RAM while often still getting decent
+performances, and even running very large models (like the full GLM 5.3 or DeepSeek v4 PRO)
+on systems with just 128GB of RAM at a slower speed, but fast enough for
+QA-style chats.
 
 # So, what can I do with this software?
 
@@ -208,6 +215,31 @@ For ROCm packages, GTT configuration and the reproducible ROCm 10.0 container bu
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.
+
+## DeepSeek V4 Flash Vision Experimental
+
+Vision-Exp is a separate DeepSeek checkpoint, not the 0731 text model. It uses
+a matching language GGUF and a 0.9 GiB vision encoder. The Q2 model is the
+recommended version for 96 and 128 GB systems:
+
+```sh
+./download_model.sh ds4f-vision-q2
+./ds4 --vision gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf
+```
+
+Use `/read image.png` in the interactive CLI. The same `--vision` option gives
+`ds4-agent` its `view_image` tool and enables image input through `ds4-server`.
+PNG and JPEG are supported. The Q2 path is validated on Metal, single-GPU CUDA
+including DGX Spark, and ROCm. Larger `ds4f-vision-q2-q4` and
+`ds4f-vision-mxfp4` downloads are also available.
+
+Vision-Exp has its own DSpark checkpoint. Do not use the 0731 support model:
+
+```sh
+./download_model.sh ds4f-vision-dspark
+./ds4 --vision gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf --dspark \
+  --mtp-model gguf/DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf
+```
 
 ## GLM 5.3 Flash
 
