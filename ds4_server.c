@@ -9126,7 +9126,6 @@ struct server {
     job *tail;
     bool stopping;
     int clients;
-    uint64_t seq;
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
@@ -11945,13 +11944,6 @@ static void *decode_worker_main(void *arg) {
     return NULL;
 }
 
-static uint64_t server_next_sequence(server *s) {
-    pthread_mutex_lock(&s->mu);
-    uint64_t seq = ++s->seq;
-    pthread_mutex_unlock(&s->mu);
-    return seq;
-}
-
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -12332,11 +12324,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                              cold_store_len);
         }
     }
-    const uint64_t response_seq = server_next_sequence(s);
     char id[96];
-    snprintf(id, sizeof(id), "%s-%llu",
-             j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
-             (unsigned long long)response_seq);
+    responses_random_id(id, sizeof(id),
+                        j->req.kind == REQ_CHAT ? "chatcmpl-" : "cmpl-");
 
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
@@ -12410,9 +12400,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
 
     bool dsml_recovery_attempted = false;
-    uint64_t rng = j->req.seed ? j->req.seed :
-        (((uint64_t)time(NULL) << 32) ^ (response_seq << 1) ^
-         (uint64_t)(uintptr_t)j);
+    uint64_t rng = j->req.seed;
+    if (!rng && !random_bytes(&rng, sizeof(rng))) {
+        rng = ((uint64_t)time(NULL) << 32) ^ (uint64_t)(uintptr_t)j;
+    }
+    if (!rng) rng = UINT64_C(0x9e3779b97f4a7c15);
 decode_again:
     ;
     buf text = {0};
