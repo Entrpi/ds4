@@ -196,6 +196,8 @@ typedef enum {
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
     DS4_TP_FRAME_SYNC_MULTIMODAL = 18,
+    DS4_TP_FRAME_RDMA_WARM = 19,
+    DS4_TP_FRAME_RDMA_POSTED = 20,
 } ds4_tp_frame_type;
 
 typedef struct {

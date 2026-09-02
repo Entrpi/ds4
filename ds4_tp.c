@@ -117,6 +117,7 @@ typedef struct {
     struct ibv_qp *(*create_qp)(struct ibv_pd *, struct ibv_qp_init_attr *);
     int (*destroy_qp)(struct ibv_qp *);
     int (*modify_qp)(struct ibv_qp *, struct ibv_qp_attr *, int);
+    int (*query_qp)(struct ibv_qp *, struct ibv_qp_attr *, int, struct ibv_qp_init_attr *);
 } ds4_tp_verbs_api;
 
 /* AppleThunderboltRDMA quirks (validated with scratchpad probes,
@@ -151,6 +152,8 @@ typedef struct {
     uint64_t recv_done;         /* highest gate seq whose recv completed */
     uint64_t last_gate_seq;     /* last real decode receive consumed */
     bool recv_window_active;    /* decode recvs are queued ahead */
+    int warm_failed;            /* last warm-up round failed (dead direction) */
+    uint32_t setup_attempt;     /* queue pair recreations so far */
     pthread_mutex_t post_lock;
 } ds4_tp_rdma;
 #endif
@@ -645,6 +648,7 @@ static int tp_rdma_load_api(ds4_tp_verbs_api *api) {
     TP_SYM(create_qp, "ibv_create_qp");
     TP_SYM(destroy_qp, "ibv_destroy_qp");
     TP_SYM(modify_qp, "ibv_modify_qp");
+    TP_SYM(query_qp, "ibv_query_qp");
 #undef TP_SYM
     api->handle = h;
     return 1;
@@ -763,13 +767,164 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     return 1;
 }
 
+#define DS4_TP_RDMA_WARM_WR_TAG (UINT64_C(1) << 62)
+
+static const char *tp_wc_status_str(int status);
+
+/* Warm-up round after the ready barrier.  A fresh UC queue pair over
+ * Thunderbolt RDMA sometimes cannot deliver in one direction at all, and UC
+ * never reports a lost message: such runs timed out at the first bulk round
+ * with no completions.  This round proves both directions before any real
+ * traffic (the caller recreates the queue pair when it fails).  Each side posts exactly one full-size receive and resends
+ * a tagged message until the peer confirms receipt over the control
+ * channel.  A dropped UC message never arrives late, so once both sides
+ * have received, no stray message can reach the receive queue. */
+/* "Receives posted" barrier.  On Apple's Thunderbolt RDMA a UC send that
+ * reaches a queue pair with no receive posted is not just lost: that
+ * direction of the pair stops delivering for good.  Every sender therefore
+ * waits for the peer's word that its receives are posted before posting
+ * sends (one control-channel round trip). */
+static int tp_rdma_posted_barrier(ds4_tp *tp, uint32_t tag) {
+    uint32_t t = 0, b = 0, theirs = 0;
+    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_POSTED, &tag, sizeof(tag))) return 0;
+    if (!tp_read_frame_header(tp->control_fd, &t, &b) ||
+        t != DS4_TP_FRAME_RDMA_POSTED || b != sizeof(theirs) ||
+        !tp_read_full(tp->control_fd, &theirs, sizeof(theirs)) || theirs != tag) {
+        return 0;
+    }
+    return 1;
+}
+
+static int tp_rdma_warm_up(ds4_tp *tp, char *err, size_t errlen) {
+    ds4_tp_rdma *r = &tp->rdma;
+    uint8_t *wsend = tp->slab + tp->batch_out_off;
+    uint8_t *wrecv = tp->slab + tp->batch_in_off;
+    /* Full-size message: 64 B warm messages pass on a fresh direction while
+     * the first 16 KB chunks are still dropped. */
+    const uint32_t bytes = DS4_TP_RDMA_MAX_MSG;
+    memset(wsend, 0x5A, bytes);
+    memset(wrecv, 0, bytes);
+    struct ibv_sge rsge = {
+        .addr = (uintptr_t)wrecv, .length = bytes, .lkey = r->mr->lkey,
+    };
+    struct ibv_recv_wr rwr;
+    memset(&rwr, 0, sizeof(rwr));
+    rwr.wr_id = DS4_TP_RDMA_WARM_WR_TAG;
+    rwr.sg_list = &rsge;
+    rwr.num_sge = 1;
+    struct ibv_recv_wr *bad_r = NULL;
+    if (ibv_post_recv(r->qp, &rwr, &bad_r) != 0) {
+        tp_set_err(err, errlen, "tp rdma: warm-up post_recv: %s", strerror(errno));
+        return 0;
+    }
+    if (!tp_rdma_posted_barrier(tp, 0xfeedu)) {
+        tp_set_err(err, errlen, "tp rdma: warm-up posted barrier failed");
+        return 0;
+    }
+    int got_recv = 0, peer_got = 0, attempts = 0;
+    for (int attempt = 0; attempt < 20 && !(got_recv && peer_got); attempt++) {
+        attempts = attempt + 1;
+        int send_done = peer_got;
+        if (!peer_got) {
+            struct ibv_sge ssge = {
+                .addr = (uintptr_t)wsend, .length = bytes, .lkey = r->mr->lkey,
+            };
+            struct ibv_send_wr swr;
+            memset(&swr, 0, sizeof(swr));
+            swr.wr_id = DS4_TP_RDMA_WARM_WR_TAG;
+            swr.sg_list = &ssge;
+            swr.num_sge = 1;
+            swr.opcode = IBV_WR_SEND;
+            swr.send_flags = IBV_SEND_SIGNALED;
+            struct ibv_send_wr *bad_s = NULL;
+            if (ibv_post_send(r->qp, &swr, &bad_s) != 0) {
+                tp_set_err(err, errlen, "tp rdma: warm-up post_send: %s", strerror(errno));
+                return 0;
+            }
+        }
+        const double deadline = tp_now_sec() + 0.1;
+        while (tp_now_sec() < deadline && !(send_done && got_recv)) {
+            struct ibv_wc wc[8];
+            int n = ibv_poll_cq(r->cq, 8, wc);
+            if (n < 0) {
+                tp_set_err(err, errlen, "tp rdma: warm-up poll_cq failed");
+                return 0;
+            }
+            for (int i = 0; i < n; i++) {
+                if (wc[i].status != IBV_WC_SUCCESS) {
+                    tp_set_err(err, errlen, "tp rdma: warm-up completion error: %s",
+                               tp_wc_status_str(wc[i].status));
+                    return 0;
+                }
+                if (wc[i].wr_id != DS4_TP_RDMA_WARM_WR_TAG) continue;
+                if (wc[i].opcode & IBV_WC_RECV) got_recv = 1;
+                else send_done = 1;
+            }
+        }
+        uint32_t mine = (uint32_t)got_recv, theirs = 0, t = 0, b = 0;
+        if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_WARM, &mine, sizeof(mine)) ||
+            !tp_read_frame_header(tp->control_fd, &t, &b) ||
+            t != DS4_TP_FRAME_RDMA_WARM || b != sizeof(theirs) ||
+            !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
+            tp_set_err(err, errlen, "tp rdma: warm-up status exchange failed");
+            return 0;
+        }
+        peer_got = theirs != 0;
+    }
+    if (!(got_recv && peer_got)) {
+        tp_set_err(err, errlen, "tp rdma: warm-up failed after %d attempts (recv %d, peer %d)",
+                   attempts, got_recv, peer_got);
+        r->warm_failed = 1;
+        return 0;
+    }
+    fprintf(stderr, "ds4-tp: rdma warm-up ok (%d attempt%s)\n", attempts, attempts == 1 ? "" : "s");
+    return 1;
+}
+
 static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq);
+
+/* A freshly created UC queue pair over Thunderbolt RDMA sometimes cannot
+ * deliver in one direction at all (every send silently dropped, observed
+ * right after a working run and after role swaps).  Recreating the pair
+ * (new queue pair number) and re-exchanging the info fixes it; both sides
+ * take this path in lockstep because the warm-up status exchange tells
+ * them the same outcome. */
+static int tp_rdma_recreate_qp(ds4_tp *tp, char *err, size_t errlen) {
+    ds4_tp_rdma *r = &tp->rdma;
+    if (r->qp) { r->api.destroy_qp(r->qp); r->qp = NULL; }
+    if (r->cq) { r->api.destroy_cq(r->cq); r->cq = NULL; }
+    r->cq = r->api.create_cq(r->ctx, 512, NULL, NULL, 0);
+    if (!r->cq) {
+        tp_set_err(err, errlen, "tp rdma: create_cq (retry) failed");
+        return 0;
+    }
+    struct ibv_qp_init_attr qia = {0};
+    qia.send_cq = r->cq;
+    qia.recv_cq = r->cq;
+    qia.qp_type = IBV_QPT_UC;
+    qia.cap.max_send_wr = 256;
+    qia.cap.max_recv_wr = 64;
+    qia.cap.max_send_sge = 1;
+    qia.cap.max_recv_sge = 1;
+    qia.cap.max_inline_data = 0;
+    r->qp = r->api.create_qp(r->pd, &qia);
+    if (!r->qp) {
+        tp_set_err(err, errlen, "tp rdma: create_qp (retry): %s", strerror(errno));
+        return 0;
+    }
+    r->max_inline = qia.cap.max_inline_data;
+    r->send_outstanding = 0;
+    r->recv_done = 0;
+    return 1;
+}
 
 static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     ds4_tp_rdma *r = &tp->rdma;
-    r->mr = r->api.reg_mr(r->pd, tp->slab, tp->slab_bytes,
-                          IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-                          IBV_ACCESS_REMOTE_WRITE);
+    if (!r->mr) {
+        r->mr = r->api.reg_mr(r->pd, tp->slab, tp->slab_bytes,
+                              IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                              IBV_ACCESS_REMOTE_WRITE);
+    }
     if (!r->mr) {
         tp_set_err(err, errlen, "tp rdma: reg_mr(%llu bytes): %s",
                    (unsigned long long)tp->slab_bytes, strerror(errno));
@@ -779,7 +934,7 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     mine.slab_base = (uint64_t)(uintptr_t)tp->slab;
     mine.rkey = r->mr->rkey;
     mine.qpn = r->qp->qp_num;
-    mine.psn = (uint32_t)(getpid() ^ (uintptr_t)tp) & 0xffffff;
+    mine.psn = ((uint32_t)(getpid() ^ (uintptr_t)tp) + r->setup_attempt * 0x1000u) & 0xffffff;
     mine.mtu = (uint32_t)r->port.active_mtu;
     mine.lid = r->port.lid;
     memcpy(mine.gid, r->gid.raw, 16);
@@ -858,6 +1013,8 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
         tp_set_err(err, errlen, "tp rdma: ready barrier failed");
         return 0;
     }
+    if (getenv("DS4_TP_DISABLE_RDMA_WARMUP") == NULL &&
+        !tp_rdma_warm_up(tp, err, errlen)) return 0;
     return 1;
 }
 
@@ -1228,6 +1385,13 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             return 0;
         }
         atomic_thread_fence(memory_order_release);
+        /* Known race (see tp_rdma_posted_barrier): the peer's sends for this
+         * round can reach us before these receives are posted when the peer
+         * finished the previous round earlier; the driver then stops
+         * delivering that direction and the round times out below.  A
+         * control-channel barrier here collides with the eval protocol's
+         * frames; the fix is to pre-post the next round's receives (second
+         * staging area) before sending the current round. */
         struct ibv_sge send_sge[DS4_TP_RDMA_BULK_SLOTS];
         struct ibv_send_wr send_wr[DS4_TP_RDMA_BULK_SLOTS];
         memset(send_wr, 0, sizeof(send_wr));
@@ -1280,8 +1444,19 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                     }
                     continue;
                 }
-                if (wc[i].opcode & IBV_WC_RECV) recv_done++;
-                else send_done = 1;
+                if (wc[i].opcode & IBV_WC_RECV) {
+                    const uint64_t idx = (wc[i].wr_id & ~DS4_TP_RDMA_BULK_WR_TAG) - 1u;
+                    if (idx >= chunks || wc[i].byte_len != lens[idx]) {
+                        fprintf(stderr,
+                                "ds4-tp: bulk rdma chunk %llu received %u bytes, expected %u\n",
+                                (unsigned long long)idx, wc[i].byte_len,
+                                idx < chunks ? lens[idx] : 0u);
+                        return 0;
+                    }
+                    recv_done++;
+                } else {
+                    send_done = 1;
+                }
             }
             if ((peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
                 fprintf(stderr,
@@ -1289,10 +1464,17 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 return 0;
             }
             if (tp_now_sec() > deadline) {
+                struct ibv_qp_attr qa;
+                struct ibv_qp_init_attr qia;
+                memset(&qa, 0, sizeof(qa));
+                memset(&qia, 0, sizeof(qia));
+                const int qrc = r->api.query_qp ? r->api.query_qp(r->qp, &qa, IBV_QP_STATE, &qia) : -1;
                 fprintf(stderr,
                         "ds4-tp: timeout waiting for bulk RDMA round "
-                        "(%u/%u recvs, send=%d)\n",
-                        recv_done, chunks, send_done);
+                        "(%u/%u recvs, send=%d, qp state %d%s, chunks %u x %u bytes, %s)\n",
+                        recv_done, chunks, send_done,
+                        qrc == 0 ? (int)qa.qp_state : -1, qrc == 0 ? "" : " (query failed)",
+                        chunks, chunks ? lens[0] : 0u, direct ? "direct" : "staged");
                 return 0;
             }
         }
@@ -1509,7 +1691,17 @@ int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen) {
     memset(tp->slab + tp->in_flags_off, 0, (uint64_t)tp->n_slots * 8);
     memset(tp->slab + tp->token_off, 0, 16);
 #ifdef DS4_TP_HAVE_VERBS
-    if (tp->rdma_active) return tp_rdma_register_and_exchange(tp, err, errlen);
+    if (tp->rdma_active) {
+        for (;;) {
+            tp->rdma.warm_failed = 0;
+            if (tp_rdma_register_and_exchange(tp, err, errlen)) return 1;
+            if (!tp->rdma.warm_failed || tp->rdma.setup_attempt >= 3) return 0;
+            tp->rdma.setup_attempt++;
+            fprintf(stderr, "ds4-tp: %s; recreating the queue pair (setup attempt %u)\n",
+                    err, tp->rdma.setup_attempt + 1u);
+            if (!tp_rdma_recreate_qp(tp, err, errlen)) return 0;
+        }
+    }
 #endif
     (void)err; (void)errlen;
     return 1;
