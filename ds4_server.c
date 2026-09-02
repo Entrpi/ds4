@@ -2654,6 +2654,15 @@ static bool tool_call_reminder_due(const char *tool_schemas, size_t rendered_len
            rendered_len >= g_tool_reminder_min_bytes;
 }
 
+/* Receipt predicate for the continuation log lines: does a live tail carry
+ * the reminder bytes?  Read off the exact suffix that is tokenized and
+ * appended to the live KV, so a gate observes the verdict on the fed bytes
+ * rather than inferring it from token counts.  (A tool output quoting the
+ * reminder verbatim would also match; gates keep their outputs free of it.) */
+static bool live_tail_has_reminder(const char *tail) {
+    return tail && strstr(tail, DS4_TOOL_CALL_REMINDER_TEXT) != NULL;
+}
+
 /* Core renderer.  mark_idx/mark_out are the live-tail extraction hook: when
  * mark_idx names a message index, *mark_out reports the byte offset of out at
  * the top of that message's loop iteration -- i.e. where that message's bytes
@@ -11638,6 +11647,21 @@ static void trace_piece(server *s, uint64_t id, const char *piece, size_t len) {
     pthread_mutex_unlock(&s->trace_mu);
 }
 
+/* A titled text section in the trace.  Used for the live continuation
+ * suffix: on an output-only turn the request's prompt_text is a render of
+ * the outputs alone, so the "rendered prompt" section above never shows
+ * the bytes actually appended to the live KV -- this does. */
+static void trace_section(server *s, uint64_t id, const char *title,
+                          const char *text) {
+    if (!s->trace || !id || !title) return;
+    pthread_mutex_lock(&s->trace_mu);
+    fprintf(s->trace, "\n\n--- %s ---\n", title);
+    fputs(text ? text : "", s->trace);
+    fprintf(s->trace, "\n--- end %s ---\n\n", title);
+    fflush(s->trace);
+    pthread_mutex_unlock(&s->trace_mu);
+}
+
 static void trace_event(server *s, uint64_t id, const char *fmt, ...) {
     if (!s->trace || !id) return;
     pthread_mutex_lock(&s->trace_mu);
@@ -12846,19 +12870,31 @@ static void generate_job(server *s, job *j) {
     log_flags(req_flags, sizeof(req_flags), responses_protocol,
               j->req.has_tools, false, false, false);
     if (responses_live_continuation) {
+        /* tail_bytes/reminder describe the suffix actually fed on the
+         * call-id lane (the visible-prefix lane feeds prompt_text's own
+         * remainder, so they read 0 there); the trace gets the bytes. */
+        const char *tail = responses_tool_output_continuation ?
+            j->req.responses_live_suffix_text : NULL;
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d frontier_bytes=%zu",
+                   "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d frontier_bytes=%zu tail_bytes=%zu reminder=%d",
                    responses_live_match ? responses_live_match : "unknown",
                    responses_live_match_ids,
                    cached,
                    prompt_tokens,
-                   j->req.cont_frontier_bytes);
+                   j->req.cont_frontier_bytes,
+                   tail ? strlen(tail) : (size_t)0,
+                   live_tail_has_reminder(tail) ? 1 : 0);
+        if (tail) trace_section(s, trace_id, "live continuation suffix", tail);
     } else if (anthropic_live_continuation) {
+        const char *tail = j->req.anthropic_live_suffix_text;
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: anthropic live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   "ds4-server: anthropic live continuation match=tool-output-ids ids=%d cached=%d prompt=%d tail_bytes=%zu reminder=%d",
                    anthropic_live_match_ids,
                    cached,
-                   prompt_tokens);
+                   prompt_tokens,
+                   tail ? strlen(tail) : (size_t)0,
+                   live_tail_has_reminder(tail) ? 1 : 0);
+        if (tail) trace_section(s, trace_id, "live continuation suffix", tail);
     } else if (thinking_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: thinking live continuation match=visible-prefix cached=%d prompt=%d",
@@ -15999,9 +16035,13 @@ static bool cont_bank_continuation_admit(server *s, cont_sched *cs, job *j,
      * keeps every disk-covered prefix valid (v0.5.1 inc3b). */
     warm_rec_invalidate(s, bank);
     ds4_metric_add(&ds4_metrics_get()->creg_resolved, 1);
+    /* The cont lane has no trace; this line is the receipt for the fed
+     * tail: its byte length and whether it carries the reminder, next to
+     * the frontier the parser evaluated that verdict against. */
     server_log(DS4_LOG_GENERATION,
-               "ds4-server: cont bank continuation admit bank=%d cached=%d suffix=%d",
-               bank, frontier, req->n - frontier);
+               "ds4-server: cont bank continuation admit bank=%d cached=%d suffix=%d frontier_bytes=%zu tail_bytes=%zu reminder=%d",
+               bank, frontier, req->n - frontier, j->req.cont_frontier_bytes,
+               strlen(suffix), live_tail_has_reminder(suffix) ? 1 : 0);
     return true;
 }
 
