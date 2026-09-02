@@ -108,6 +108,9 @@ typedef struct {
     const char *model_path;
     const char *mtp_path;
     const char *dspark_path;   /* DSpark/dflash block-drafter GGUF (optional) */
+    /* Track B: DeepSeek-V4-Flash-Vision-Exp encoder sidecar GGUF (optional,
+     * never auto-attached; refused by name on a non-Vision-Exp base). */
+    const char *vision_path;
     /* Set by launch defaults when the support model was volunteered by a
      * sibling lookup rather than named by the user: a checkpoint-generation
      * refusal then degrades to serving without it instead of failing the
@@ -182,6 +185,10 @@ const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_checkpoint_variant(ds4_engine *e);
 /* Pinned general.source.revision of the loaded base, or "" when absent. */
 const char *ds4_engine_source_revision(ds4_engine *e);
+/* Track B: 1 when a Vision-Exp encoder sidecar is bound (validated); the
+ * 32-byte SHA-256 of the sidecar file is the cache identity's sidecar half. */
+bool ds4_engine_has_vision(ds4_engine *e);
+const uint8_t *ds4_engine_vision_fingerprint(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
@@ -1115,6 +1122,10 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
 /* Standalone DSpark/dflash drafter GGUF load + strict layout validation (D1 gate).
  * Low-RAM: opens only the drafter file, no base model required. Returns 0 on OK. */
 int ds4_dspark_validate(const char *path);
+/* Track B inc 1: standalone encoder-sidecar validation (no base model): opens
+ * only the sidecar, binds all 316 tensors with type/rank/dims checks, the 11
+ * metadata expectations, and prints the revision/variant + file SHA-256. */
+int ds4_vision_validate(const char *path);
 /* DSpark GPU block-forward accept gate (D4.4): replays a DS4DSPK1 hidden trace
  * through the in-engine drafter block forward + Markov refine and reports
  * pos-0 accept / mean commit (target: ~0.875 / ~3.12). Needs base + drafter

@@ -145,6 +145,11 @@ static void usage(FILE *fp) {
         "      GGUF model path. Default: ds4flash.gguf\n"
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
+        "  --vision FILE\n"
+        "      DeepSeek-V4-Flash-Vision-Exp encoder sidecar GGUF (needs the Vision-Exp base;\n"
+        "      image input is still being ported -- this build binds and validates it).\n"
+        "  --validate-vision FILE\n"
+        "      Open only the encoder sidecar, validate all 316 tensors + metadata, print its SHA-256, exit.\n"
         "  --mtp-draft N\n"
         "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
         "  --mtp-margin F\n"
@@ -1670,6 +1675,10 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--vision")) {
+            c.engine.vision_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--validate-vision")) {
+            exit(ds4_vision_validate(need_arg(&i, argc, argv, arg)));
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {

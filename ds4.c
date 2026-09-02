@@ -41,6 +41,7 @@
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
+#include "ds4_image.h"
 #endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -1195,6 +1196,7 @@ enum {
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
+    DS4_TENSOR_BF16     = 30,   /* Track B: the Vision-Exp encoder sidecar (GGML type 30) */
 };
 
 typedef struct {
@@ -3716,6 +3718,165 @@ int ds4_dspark_validate(const char *path) {
 
     model_close(&m);
     printf("dspark: VALIDATE OK\n");
+    return 0;
+}
+
+/* ===================== Track B inc 1: Vision-Exp encoder sidecar =====================
+ * Bind + validate the encoder sidecar GGUF (upstream antirez/ds4 layout: exactly
+ * 316 tensors, BF16 ViT/aligner/sentinels, F32 visual router biases).  Fork style:
+ * a mismatch is reported by NAME into err and the caller refuses the open (no
+ * exit from inside the loader); a missing tensor still exits through
+ * required_tensor like every other loader.  expect_revision (the BASE's recorded
+ * general.source.revision) is cross-checked when non-empty: the fork records but
+ * does not pin the checkpoint revision, so the sidecar must match THIS base. */
+static bool deepseek4_vision_tensor_offset(const ds4_model *m, const char *name,
+                                           uint32_t type, uint32_t ndim,
+                                           const uint64_t *dims, uint64_t *out,
+                                           char *err, size_t errlen) {
+    ds4_tensor *t = required_tensor(m, name);
+    if (t->type != type || t->ndim != ndim) {
+        snprintf(err, errlen, "vision tensor %s has type %s/rank %u, expected %s/rank %u",
+                 name, tensor_type_name(t->type), t->ndim, tensor_type_name(type), ndim);
+        return false;
+    }
+    for (uint32_t d = 0; d < ndim; d++) {
+        if (t->dim[d] == dims[d]) continue;
+        snprintf(err, errlen, "vision tensor %s has dim[%u]=%" PRIu64 ", expected %" PRIu64,
+                 name, d, t->dim[d], dims[d]);
+        return false;
+    }
+    *out = t->abs_offset;
+    return true;
+}
+
+static bool deepseek4_vision_weights_bind(ds4_deepseek4_vision_weights *w, const ds4_model *m,
+                                          const char *expect_revision,
+                                          char *err, size_t errlen) {
+    ds4_str arch = {0}, rev = {0}, variant = {0};
+    memset(w, 0, sizeof(*w));
+    if (!model_get_string(m, "general.architecture", &arch) || !ds4_streq(arch, "deepseek4-vision")) {
+        snprintf(err, errlen, "not a DeepSeek V4 vision encoder GGUF (general.architecture %.*s)",
+                 arch.ptr ? (int)(arch.len > 40 ? 40 : arch.len) : 7, arch.ptr ? arch.ptr : "missing");
+        return false;
+    }
+    if (!model_get_string(m, "deepseek4-vision.checkpoint_variant", &variant) || !ds4_streq(variant, "vision-exp")) {
+        snprintf(err, errlen, "sidecar checkpoint_variant is not vision-exp"); return false;
+    }
+    if (!model_get_string(m, "general.source.revision", &rev) || rev.len == 0) {
+        snprintf(err, errlen, "sidecar carries no general.source.revision"); return false;
+    }
+    if (expect_revision && expect_revision[0] &&
+        (rev.len != strlen(expect_revision) || memcmp(rev.ptr, expect_revision, rev.len) != 0)) {
+        snprintf(err, errlen, "sidecar source revision %.*s does not match the base's %s",
+                 (int)(rev.len > 40 ? 40 : rev.len), rev.ptr, expect_revision);
+        return false;
+    }
+    if (m->n_tensors != DS4_DEEPSEEK4_VISION_TENSORS) {
+        snprintf(err, errlen, "sidecar has %" PRIu64 " tensors, expected %u", m->n_tensors, DS4_DEEPSEEK4_VISION_TENSORS);
+        return false;
+    }
+    /* Encoder geometry (config_expect_* exit by name on a mismatch, as for the
+     * base model's own shape). */
+    config_expect_u32("vision block_count", required_u32(m, "deepseek4-vision.block_count"), 32u);
+    config_expect_u32("vision embedding_length", required_u32(m, "deepseek4-vision.embedding_length"), 1024u);
+    config_expect_u32("vision feed_forward_length", required_u32(m, "deepseek4-vision.feed_forward_length"), 2816u);
+    config_expect_u32("vision head_count", required_u32(m, "deepseek4-vision.attention.head_count"), 16u);
+    config_expect_u32("vision projection_length", required_u32(m, "deepseek4-vision.projection_length"), 4096u);
+    config_expect_u32("vision patch_size", required_u32(m, "deepseek4-vision.patch_size"), 14u);
+    config_expect_u32("vision downsample_ratio", required_u32(m, "deepseek4-vision.downsample_ratio"), 3u);
+    config_expect_u32("vision image.max_tokens", required_u32(m, "deepseek4-vision.image.max_tokens"), 384u);
+    config_expect_u32("vision image.min_pixels", required_u32(m, "deepseek4-vision.image.min_pixels"), 147456u);
+    config_expect_u32("vision image.max_width_height_ratio", required_u32(m, "deepseek4-vision.image.max_width_height_ratio"), 8u);
+    config_expect_epsilon("vision RMS epsilon", required_f32(m, "deepseek4-vision.attention.layer_norm_rms_epsilon"), 1.0e-6f);
+
+    static const uint64_t d256[] = {256u};
+    static const uint64_t d1024[] = {1024u};
+    static const uint64_t d2816_1024[] = {2816u, 1024u};
+    static const uint64_t d588_1024[] = {588u, 1024u};
+    static const uint64_t d1024_1024[] = {1024u, 1024u};
+    static const uint64_t d1024_3072[] = {1024u, 3072u};
+    static const uint64_t d1024_5632[] = {1024u, 5632u};
+    static const uint64_t d3072[] = {3072u};
+    static const uint64_t d4096[] = {4096u};
+    static const uint64_t d4096_4096[] = {4096u, 4096u};
+    static const uint64_t d9216_4096[] = {9216u, 4096u};
+#define VT(field_, name_, type_, rank_, dims_) \
+    do { if (!deepseek4_vision_tensor_offset(m, name_, type_, rank_, dims_, &w->field_, err, errlen)) return false; } while (0)
+    VT(patch_weight,    "vision.patch_embed.proj.weight", DS4_TENSOR_BF16, 2, d588_1024);
+    VT(patch_bias,      "vision.patch_embed.proj.bias",   DS4_TENSOR_BF16, 1, d1024);
+    VT(post_norm,       "vision.norm.weight",             DS4_TENSOR_BF16, 1, d1024);
+    VT(aligner_w1,      "aligner.w1.weight",              DS4_TENSOR_BF16, 2, d9216_4096);
+    VT(aligner_w1_bias, "aligner.w1.bias",                DS4_TENSOR_BF16, 1, d4096);
+    VT(aligner_w2,      "aligner.w2.weight",              DS4_TENSOR_BF16, 2, d4096_4096);
+    VT(aligner_w2_bias, "aligner.w2.bias",                DS4_TENSOR_BF16, 1, d4096);
+    VT(image_start,     "image_start",                    DS4_TENSOR_BF16, 1, d4096);
+    VT(image_pad,       "image_pad",                      DS4_TENSOR_BF16, 1, d4096);
+    VT(image_newline,   "image_newline",                  DS4_TENSOR_BF16, 1, d4096);
+    VT(image_end,       "image_end",                      DS4_TENSOR_BF16, 1, d4096);
+#undef VT
+    char name[128];
+#define VTL(field_, suffix_, rank_, dims_) \
+    do { snprintf(name, sizeof(name), "vision.blocks.%u.%s", il, suffix_); \
+         if (!deepseek4_vision_tensor_offset(m, name, DS4_TENSOR_BF16, rank_, dims_, &w->layer[il].field_, err, errlen)) return false; } while (0)
+    for (uint32_t il = 0; il < DS4_DEEPSEEK4_VISION_LAYERS; il++) {
+        VTL(norm1,            "norm1.weight",     1, d1024);
+        VTL(qkv_weight,       "attn.wqkv.weight", 2, d1024_3072);
+        VTL(qkv_bias,         "attn.wqkv.bias",   1, d3072);
+        VTL(attn_proj_weight, "attn.wo.weight",   2, d1024_1024);
+        VTL(attn_proj_bias,   "attn.wo.bias",     1, d1024);
+        VTL(norm2,            "norm2.weight",     1, d1024);
+        VTL(mlp_w1,           "mlp.w1.weight",    2, d1024_5632);
+        VTL(mlp_w2,           "mlp.w2.weight",    2, d2816_1024);
+    }
+#undef VTL
+    for (uint32_t il = 0; il < DS4_DEEPSEEK4_LANGUAGE_LAYERS; il++) {
+        snprintf(name, sizeof(name), "layers.%u.ffn.gate.bias_vl", il);
+        if (!deepseek4_vision_tensor_offset(m, name, DS4_TENSOR_F32, 1, d256, &w->visual_router_bias[il], err, errlen)) return false;
+    }
+    for (uint32_t st = 0; st < DS4_DEEPSEEK4_MTP_LAYERS; st++) {
+        snprintf(name, sizeof(name), "mtp.%u.ffn.gate.bias_vl", st);
+        if (!deepseek4_vision_tensor_offset(m, name, DS4_TENSOR_F32, 1, d256, &w->mtp_visual_router_bias[st], err, errlen)) return false;
+    }
+    for (uint32_t il = 0; il < 3u; il++) {
+        snprintf(name, sizeof(name), "layers.%u.ffn.gate.bias", il);
+        if (!deepseek4_vision_tensor_offset(m, name, DS4_TENSOR_F32, 1, d256, &w->hash_router_bias[il], err, errlen)) return false;
+    }
+    return true;
+}
+
+static void vision_fingerprint_hex(const uint8_t fp[32], char out[65]) {
+    static const char hexd[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) { out[2 * i] = hexd[fp[i] >> 4]; out[2 * i + 1] = hexd[fp[i] & 15]; }
+    out[64] = 0;
+}
+
+int ds4_vision_validate(const char *path) {
+    ds4_model m;
+    model_open(&m, path, false, false);
+    printf("vision: file %s\n", path);
+    printf("vision: gguf v%u, %" PRIu64 " tensors, %" PRIu64 " metadata keys\n",
+           m.version, m.n_tensors, m.n_kv);
+    ds4_str rev = {0}, variant = {0}, gname = {0};
+    model_get_string(&m, "general.source.revision", &rev);
+    model_get_string(&m, "deepseek4-vision.checkpoint_variant", &variant);
+    model_get_string(&m, "general.name", &gname);
+    printf("vision: name \"%.*s\" variant %.*s revision %.*s\n",
+           (int)gname.len, gname.ptr ? gname.ptr : "", (int)variant.len, variant.ptr ? variant.ptr : "",
+           (int)rev.len, rev.ptr ? rev.ptr : "");
+    ds4_deepseek4_vision_weights w;
+    char err[256] = {0};
+    if (!deepseek4_vision_weights_bind(&w, &m, NULL, err, sizeof(err))) {
+        fprintf(stderr, "vision: REFUSED: %s\n", err);
+        model_close(&m);
+        return 1;
+    }
+    uint8_t fp[32]; char hex[65];
+    ds4_image_sha256(m.map, m.size, fp);
+    vision_fingerprint_hex(fp, hex);
+    printf("vision: bound %u tensors (32 ViT blocks x 8 + 11 head/aligner/sentinel + 43 + 3 + 3 router biases), layout OK\n",
+           DS4_DEEPSEEK4_VISION_TENSORS);
+    printf("vision: sidecar sha256 %s (%" PRIu64 " bytes)\n", hex, m.size);
+    model_close(&m);
     return 0;
 }
 
@@ -22842,10 +23003,13 @@ struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
     ds4_model dspark_model;
+    ds4_model vision_model;          /* Track B: encoder sidecar (bound, validated) */
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
     ds4_dspark_weights dspark_weights;
+    ds4_deepseek4_vision_weights vision_weights;
+    uint8_t vision_fingerprint[32];  /* SHA-256 of the sidecar file */
     ds4_backend backend;
     int mtp_draft_tokens;
     float mtp_margin;
@@ -22859,6 +23023,7 @@ struct ds4_engine {
     bool metal_ready;
     bool mtp_ready;
     bool dspark_ready;
+    bool vision_ready;
     bool boot_prewarm_done;   /* inc-14b: prewarm ran (or was attempted) */
     /* v0.5.1 inc4: MTP accept guard -- a process-wide mismatch detector for
      * the MTP draft arms (DSpark has its own calibrated yield quench; these
@@ -40519,10 +40684,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
     if (g_ds4_ckpt_variant == DS4_CKPT_VISION_EXP && !opt->inspect_only) {
-        fprintf(stderr, "ds4: checkpoint variant: vision-exp (rms_eps=%.3g, source revision %s); "
-                "text-only serving -- image input is not implemented in this build\n",
+        fprintf(stderr, "ds4: checkpoint variant: vision-exp (rms_eps=%.3g, source revision %s); %s\n",
                 (double)g_ds4_shape.rms_eps,
-                g_ds4_source_revision[0] ? g_ds4_source_revision : "unknown");
+                g_ds4_source_revision[0] ? g_ds4_source_revision : "unknown",
+                (opt->vision_path && opt->vision_path[0])
+                    ? "encoder sidecar requested (--vision)"
+                    : "text-only serving -- image input is not implemented in this build");
     }
     if (opt->inspect_only) {
         *out = e;
@@ -40600,6 +40767,45 @@ mtp_done:;
                 fprintf(stderr, "ds4: DSpark drafter loaded: %s (%u layers)\n",
                         dspark_path, (unsigned)DS4_DSPARK_N_LAYER);
             }
+        }
+    }
+
+    /* Track B inc 1: the Vision-Exp encoder sidecar (--vision FILE).  Bound and
+     * validated only in this increment (no encoder compute yet): all 316
+     * tensors by type/rank/dims, the 11 geometry expectations, the sidecar's
+     * source revision against the BASE's recorded revision, and the file's
+     * SHA-256 (the sidecar half of the image cache identity).  Never
+     * auto-attached; refused by name on a non-Vision-Exp base or under a
+     * distributed role.  A refusal fails the open: the user asked for images. */
+    if (opt->vision_path && opt->vision_path[0] && !opt->inspect_only) {
+        const char *why = NULL;
+        char verr[256] = {0};
+        if (g_ds4_ckpt_variant != DS4_CKPT_VISION_EXP) {
+            why = "the base model is not a Vision-Exp checkpoint (image input needs DeepSeek-V4-Flash-Vision-Exp)";
+        } else if (opt->distributed.role != DS4_DISTRIBUTED_NONE) {
+            why = "not supported under a distributed role yet";
+        } else {
+            model_open(&e->vision_model, opt->vision_path, graph_backend, false);
+            if (!deepseek4_vision_weights_bind(&e->vision_weights, &e->vision_model,
+                                               g_ds4_source_revision, verr, sizeof(verr))) {
+                model_close(&e->vision_model);
+                why = verr;
+            }
+        }
+        if (why) {
+            fprintf(stderr, "ds4: --vision %s refused: %s\n", opt->vision_path, why);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        ds4_image_sha256(e->vision_model.map, e->vision_model.size, e->vision_fingerprint);
+        e->vision_ready = true;
+        {
+            char hex[65];
+            vision_fingerprint_hex(e->vision_fingerprint, hex);
+            fprintf(stderr, "ds4: vision sidecar bound: %s (%u tensors, sha256 %.16s...); "
+                    "image input lands with the encoder + prompt increments -- this build still serves text only\n",
+                    opt->vision_path, DS4_DEEPSEEK4_VISION_TENSORS, hex);
         }
     }
 
@@ -41102,6 +41308,14 @@ const char *ds4_engine_source_revision(ds4_engine *e) {
     return g_ds4_source_revision;
 }
 
+bool ds4_engine_has_vision(ds4_engine *e) {
+    return e && e->vision_ready;
+}
+
+const uint8_t *ds4_engine_vision_fingerprint(ds4_engine *e) {
+    return (e && e->vision_ready) ? e->vision_fingerprint : NULL;
+}
+
 const char *ds4_engine_model_name(ds4_engine *e) {
     (void)e;
     return DS4_MODEL_SHAPE_NAME;
@@ -41146,6 +41360,7 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_threads_shutdown();
     if (e->mtp_ready) model_close(&e->mtp_model);
     if (e->dspark_ready) model_close(&e->dspark_model);
+    if (e->vision_ready) model_close(&e->vision_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
     ds4_gpu_cleanup();

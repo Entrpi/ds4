@@ -497,6 +497,7 @@ static void usage(FILE *fp) {
         "Options:\n"
         "  -m, --model FILE        GGUF model path. Default: ds4flash.gguf\n"
         "  --mtp FILE             Optional MTP support GGUF.\n"
+        "  --vision FILE          Vision-Exp encoder sidecar GGUF (binds + validates; image input pending).\n"
         "  --mtp-draft N          Maximum MTP draft tokens. Default: 1\n"
         "  --mtp-margin F         MTP verifier margin. Default: 3\n"
         "  -c, --ctx N            Context size. Default: 100000\n"
@@ -607,6 +608,8 @@ static agent_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--vision")) {
+            c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {

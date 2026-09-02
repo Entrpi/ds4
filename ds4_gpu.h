@@ -4,6 +4,46 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* Track B: DeepSeek-V4-Flash-Vision-Exp encoder sidecar weights.  Byte offsets
+ * into the sidecar GGUF map (upstream antirez/ds4 layout, kept identical so the
+ * encoder kernels port 1:1); bound + validated by deepseek4_vision_weights_bind. */
+#ifndef DS4_DEEPSEEK4_VISION_TYPES_DEFINED
+#define DS4_DEEPSEEK4_VISION_TYPES_DEFINED
+#define DS4_DEEPSEEK4_VISION_LAYERS 32u
+#define DS4_DEEPSEEK4_LANGUAGE_LAYERS 43u
+#define DS4_DEEPSEEK4_MTP_LAYERS 3u
+#define DS4_DEEPSEEK4_VISION_TENSORS 316u
+
+typedef struct {
+    uint64_t norm1;
+    uint64_t qkv_weight;
+    uint64_t qkv_bias;
+    uint64_t attn_proj_weight;
+    uint64_t attn_proj_bias;
+    uint64_t norm2;
+    uint64_t mlp_w1;
+    uint64_t mlp_w2;
+} ds4_deepseek4_vision_layer_weights;
+
+typedef struct {
+    uint64_t patch_weight;
+    uint64_t patch_bias;
+    uint64_t post_norm;
+    uint64_t aligner_w1;
+    uint64_t aligner_w1_bias;
+    uint64_t aligner_w2;
+    uint64_t aligner_w2_bias;
+    uint64_t image_start;
+    uint64_t image_pad;
+    uint64_t image_newline;
+    uint64_t image_end;
+    uint64_t visual_router_bias[DS4_DEEPSEEK4_LANGUAGE_LAYERS];
+    uint64_t mtp_visual_router_bias[DS4_DEEPSEEK4_MTP_LAYERS];
+    uint64_t hash_router_bias[3];
+    ds4_deepseek4_vision_layer_weights layer[DS4_DEEPSEEK4_VISION_LAYERS];
+} ds4_deepseek4_vision_weights;
+#endif
+
 /* =========================================================================
  * GPU Tensor and Command Lifetime.
  * =========================================================================

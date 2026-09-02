@@ -19337,6 +19337,9 @@ static void usage(FILE *fp) {
         "      Optional MTP support GGUF used for draft-token probes.\n"
         "  --dspark FILE\n"
         "      Optional DSpark block-drafter GGUF for speculative decode (same as DS4_DSPARK_MODEL).\n"
+        "  --vision FILE\n"
+        "      DeepSeek-V4-Flash-Vision-Exp encoder sidecar GGUF (never auto-attached; needs the\n"
+        "      Vision-Exp base; image input is still being ported -- this build binds and validates it).\n"
         "  --preset spark\n"
         "      Require the full speculative stack from the standard install layout; fail if any piece is missing.\n"
         "  --no-mtp | --no-dspark | --no-spec\n"
@@ -20068,6 +20071,8 @@ static server_config parse_options(int argc, char **argv) {
             mtp_set = true;
         } else if (!strcmp(arg, "--dspark")) {
             c.engine.dspark_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--vision")) {
+            c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--preset")) {
             const char *p = need_arg(&i, argc, argv, arg);
             if (strcmp(p, "spark") != 0) {
