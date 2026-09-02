@@ -29394,6 +29394,23 @@ static uint32_t metal_graph_tp_prefill_split_min(void) {
  * set on BOTH ranks (it changes the per-layer gate count; asymmetric
  * settings deadlock the big gates).  Default off: measured net-negative
  * on the M5 Max pair, see the pipelined blocks for the numbers. */
+/* TP prefill: produce the routed-expert partial in two row halves and kick
+ * the first half's exchange while the second half computes.  Byte-identical
+ * to the single call (rows are independent in the routed kernels; this
+ * rank's shared-expert rows are folded per half before they leave), but
+ * measured net-negative on the M5 Max pair at 2048 tokens (781 vs ~850
+ * t/s): the two 1024-row routed calls cost ~27% more kernel time than one
+ * 2048-row call, more than the ~5% of exchange time they hide.  Opt-in
+ * with DS4_TP_FFN_SUBGATE=1 for slower wires. */
+static bool metal_graph_tp_ffn_subgate(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_TP_FFN_SUBGATE");
+        cached = env && env[0] && atoi(env) != 0;
+    }
+    return cached != 0;
+}
+
 static bool metal_graph_tp_subgate_pipeline(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -31201,9 +31218,9 @@ static bool metal_graph_encode_layer_attention_batch(
                             metal_graph_batch_attn_out(g), tp_peer_base + soff, srows, DS4_N_EMBD);
                     uint64_t seq = 0;
                     if (send_sub && recv_sub) {
-                        seq = ds4_gpu_tp_big_gate_kick(il, n_tokens,
-                                                       send_sub, recv_sub,
-                                                       (uint64_t)srows * DS4_N_EMBD * sizeof(float));
+                        seq = ds4_gpu_tp_big_gate_kick_flush(il, n_tokens,
+                                                             send_sub, recv_sub,
+                                                             (uint64_t)srows * DS4_N_EMBD * sizeof(float));
                     }
                     ok = seq != 0;
                     if (ok) tp_attn_gate_seq = seq;
@@ -31735,6 +31752,8 @@ static bool metal_graph_encode_layer_ffn_batch(
         g->tp_batch_rows == n_tokens && n_tokens > 0 &&
         g->tp_world == 2 &&
         g->tp_batch_out && g->tp_batch_in;
+    uint64_t tp_ffn_gate_seq = 0;
+    bool tp_shared_folded = false;
     const bool cuda_tp_owned_batch_moe =
         g->cuda_tp_ep && g->cuda_tp_prefill_ffn;
     if (ok && cuda_tp_owned_batch_moe) {
@@ -31800,35 +31819,111 @@ static bool metal_graph_encode_layer_ffn_batch(
                                     (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
         }
     } else if (ok) {
-        ok = ds4_gpu_routed_moe_batch_tensor(metal_graph_batch_routed_out(g),
-                                               metal_graph_batch_routed_gate(g),
-                                               metal_graph_batch_routed_up(g),
-                                               metal_graph_batch_routed_mid(g),
-                                               metal_graph_batch_routed_down(g),
-                                               model->map,
-                                               model->size,
-                                               layer->ffn_gate_exps->abs_offset,
-                                               layer->ffn_up_exps->abs_offset,
-                                               layer->ffn_down_exps->abs_offset,
-                                               layer->ffn_gate_exps->type,
-                                               layer->ffn_down_exps->type,
-                                               gate_expert_bytes,
-                                               gate_row_bytes,
-                                               down_expert_bytes,
-                                               down_row_bytes,
-                                               (uint32_t)expert_in_dim,
-                                               (uint32_t)down_in_dim,
-                                               (uint32_t)routed_out_dim,
-                                               metal_graph_batch_router_selected(g),
-                                               metal_graph_batch_router_weights(g),
-                                               DS4_N_EXPERT,
-                                               DS4_N_EXPERT_USED,
-                                               DS4_SWIGLU_CLAMP_EXP,
-                                               metal_graph_batch_ffn_norm(g),
-                                               il,
-                                               n_tokens,
-                                               &g->batch_routed_mid_is_f16,
-                                               false) != 0;
+        const bool ffn_subgate = tp_split_ffn && !tp_split_batch_moe &&
+                                 n_tokens >= 256u && metal_graph_tp_ffn_subgate();
+        const uint32_t n_sub = ffn_subgate ? 2u : 1u;
+        if (ffn_subgate) ok = metal_graph_ensure_batch_ffn_out(g);
+        if (ok && ffn_subgate && !shared_done) {
+            /* The exchanged rows must already carry this rank's shared-expert
+             * fold (see the own-rows add below), so encode the shared expert
+             * first and fold it per half before each kick. */
+            DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT();
+            shared_done = ok;
+        }
+        for (uint32_t sub = 0; ok && sub < n_sub; sub++) {
+            const uint32_t row0 = (sub == 0) ? 0u : n_tokens / 2u;
+            const uint32_t rows = ffn_subgate ?
+                (sub == 0 ? n_tokens / 2u : n_tokens - n_tokens / 2u) : n_tokens;
+            ds4_gpu_tensor *v_out = NULL, *v_gate = NULL, *v_up = NULL, *v_mid = NULL,
+                           *v_down = NULL, *v_sel = NULL, *v_w = NULL, *v_x = NULL;
+            if (ffn_subgate) {
+                const uint64_t slot_vals = (uint64_t)DS4_N_EXPERT_USED * down_in_dim;
+                const uint64_t down_vals = (uint64_t)DS4_N_EXPERT_USED * routed_out_dim;
+                v_out  = metal_graph_tensor_row_range_view(metal_graph_batch_routed_out(g), row0, rows, DS4_N_EMBD);
+                v_gate = metal_graph_tensor_row_range_view(metal_graph_batch_routed_gate(g), row0, rows, slot_vals);
+                v_up   = metal_graph_tensor_row_range_view(metal_graph_batch_routed_up(g), row0, rows, slot_vals);
+                v_mid  = metal_graph_tensor_row_range_view(metal_graph_batch_routed_mid(g), row0, rows, slot_vals);
+                v_down = metal_graph_tensor_row_range_view(metal_graph_batch_routed_down(g), row0, rows, down_vals);
+                v_sel  = metal_graph_tensor_row_range_view(metal_graph_batch_router_selected(g), row0, rows, DS4_N_EXPERT_USED);
+                v_w    = metal_graph_tensor_row_range_view(metal_graph_batch_router_weights(g), row0, rows, DS4_N_EXPERT_USED);
+                v_x    = metal_graph_tensor_row_range_view(metal_graph_batch_ffn_norm(g), row0, rows, DS4_N_EMBD);
+                ok = v_out && v_gate && v_up && v_mid && v_down && v_sel && v_w && v_x;
+            }
+            if (ok) {
+                ok = ds4_gpu_routed_moe_batch_tensor(v_out ? v_out : metal_graph_batch_routed_out(g),
+                                                       v_gate ? v_gate : metal_graph_batch_routed_gate(g),
+                                                       v_up ? v_up : metal_graph_batch_routed_up(g),
+                                                       v_mid ? v_mid : metal_graph_batch_routed_mid(g),
+                                                       v_down ? v_down : metal_graph_batch_routed_down(g),
+                                                       model->map,
+                                                       model->size,
+                                                       layer->ffn_gate_exps->abs_offset,
+                                                       layer->ffn_up_exps->abs_offset,
+                                                       layer->ffn_down_exps->abs_offset,
+                                                       layer->ffn_gate_exps->type,
+                                                       layer->ffn_down_exps->type,
+                                                       gate_expert_bytes,
+                                                       gate_row_bytes,
+                                                       down_expert_bytes,
+                                                       down_row_bytes,
+                                                       (uint32_t)expert_in_dim,
+                                                       (uint32_t)down_in_dim,
+                                                       (uint32_t)routed_out_dim,
+                                                       v_sel ? v_sel : metal_graph_batch_router_selected(g),
+                                                       v_w ? v_w : metal_graph_batch_router_weights(g),
+                                                       DS4_N_EXPERT,
+                                                       DS4_N_EXPERT_USED,
+                                                       DS4_SWIGLU_CLAMP_EXP,
+                                                       v_x ? v_x : metal_graph_batch_ffn_norm(g),
+                                                       il,
+                                                       rows,
+                                                       &g->batch_routed_mid_is_f16,
+                                                       false) != 0;
+            }
+            if (ok && ffn_subgate && tp_row_split_ffn) {
+                /* Fold this rank's shared-expert rows that fall in this half
+                 * before they leave (the peer adds what it receives). */
+                const uint32_t lo = row0 > tp_row0 ? row0 : tp_row0;
+                const uint32_t hi0 = row0 + rows, hi1 = tp_row0 + tp_rows;
+                const uint32_t hi = hi0 < hi1 ? hi0 : hi1;
+                if (hi > lo) {
+                    ds4_gpu_tensor *own = metal_graph_tensor_row_range_view(
+                            metal_graph_batch_routed_out(g), lo, hi - lo, DS4_N_EMBD);
+                    ds4_gpu_tensor *sh = metal_graph_tensor_row_range_view(
+                            metal_graph_batch_shared_out(g), lo - tp_row0, hi - lo, DS4_N_EMBD);
+                    ok = own && sh &&
+                         ds4_gpu_add_tensor(own, own, sh,
+                                            (uint32_t)((uint64_t)(hi - lo) * DS4_N_EMBD)) != 0;
+                    ds4_gpu_tensor_free(sh);
+                    ds4_gpu_tensor_free(own);
+                }
+                tp_shared_folded = true;
+            }
+            if (ok && ffn_subgate) {
+                /* Kick this half's partial exchange; the next half's compute
+                 * (or the wait below) overlaps the wire. */
+                ds4_gpu_tensor *recv = metal_graph_tensor_row_range_view(
+                        metal_graph_batch_ffn_out(g), row0, rows, DS4_N_EMBD);
+                /* The kick ends the command buffer: a shared-event signal
+                 * inside a buffer is only published when the GPU parks or
+                 * the buffer completes, and the service thread must see it
+                 * (and the landed payload) while the next half computes. */
+                const uint64_t seq = recv ?
+                    ds4_gpu_tp_big_gate_kick_flush(il, n_tokens, v_out, recv,
+                                                   (uint64_t)rows * DS4_N_EMBD * sizeof(float)) : 0;
+                ok = seq != 0;
+                if (ok) tp_ffn_gate_seq = seq;
+                ds4_gpu_tensor_free(recv);
+            }
+            ds4_gpu_tensor_free(v_x);
+            ds4_gpu_tensor_free(v_w);
+            ds4_gpu_tensor_free(v_sel);
+            ds4_gpu_tensor_free(v_down);
+            ds4_gpu_tensor_free(v_mid);
+            ds4_gpu_tensor_free(v_up);
+            ds4_gpu_tensor_free(v_gate);
+            ds4_gpu_tensor_free(v_out);
+        }
     }
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", metal_graph_batch_routed_gate(g),
@@ -31861,7 +31956,7 @@ static bool metal_graph_encode_layer_ffn_batch(
 #undef DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT
 #undef DS4_METAL_TRY_SHARED_DOWN_F16
 
-    if (ok && tp_row_split_ffn) {
+    if (ok && tp_row_split_ffn && !tp_shared_folded) {
         /* Each shared-expert row must appear exactly once in the all-reduce.
          * Fold this rank's shared rows into its full-row routed partial; the
          * peer does the same for the complementary rows. */
@@ -31880,11 +31975,16 @@ static bool metal_graph_encode_layer_ffn_batch(
          * batch verify path above already performed the equivalent slab gate. */
         const uint64_t bytes =
             (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
-        ok = metal_graph_ensure_batch_ffn_out(g) &&
-             ds4_gpu_tp_big_gate_encode(il, n_tokens,
-                                        metal_graph_batch_routed_out(g),
-                                        metal_graph_batch_ffn_out(g),
-                                        bytes) != 0;
+        if (tp_ffn_gate_seq != 0) {
+            /* Pipelined halves: the last kick's release covers both. */
+            ok = ds4_gpu_tp_big_gate_wait(tp_ffn_gate_seq) != 0;
+        } else {
+            ok = metal_graph_ensure_batch_ffn_out(g) &&
+                 ds4_gpu_tp_big_gate_encode(il, n_tokens,
+                                            metal_graph_batch_routed_out(g),
+                                            metal_graph_batch_ffn_out(g),
+                                            bytes) != 0;
+        }
         if (ok) {
             ds4_gpu_tensor *first = g->tp_rank == 0 ?
                 metal_graph_batch_routed_out(g) : metal_graph_batch_ffn_out(g);
@@ -31892,6 +31992,12 @@ static bool metal_graph_encode_layer_ffn_batch(
                 metal_graph_batch_ffn_out(g) : metal_graph_batch_routed_out(g);
             ok = ds4_gpu_add_tensor(metal_graph_batch_routed_out(g), first, second,
                                     (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
+        }
+        if (ok) {
+            metal_graph_debug_dump_tensor("tp_ffn_recv", metal_graph_batch_ffn_out(g),
+                                          (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
+            metal_graph_debug_dump_tensor("tp_ffn_sum", metal_graph_batch_routed_out(g),
+                                          (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
         }
         if (!ok) {
             fprintf(stderr, "ds4: TP prefill FFN all-reduce failed (layer %u)\n", il);

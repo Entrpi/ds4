@@ -1953,6 +1953,11 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
     static int dbg = -1;
     if (dbg < 0) dbg = getenv("DS4_TP_BIG_GATE_DEBUG") != NULL;
+    /* Timing diagnostic only: skip the exchange entirely (results are
+     * garbage) to measure the compute-only prefill bound. */
+    static int fake = -1;
+    if (fake < 0) fake = getenv("DS4_TP_FAKE_BIG_GATE") != NULL;
+    if (fake) return 1;
     const double t_start = dbg ? tp_now_sec() : 0.0;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
@@ -1973,9 +1978,15 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
         const int ok = tp_rdma_big_gate_exchange(tp, out, in, bytes);
         if (dbg) {
             static unsigned n;
-            static double hs_acc, tx_acc;
+            static double hs_acc, tx_acc, last_end;
             const double t_end = tp_now_sec();
             hs_acc += t_hs - t_start; tx_acc += t_end - t_hs;
+            if (getenv("DS4_TP_BIG_GATE_DEBUG")[0] == '2')
+                fprintf(stderr, "ds4-tp: big gate #%u layer %u: %llu bytes, since last release %.2f ms, handshake %.2f, transfer %.2f\n",
+                        n + 1, layer, (unsigned long long)bytes,
+                        last_end > 0.0 ? (t_start - last_end) * 1e3 : 0.0,
+                        (t_hs - t_start) * 1e3, (t_end - t_hs) * 1e3);
+            last_end = t_end;
             if ((++n % 32u) == 0u) {
                 fprintf(stderr, "ds4-tp: big gate %u: %llu bytes, last: handshake wait %.2f ms, transfer %.2f ms; avg over 32: %.2f / %.2f ms\n",
                         n, (unsigned long long)bytes, (t_hs - t_start) * 1e3, (t_end - t_hs) * 1e3,

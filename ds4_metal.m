@@ -10547,6 +10547,21 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                 if (big_spin_us > 0) usleep((useconds_t)big_spin_us);
                 else if (++spins > (1u << 16)) sched_yield();
             }
+            if (req.payload_cb) {
+                /* Pipelined kick: the buffer ended right after the signal.
+                 * The event fires when the GPU is done, but the payload
+                 * stores are only CPU-visible once the buffer completes
+                 * (~15 us later; measured stale rows without this). */
+                id<MTLCommandBuffer> kick_cb = (__bridge_transfer id<MTLCommandBuffer>)req.payload_cb;
+                [kick_cb waitUntilCompleted];
+                if (kick_cb.status != MTLCommandBufferStatusCompleted)
+                    fprintf(stderr, "ds4: TP kick buffer status %lu\n", (unsigned long)kick_cb.status);
+                kick_cb = nil;
+                req.payload_cb = NULL;
+                static int64_t settle_us = -1;
+                if (settle_us < 0) settle_us = (int64_t)ds4_gpu_env_u64("DS4_TP_KICK_SETTLE_US", 0u, 0u, 100000u);
+                if (settle_us > 0) usleep((useconds_t)settle_us);
+            }
         } else if (!req.event_arrival) {
             const uint32_t slot =
                 req.layer * DS4_GPU_TP_GATES_PER_LAYER + req.gate;
@@ -11218,10 +11233,10 @@ int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
  * shared-event signal only fires after every preceding command completes,
  * which is exactly the payload ordering the exchange needs; the ~10 us
  * slower arrival detection is noise against a multi-ms exchange. */
-uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
-                                  const ds4_gpu_tensor *out_t,
-                                  ds4_gpu_tensor *in_t,
-                                  uint64_t bytes) {
+static uint64_t ds4_gpu_tp_big_gate_kick_impl(uint32_t layer, uint32_t rows,
+                                              const ds4_gpu_tensor *out_t,
+                                              ds4_gpu_tensor *in_t,
+                                              uint64_t bytes, int flush) {
     if (!g_batch_cb) return 0;
     if (!g_tp_thread_running || rows == 0 || bytes == 0) return 0;
     const void *out_ptr = ds4_gpu_tensor_contents((ds4_gpu_tensor *)out_t);
@@ -11233,10 +11248,23 @@ uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
     const uint64_t seq = ++g_tp_batch_seq;
     ds4_gpu_close_batch_encoder();
     [g_batch_cb encodeSignalEvent:g_tp_batch_gpu_event value:seq];
+    void *kick_cb = NULL;
+    if (flush) {
+        /* End the buffer here so the signal (and the payload stores) are
+         * published while the caller keeps encoding; the service thread
+         * waits for this buffer's completion before reading the payload. */
+        kick_cb = (__bridge_retained void *)g_batch_cb;
+        if (!ds4_gpu_flush_commands()) {
+            id<MTLCommandBuffer> drop = (__bridge_transfer id<MTLCommandBuffer>)kick_cb;
+            drop = nil;
+            return 0;
+        }
+    }
     pthread_mutex_lock(&g_tp_mutex);
     if (g_tp_queue_count >= DS4_GPU_TP_QUEUE) {
         pthread_mutex_unlock(&g_tp_mutex);
         fprintf(stderr, "ds4: TP gate queue overflow\n");
+        if (kick_cb) { id<MTLCommandBuffer> drop = (__bridge_transfer id<MTLCommandBuffer>)kick_cb; drop = nil; }
         return 0;
     }
     uint32_t tail = (g_tp_queue_head + g_tp_queue_count) % DS4_GPU_TP_QUEUE;
@@ -11249,11 +11277,27 @@ uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
     g_tp_queue[tail].big_in = in_ptr;
     g_tp_queue[tail].big_bytes = bytes;
     g_tp_queue[tail].poll = 0;
-    g_tp_queue[tail].payload_cb = NULL;
+    g_tp_queue[tail].payload_cb = kick_cb;
     g_tp_queue_count++;
     pthread_cond_signal(&g_tp_cond);
     pthread_mutex_unlock(&g_tp_mutex);
     return seq;
+}
+
+uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
+                                  const ds4_gpu_tensor *out_t,
+                                  ds4_gpu_tensor *in_t,
+                                  uint64_t bytes) {
+    return ds4_gpu_tp_big_gate_kick_impl(layer, rows, out_t, in_t, bytes, 0);
+}
+
+/* Pipelined kick: signals, ends the command buffer, and lets the caller
+ * keep encoding into a fresh one while the exchange runs. */
+uint64_t ds4_gpu_tp_big_gate_kick_flush(uint32_t layer, uint32_t rows,
+                                        const ds4_gpu_tensor *out_t,
+                                        ds4_gpu_tensor *in_t,
+                                        uint64_t bytes) {
+    return ds4_gpu_tp_big_gate_kick_impl(layer, rows, out_t, in_t, bytes, 1);
 }
 
 /* Encode the GPU-side release wait for a previously kicked big gate.  The

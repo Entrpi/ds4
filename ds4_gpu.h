@@ -407,6 +407,12 @@ uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
                                   const ds4_gpu_tensor *out_t,
                                   ds4_gpu_tensor *in_t,
                                   uint64_t bytes);
+/* Same, but ends the command buffer at the kick so the exchange overlaps the
+ * caller's further encoding (payload visibility handled by the service thread). */
+uint64_t ds4_gpu_tp_big_gate_kick_flush(uint32_t layer, uint32_t rows,
+                                        const ds4_gpu_tensor *out_t,
+                                        ds4_gpu_tensor *in_t,
+                                        uint64_t bytes);
 int ds4_gpu_tp_big_gate_wait(uint64_t seq);
 /* Pause/resume the DVFS keep-alive around work that keeps the GPU busy.
  * No-op when TP is not bound. */
