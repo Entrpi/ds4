@@ -833,6 +833,9 @@ int main(int argc, char **argv) {
         }
         const double prefill_t1 = bench_now_sec();
         const double prefill_sec = prefill_t1 - prefill_t0;
+        if (getenv("DS4_METAL_CB_TIMES"))
+            fprintf(stderr, "ds4-bench: prefill window mono %.1f .. %.1f ms\n",
+                    prefill_t0 * 1e3, prefill_t1 * 1e3);
         const int prefill_tokens = frontier - previous;
 
         if (write_frontier_logits_json(&cfg, engine, session, frontier, previous) != 0) {

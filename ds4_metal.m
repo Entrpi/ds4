@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <execinfo.h>
 
 #include <stdint.h>
 #include <inttypes.h>
@@ -335,6 +336,44 @@ static id<MTLComputeCommandEncoder> ds4_gpu_timeline_new_encoder(
     ds4_gpu_timeline_hook_encoder(enc);
     return enc;
 }
+/* Blit encoder with timeline sampling (blit passes are otherwise invisible
+ * to the encoder timeline and show up as gaps). */
+static id<MTLBlitCommandEncoder> ds4_gpu_blit_encoder(id<MTLCommandBuffer> cb, const char *label,
+                                                     uint32_t n_ops) {
+    DS4TimelineBatch *b = g_timeline_batch;
+    if (!g_timeline_enabled || !b || cb != g_batch_cb) return [cb blitCommandEncoder];
+    const uint32_t per_buffer = DS4_TIMELINE_SAMPLES_PER_BUFFER / 2;
+    const uint32_t sb_index = b->count / per_buffer;
+    if (sb_index >= [b->samples count]) {
+        MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
+        d.counterSet = g_timeline_counter_set;
+        d.storageMode = MTLStorageModeShared;
+        d.sampleCount = DS4_TIMELINE_SAMPLES_PER_BUFFER;
+        NSError *error = nil;
+        id<MTLCounterSampleBuffer> sb = [g_device newCounterSampleBufferWithDescriptor:d error:&error];
+        if (!sb) return [cb blitCommandEncoder];
+        [b->samples addObject:sb];
+    }
+    if (b->count == b->cap) {
+        b->cap *= 2;
+        b->recs = realloc(b->recs, (size_t)b->cap * sizeof(ds4_timeline_rec));
+    }
+    const uint32_t slot = (b->count % per_buffer) * 2u;
+    MTLBlitPassDescriptor *pd = [MTLBlitPassDescriptor blitPassDescriptor];
+    MTLBlitPassSampleBufferAttachmentDescriptor *att = pd.sampleBufferAttachments[0];
+    att.sampleBuffer = b->samples[sb_index];
+    att.startOfEncoderSampleIndex = slot;
+    att.endOfEncoderSampleIndex = slot + 1u;
+    id<MTLBlitCommandEncoder> enc = [cb blitCommandEncoderWithDescriptor:pd];
+    if (!enc) return [cb blitCommandEncoder];
+    ds4_timeline_rec *rec = &b->recs[b->count++];
+    memset(rec, 0, sizeof(*rec));
+    rec->caller = (uintptr_t)__builtin_return_address(0);
+    rec->n_dispatch = n_ops;
+    snprintf(rec->kernel, sizeof(rec->kernel), "blit:%s", label ? label : "?");
+    return enc;
+}
+
 static void ds4_gpu_parallel_ffn_reset_state(BOOL close_encoder);
 static NSMutableArray<id<MTLCommandBuffer>> *g_pending_cbs;
 static id<MTLSharedEvent> g_selected_readback_event;
@@ -1519,14 +1558,39 @@ static int ds4_gpu_wait_pending_command_buffers(const char *label) {
     return ok;
 }
 
+static double g_batch_cb_created_ms;
+static double ds4_gpu_now_ms(void);
+static void ds4_gpu_queue_keepalive_start(void);
+static void ds4_gpu_queue_keepalive_stop_thread(void);
 static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, const char *label) {
     if (!owned) return 1;
 
+    const double t_commit = ds4_gpu_now_ms();
     [cb commit];
     int ok = ds4_gpu_wait_pending_command_buffers(label);
     if (!ds4_gpu_wait_command_buffer(cb, label)) {
         ok = 0;
         ds4_gpu_invalidate_zero_prefix_prefill_block_maps();
+    }
+    if (getenv("DS4_METAL_CB_TIMES")) {
+        const double t_done = ds4_gpu_now_ms();
+        struct timespec ts_mono;
+        clock_gettime(CLOCK_MONOTONIC, &ts_mono);
+        const double mono_ms = (double)ts_mono.tv_sec * 1e3 + (double)ts_mono.tv_nsec / 1e6;
+        fprintf(stderr, "ds4: cb '%s': mono %.1f ms: ", label ? label : "?", mono_ms);
+        fprintf(stderr, "encode %.1f ms, commit->done %.1f ms, gpu span %.1f ms, gpu start +%.1f ms, caller 0x%llx\n",
+                t_commit - g_batch_cb_created_ms, t_done - t_commit,
+                (cb.GPUEndTime - cb.GPUStartTime) * 1e3,
+                cb.GPUStartTime * 1e3 - (mono_ms - (t_done - t_commit)),
+                (unsigned long long)((uintptr_t)__builtin_return_address(0) - (uintptr_t)_dyld_get_image_vmaddr_slide(0)));
+        if (t_done - t_commit > 100.0 && (cb.GPUEndTime - cb.GPUStartTime) * 1e3 < 10.0) {
+            void *frames[12];
+            const int n = backtrace(frames, 12);
+            fprintf(stderr, "ds4: cb stall backtrace:");
+            for (int i = 1; i < n; i++)
+                fprintf(stderr, " 0x%llx", (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)_dyld_get_image_vmaddr_slide(0)));
+            fprintf(stderr, "\n");
+        }
     }
     ds4_gpu_stream_expert_cache_note_owned_completed();
     if (getenv("DS4_METAL_CB_TIMES")) {
@@ -2278,6 +2342,7 @@ static int ds4_gpu_finish_model_views(
             else ds4_gpu_progress_failed();
         }
     }
+    ds4_gpu_queue_keepalive_start();
     const double t_warm = ds4_gpu_now_ms();
     if (ds4_gpu_model_map_log_enabled()) {
         fprintf(stderr,
@@ -9264,7 +9329,7 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
     ds4_gpu_close_batch_encoder();
     g_batch_has_work = YES;
-    id<MTLBlitCommandEncoder> blit = [g_batch_cb blitCommandEncoder];
+    id<MTLBlitCommandEncoder> blit = ds4_gpu_blit_encoder(g_batch_cb, "tensor_copy", 1u);
     if (!blit) return 0;
     [blit copyFromBuffer:s.buffer
             sourceOffset:(NSUInteger)(s.offset + src_offset)
@@ -9392,6 +9457,7 @@ int ds4_gpu_begin_commands(void) {
         !g_ssd_streaming_mode &&
         ds4_gpu_device_is_pre_m5_apple_silicon() &&
         getenv("DS4_METAL_DISABLE_PRE_M5_HEAD_RMS_ROPE_PIPELINE_STATIC") == NULL;
+    g_batch_cb_created_ms = ds4_gpu_now_ms();
     g_batch_cb = ds4_gpu_new_command_buffer();
     g_batch_has_work = NO;
     if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
@@ -10477,9 +10543,17 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
              * event (see ds4_gpu_tp_big_gate_kick): the event completion
              * semantics are what guarantee the bounce payload is visible
              * before the exchange reads it. */
+            /* A big-gate exchange takes milliseconds, so a tight spin on
+             * the shared event buys nothing; each signaledValue read is a
+             * driver round trip.  Sleep-poll unless asked otherwise
+             * (DS4_TP_BIG_GATE_SPIN_US=0 restores the tight spin). */
+            static int64_t big_spin_us = -1;
+            if (big_spin_us < 0)
+                big_spin_us = (int64_t)ds4_gpu_env_u64("DS4_TP_BIG_GATE_SPIN_US", 20u, 0u, 5000u);
             while (g_tp_batch_gpu_event.signaledValue < req.seq) {
                 if (g_tp_shutdown) break;
-                if (++spins > (1u << 16)) sched_yield();
+                if (big_spin_us > 0) usleep((useconds_t)big_spin_us);
+                else if (++spins > (1u << 16)) sched_yield();
             }
         } else if (!req.event_arrival) {
             const uint32_t slot =
@@ -11210,6 +11284,93 @@ int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
     return ds4_gpu_tp_big_gate_wait(seq);
 }
 
+/* Run one trivial command buffer so the process's first-submission costs
+ * (command queue and GPU context setup, page-table validation of the
+ * mapped model views) are paid at load time rather than inside the first
+ * prefill.  TP sharding skips the load-time model-view warm, which used to
+ * leave a 600-800 ms stall at the head of the first prompt on each rank. */
+int ds4_gpu_warm_command_queue(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (g_batch_cb) return 1;
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
+    if (!pipeline) return 0;
+    const double t0 = ds4_gpu_now_ms();
+    @autoreleasepool {
+        id<MTLBuffer> scratch = [g_device newBufferWithLength:256u * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+        if (!scratch) return 0;
+        memset(scratch.contents, 0, 256u * sizeof(float));
+        id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        const uint32_t iters = 1u;
+        [enc setComputePipelineState:pipeline];
+        [enc setBuffer:scratch offset:0 atIndex:0];
+        [enc setBytes:&iters length:sizeof(iters) atIndex:1];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) return 0;
+    }
+    if (getenv("DS4_METAL_CB_TIMES"))
+        fprintf(stderr, "ds4: command queue warm in %.1f ms\n", ds4_gpu_now_ms() - t0);
+    ds4_gpu_queue_keepalive_start();
+    return 1;
+}
+
+/* Main-queue idle keepalive.  Measured on M5 Max (macOS 26): once the
+ * engine's command queue has been idle for about 3 s, the next command
+ * buffer on it starts 600-800 ms late (the driver drops and rebuilds the
+ * process's GPU mappings; 76-145 GB of no-copy model views here).  Work on
+ * other queues does not prevent it.  One 1 KB kernel per second on this
+ * queue keeps the mappings alive at no measurable cost.
+ * DS4_METAL_DISABLE_QUEUE_KEEPALIVE=1 opts out. */
+static pthread_t g_queue_keepalive_thread;
+static volatile int g_queue_keepalive_running;
+static volatile int g_queue_keepalive_stop;
+
+static void *ds4_gpu_queue_keepalive_thread(void *arg) {
+    (void)arg;
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv4_tp_keepalive");
+    id<MTLBuffer> scratch = [g_device newBufferWithLength:256u * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+    if (!pipeline || !scratch) return NULL;
+    memset(scratch.contents, 0, 256u * sizeof(float));
+    const uint32_t iters = 1u;
+    uint64_t period_ms = ds4_gpu_env_u64("DS4_METAL_QUEUE_KEEPALIVE_MS", 1000u, 50u, 10000u);
+    while (!g_queue_keepalive_stop) {
+        @autoreleasepool {
+            id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:scratch offset:0 atIndex:0];
+            [enc setBytes:&iters length:sizeof(iters) atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc endEncoding];
+            [cb commit];
+        }
+        for (uint64_t slept = 0; slept < period_ms && !g_queue_keepalive_stop; slept += 50)
+            usleep(50000);
+    }
+    return NULL;
+}
+
+static void ds4_gpu_queue_keepalive_start(void) {
+    if (g_queue_keepalive_running) return;
+    if (getenv("DS4_METAL_DISABLE_QUEUE_KEEPALIVE")) return;
+    g_queue_keepalive_stop = 0;
+    if (pthread_create(&g_queue_keepalive_thread, NULL, ds4_gpu_queue_keepalive_thread, NULL) == 0)
+        g_queue_keepalive_running = 1;
+}
+
+static void ds4_gpu_queue_keepalive_stop_thread(void) {
+    if (!g_queue_keepalive_running) return;
+    g_queue_keepalive_stop = 1;
+    pthread_join(g_queue_keepalive_thread, NULL);
+    g_queue_keepalive_running = 0;
+}
+
 int ds4_gpu_tp_failed(void) {
     return g_tp_failed_flag;
 }
@@ -11375,6 +11536,7 @@ int ds4_gpu_synchronize(void) {
 
 void ds4_gpu_cleanup(void) {
     if (!g_initialized) return;
+    ds4_gpu_queue_keepalive_stop_thread();
 
     @autoreleasepool {
         ds4_gpu_decode_pipeline_fast_cache_reset();
@@ -16948,7 +17110,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         }
 
         ds4_gpu_close_batch_encoder();
-        id<MTLBlitCommandEncoder> blit = [g_batch_cb blitCommandEncoder];
+        id<MTLBlitCommandEncoder> blit = ds4_gpu_blit_encoder(g_batch_cb, "expert_cache_fill", n_loads * 3u);
         if (!blit) return 0;
         for (uint32_t load_i = 0; load_i < n_loads; load_i++) {
             [blit copyFromBuffer:gate_srcs[load_i]
@@ -27116,7 +27278,7 @@ static int ds4_gpu_encode_copy_to_f16_1d(
     }
 
     if (g_batch_cb && cb == g_batch_cb) ds4_gpu_close_batch_encoder();
-    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    id<MTLBlitCommandEncoder> blit = ds4_gpu_blit_encoder(cb, "f16_copy", 1u);
     if (!blit) return 0;
     [blit copyFromBuffer:src
             sourceOffset:src_off

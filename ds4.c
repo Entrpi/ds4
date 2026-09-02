@@ -61503,6 +61503,12 @@ static void model_warm_weights_sharded(const ds4_model *m,
     free(skips);
     fprintf(stderr, "ds4: sharded warm done in %.1fs (checksum=%llu)\n",
             now_sec() - t0, (unsigned long long)checksum);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* The GPU has not submitted anything yet in sharded mode: pay the
+     * first-submission setup here instead of inside the first prompt. */
+    if (!ds4_gpu_warm_command_queue())
+        fprintf(stderr, "ds4: command queue warm failed (continuing)\n");
+#endif
 }
 
 /* =========================================================================

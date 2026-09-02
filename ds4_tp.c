@@ -156,6 +156,17 @@ typedef struct {
     int warm_failed;            /* last warm-up round failed (dead direction) */
     uint32_t setup_attempt;     /* queue pair recreations so far */
     pthread_mutex_t post_lock;
+    uint32_t recv_depth;        /* queue pair receive depth actually granted */
+    uint32_t send_depth;        /* queue pair send depth actually granted */
+    struct {                    /* registered ranges for big-gate payloads */
+        uintptr_t addr;
+        uint64_t len;
+        struct ibv_mr *mr;
+    } range_mr[8];
+    uint32_t range_mr_count;
+    struct ibv_sge *win_sge;    /* window work request arrays (recv_depth) */
+    struct ibv_recv_wr *win_rwr;
+    struct ibv_send_wr *win_swr;
 } ds4_tp_rdma;
 #endif
 
@@ -747,6 +758,14 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
         tp_set_err(err, errlen, "tp rdma: alloc_pd failed");
         return 0;
     }
+    {
+        struct ibv_device_attr da;
+        memset(&da, 0, sizeof(da));
+        if (r->api.query_device && r->api.query_device(r->ctx, &da) == 0) {
+            fprintf(stderr, "ds4-tp: rdma device limits: max_qp_wr %d, max_sge %d, max_cqe %d, max_mr_size %llu\n",
+                    da.max_qp_wr, da.max_sge, da.max_cqe, (unsigned long long)da.max_mr_size);
+        }
+    }
     r->cq = r->api.create_cq(r->ctx, 512, NULL, NULL, 0);
     if (!r->cq) {
         tp_set_err(err, errlen, "tp rdma: create_cq failed");
@@ -756,17 +775,26 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
     qia.qp_type = IBV_QPT_UC;
-    qia.cap.max_send_wr = 256;
-    qia.cap.max_recv_wr = 64;
+    qia.cap.max_send_wr = 1024;
+    qia.cap.max_recv_wr = 1024;
     qia.cap.max_send_sge = 1;
     qia.cap.max_recv_sge = 1;
     qia.cap.max_inline_data = 0;
     r->qp = r->api.create_qp(r->pd, &qia);
     if (!r->qp) {
+        qia.cap.max_send_wr = 256;
+        qia.cap.max_recv_wr = 64;
+        r->qp = r->api.create_qp(r->pd, &qia);
+    }
+    if (!r->qp) {
         tp_set_err(err, errlen, "tp rdma: create_qp(UC): %s", strerror(errno));
         return 0;
     }
     r->max_inline = qia.cap.max_inline_data;
+    r->recv_depth = qia.cap.max_recv_wr ? qia.cap.max_recv_wr : 64u;
+    r->send_depth = qia.cap.max_send_wr ? qia.cap.max_send_wr : 256u;
+    if (r->recv_depth > 4096u) r->recv_depth = 4096u;
+    if (r->send_depth > 4096u) r->send_depth = 4096u;
 
     pthread_mutex_init(&r->post_lock, NULL);
     return 1;
@@ -882,7 +910,8 @@ static int tp_rdma_warm_up(ds4_tp *tp, char *err, size_t errlen) {
         r->warm_failed = 1;
         return 0;
     }
-    fprintf(stderr, "ds4-tp: rdma warm-up ok (%d attempt%s)\n", attempts, attempts == 1 ? "" : "s");
+    fprintf(stderr, "ds4-tp: rdma warm-up ok (%d attempt%s), queue depth recv %u send %u\n",
+            attempts, attempts == 1 ? "" : "s", r->recv_depth, r->send_depth);
     return 1;
 }
 
@@ -907,17 +936,26 @@ static int tp_rdma_recreate_qp(ds4_tp *tp, char *err, size_t errlen) {
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
     qia.qp_type = IBV_QPT_UC;
-    qia.cap.max_send_wr = 256;
-    qia.cap.max_recv_wr = 64;
+    qia.cap.max_send_wr = 1024;
+    qia.cap.max_recv_wr = 1024;
     qia.cap.max_send_sge = 1;
     qia.cap.max_recv_sge = 1;
     qia.cap.max_inline_data = 0;
     r->qp = r->api.create_qp(r->pd, &qia);
     if (!r->qp) {
+        qia.cap.max_send_wr = 256;
+        qia.cap.max_recv_wr = 64;
+        r->qp = r->api.create_qp(r->pd, &qia);
+    }
+    if (!r->qp) {
         tp_set_err(err, errlen, "tp rdma: create_qp (retry): %s", strerror(errno));
         return 0;
     }
     r->max_inline = qia.cap.max_inline_data;
+    r->recv_depth = qia.cap.max_recv_wr ? qia.cap.max_recv_wr : 64u;
+    r->send_depth = qia.cap.max_send_wr ? qia.cap.max_send_wr : 256u;
+    if (r->recv_depth > 4096u) r->recv_depth = 4096u;
+    if (r->send_depth > 4096u) r->send_depth = 4096u;
     r->send_outstanding = 0;
     r->recv_done = 0;
     return 1;
@@ -1324,126 +1362,182 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
  * are queued, so each round can post its 1 MiB receive window before sending
  * the matching 16 KiB messages.  Verify scratch provides already-registered
  * staging memory and is idle during normal prefill. */
+/* Registered range lookup for big-gate payloads (prefill partials live in
+ * standalone Metal buffers, not in the slab): register once, page aligned,
+ * and cache.  Falls back to NULL when registration fails. */
+static struct ibv_mr *tp_rdma_range_mr(ds4_tp *tp, const void *ptr, uint64_t bytes) {
+    ds4_tp_rdma *r = &tp->rdma;
+    const uintptr_t a = (uintptr_t)ptr;
+    for (uint32_t i = 0; i < r->range_mr_count; i++) {
+        if (a >= r->range_mr[i].addr && a + bytes <= r->range_mr[i].addr + r->range_mr[i].len)
+            return r->range_mr[i].mr;
+    }
+    if (r->range_mr_count >= 8u) return NULL;
+    const uintptr_t page = (uintptr_t)getpagesize();
+    const uintptr_t lo = a & ~(page - 1u);
+    const uintptr_t hi = (a + bytes + page - 1u) & ~(page - 1u);
+    struct ibv_mr *mr = r->api.reg_mr(r->pd, (void *)lo, (size_t)(hi - lo),
+                                      IBV_ACCESS_LOCAL_WRITE);
+    if (!mr) {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "ds4-tp: big gate: reg_mr(%zu bytes) failed (%s); staging through the slab\n",
+                    (size_t)(hi - lo), strerror(errno));
+        }
+        return NULL;
+    }
+    r->range_mr[r->range_mr_count++] = (__typeof__(r->range_mr[0])){ lo, hi - lo, mr };
+    return mr;
+}
+
+/* One-byte barrier on the batch socket: both sides have their receives
+ * posted for the coming window before either posts a send (a UC send with
+ * no receive posted kills that direction on this driver). */
+static int tp_rdma_window_barrier(ds4_tp *tp, uint8_t tag) {
+    uint8_t peer = 0;
+    if (!tp_write_full(tp->data_fd, &tag, 1) || !tp_read_full(tp->data_fd, &peer, 1)) return 0;
+    return peer == tag;
+}
+
+/* Big-gate exchange (prefill partials): windows of up to recv_depth
+ * messages; every window posts all its receives directly into the
+ * destination, crosses the barrier, then streams its sends in
+ * send-depth sub-batches, and waits for the window's completions.  UC
+ * in-order delivery pairs the k-th send with the k-th receive.  Payloads
+ * outside the slab are registered on first use; if that fails, each
+ * window is staged through the slab's batch region (recv_depth capped by
+ * its size). */
 static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                                      const void *out,
                                      void *in,
                                      uint64_t bytes) {
     ds4_tp_rdma *r = &tp->rdma;
     if (!tp_rdma_big_gate_capable(tp) || r->recv_window_active) return 0;
-
-    /* Payloads already inside the registered slab (verify batches) can ride
-     * directly. Ordinary prefill tensors use the idle verify regions as
-     * registered staging because their standalone MTLBuffers are not in the
-     * NIC memory region. */
     const uintptr_t slab_lo = (uintptr_t)tp->slab;
     const uintptr_t slab_hi = slab_lo + tp->slab_bytes;
     const uintptr_t out_lo = (uintptr_t)out;
     const uintptr_t in_lo = (uintptr_t)in;
-    const bool direct =
+    const bool in_slab =
         out_lo >= slab_lo && out_lo <= slab_hi && bytes <= slab_hi - out_lo &&
         in_lo >= slab_lo && in_lo <= slab_hi && bytes <= slab_hi - in_lo;
+    /* Registering Metal-owned payload buffers with the NIC completes with a
+     * local protection error on this driver; keep it opt-in for experiments
+     * (DS4_TP_RDMA_REG_PAYLOAD=1) and stage through the slab by default. */
+    static int reg_payload = -1;
+    if (reg_payload < 0) reg_payload = getenv("DS4_TP_RDMA_REG_PAYLOAD") != NULL;
+    struct ibv_mr *out_mr = in_slab ? r->mr : (reg_payload ? tp_rdma_range_mr(tp, out, bytes) : NULL);
+    struct ibv_mr *in_mr = in_slab ? r->mr : (reg_payload ? tp_rdma_range_mr(tp, in, bytes) : NULL);
+    const bool direct = out_mr != NULL && in_mr != NULL;
     uint8_t *stage_send = tp->slab + tp->batch_out_off;
     uint8_t *stage_recv = tp->slab + tp->batch_in_off;
+    const uint64_t stage_bytes = (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
+    uint32_t depth = r->recv_depth ? r->recv_depth : 64u;
+    if (depth > 256u) depth = 256u;
+    if (!direct) {
+        const uint32_t stage_slots = (uint32_t)(stage_bytes / DS4_TP_RDMA_MAX_MSG);
+        if (depth > stage_slots) depth = stage_slots;
+        if (depth == 0u) return 0;
+        out_mr = in_mr = r->mr;
+    }
+    if (!r->win_sge) {
+        const uint32_t cap = r->recv_depth > r->send_depth ? r->recv_depth : r->send_depth;
+        r->win_sge = calloc(2u * cap, sizeof(*r->win_sge));
+        r->win_rwr = calloc(cap, sizeof(*r->win_rwr));
+        r->win_swr = calloc(cap, sizeof(*r->win_swr));
+        if (!r->win_sge || !r->win_rwr || !r->win_swr) return 0;
+    }
+    const uint32_t send_depth = r->send_depth ? r->send_depth : 256u;
     uint64_t off = 0;
+    uint8_t tag = 1;
     while (off < bytes) {
         const uint64_t remaining = bytes - off;
-        uint32_t chunks = (uint32_t)((remaining + DS4_TP_RDMA_MAX_MSG - 1u) /
-                                     DS4_TP_RDMA_MAX_MSG);
-        if (chunks > DS4_TP_RDMA_BULK_SLOTS)
-            chunks = DS4_TP_RDMA_BULK_SLOTS;
-
-        uint32_t lens[DS4_TP_RDMA_BULK_SLOTS];
-        uint64_t chunk_off[DS4_TP_RDMA_BULK_SLOTS];
-        uint64_t round_bytes = 0;
+        uint32_t chunks = (uint32_t)((remaining + DS4_TP_RDMA_MAX_MSG - 1u) / DS4_TP_RDMA_MAX_MSG);
+        if (chunks > depth) chunks = depth;
+        uint64_t win_bytes = 0;
         for (uint32_t i = 0; i < chunks; i++) {
-            const uint64_t left = remaining - round_bytes;
-            lens[i] = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ?
-                                 DS4_TP_RDMA_MAX_MSG : left);
-            chunk_off[i] = direct ? round_bytes :
-                (uint64_t)i * DS4_TP_RDMA_MAX_MSG;
+            const uint64_t left = remaining - win_bytes;
+            const uint32_t len = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ? DS4_TP_RDMA_MAX_MSG : left);
+            const uint64_t coff = win_bytes;
             if (!direct) {
-                memcpy(stage_send + chunk_off[i],
-                       (const uint8_t *)out + off + round_bytes, lens[i]);
+                memcpy(stage_send + coff, (const uint8_t *)out + off + coff, len);
             }
-            round_bytes += lens[i];
-        }
-
-        struct ibv_sge recv_sge[DS4_TP_RDMA_BULK_SLOTS];
-        struct ibv_recv_wr recv_wr[DS4_TP_RDMA_BULK_SLOTS];
-        memset(recv_wr, 0, sizeof(recv_wr));
-        for (uint32_t i = 0; i < chunks; i++) {
-            recv_sge[i] = (struct ibv_sge) {
-                .addr = direct ? in_lo + off + chunk_off[i] :
-                                 (uintptr_t)(stage_recv + chunk_off[i]),
-                .length = lens[i],
-                .lkey = r->mr->lkey,
+            r->win_sge[i] = (struct ibv_sge) {
+                .addr = direct ? in_lo + off + coff : (uintptr_t)(stage_recv + coff),
+                .length = len,
+                .lkey = in_mr->lkey,
             };
-            recv_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
-            recv_wr[i].sg_list = &recv_sge[i];
-            recv_wr[i].num_sge = 1;
-            recv_wr[i].next = i + 1u < chunks ? &recv_wr[i + 1u] : NULL;
+            memset(&r->win_rwr[i], 0, sizeof(r->win_rwr[i]));
+            r->win_rwr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
+            r->win_rwr[i].sg_list = &r->win_sge[i];
+            r->win_rwr[i].num_sge = 1;
+            r->win_rwr[i].next = i + 1u < chunks ? &r->win_rwr[i + 1u] : NULL;
+            r->win_sge[depth + i] = (struct ibv_sge) {
+                .addr = direct ? out_lo + off + coff : (uintptr_t)(stage_send + coff),
+                .length = len,
+                .lkey = out_mr->lkey,
+            };
+            win_bytes += len;
         }
-        struct ibv_recv_wr *bad_recv = NULL;
-        if (ibv_post_recv(r->qp, recv_wr, &bad_recv) != 0) {
-            fprintf(stderr, "ds4-tp: bulk rdma post_recv: %s\n",
-                    strerror(errno));
-            return 0;
+        /* Post in chains of 64 (the chain length the driver is known to
+         * accept); the work requests are already linked, so cut the links at
+         * chain ends. */
+        for (uint32_t c0 = 0; c0 < chunks; c0 += 64u) {
+            const uint32_t c1 = c0 + 64u < chunks ? c0 + 64u : chunks;
+            r->win_rwr[c1 - 1u].next = NULL;
+            struct ibv_recv_wr *bad_recv = NULL;
+            if (ibv_post_recv(r->qp, &r->win_rwr[c0], &bad_recv) != 0) {
+                fprintf(stderr, "ds4-tp: big gate post_recv(%u of %u): %s\n", c0, chunks, strerror(errno));
+                return 0;
+            }
         }
         atomic_thread_fence(memory_order_release);
-        /* Known race (see tp_rdma_posted_barrier): the peer's sends for this
-         * round can reach us before these receives are posted when the peer
-         * finished the previous round earlier; the driver then stops
-         * delivering that direction and the round times out below.  A
-         * control-channel barrier here collides with the eval protocol's
-         * frames; the fix is to pre-post the next round's receives (second
-         * staging area) before sending the current round. */
-        struct ibv_sge send_sge[DS4_TP_RDMA_BULK_SLOTS];
-        struct ibv_send_wr send_wr[DS4_TP_RDMA_BULK_SLOTS];
-        memset(send_wr, 0, sizeof(send_wr));
-        for (uint32_t i = 0; i < chunks; i++) {
-            send_sge[i] = (struct ibv_sge) {
-                .addr = direct ? out_lo + off + chunk_off[i] :
-                                 (uintptr_t)(stage_send + chunk_off[i]),
-                .length = lens[i],
-                .lkey = r->mr->lkey,
-            };
-            send_wr[i].wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)i + 1u);
-            send_wr[i].sg_list = &send_sge[i];
-            send_wr[i].num_sge = 1;
-            send_wr[i].opcode = IBV_WR_SEND;
-            send_wr[i].send_flags = i + 1u == chunks ? IBV_SEND_SIGNALED : 0;
-            send_wr[i].next = i + 1u < chunks ? &send_wr[i + 1u] : NULL;
-        }
-        struct ibv_send_wr *bad_send = NULL;
-        if (ibv_post_send(r->qp, send_wr, &bad_send) != 0) {
-            fprintf(stderr, "ds4-tp: bulk rdma post_send: %s\n",
-                    strerror(errno));
+        if (!tp_rdma_window_barrier(tp, tag)) {
+            fprintf(stderr, "ds4-tp: big gate window barrier failed\n");
             return 0;
         }
-
-        uint32_t recv_done = 0;
-        int send_done = 0;
-        const double deadline =
-            tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
+        tag++;
+        /* Sends in sub-batches bounded by the send depth; the last of each
+         * sub-batch is signaled. */
+        uint32_t sent = 0, send_done = 0, recv_done = 0, signaled = 0;
+        const double deadline = tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0 + 2.0;
         uint32_t peer_poll = 0;
-        while (recv_done < chunks || !send_done) {
-            struct ibv_wc wc[DS4_TP_RDMA_BULK_SLOTS + 1u];
-            int n = ibv_poll_cq(r->cq,
-                               (int)(DS4_TP_RDMA_BULK_SLOTS + 1u), wc);
-            if (n < 0) return 0;
-            for (int i = 0; i < n; i++) {
+        while (recv_done < chunks || send_done < signaled || sent < chunks) {
+            if (sent < chunks && (signaled - send_done) < 4u) {
+                uint32_t n = chunks - sent;
+                if (n > 64u) n = 64u;
+                if (n > send_depth / 4u && send_depth / 4u > 0u) n = send_depth / 4u;
+                if (n == 0u) n = 1u;
+                for (uint32_t i = 0; i < n; i++) {
+                    struct ibv_send_wr *w = &r->win_swr[i];
+                    memset(w, 0, sizeof(*w));
+                    w->wr_id = DS4_TP_RDMA_BULK_WR_TAG | ((uint64_t)(sent + i) + 1u);
+                    w->sg_list = &r->win_sge[depth + sent + i];
+                    w->num_sge = 1;
+                    w->opcode = IBV_WR_SEND;
+                    w->send_flags = i + 1u == n ? IBV_SEND_SIGNALED : 0;
+                    w->next = i + 1u < n ? &r->win_swr[i + 1u] : NULL;
+                }
+                struct ibv_send_wr *bad_send = NULL;
+                if (ibv_post_send(r->qp, r->win_swr, &bad_send) != 0) {
+                    fprintf(stderr, "ds4-tp: big gate post_send(%u): %s\n", n, strerror(errno));
+                    return 0;
+                }
+                sent += n;
+                signaled++;
+            }
+            struct ibv_wc wc[64];
+            int nwc = ibv_poll_cq(r->cq, 64, wc);
+            if (nwc < 0) return 0;
+            for (int i = 0; i < nwc; i++) {
                 if (wc[i].status != IBV_WC_SUCCESS) {
-                    fprintf(stderr,
-                            "ds4-tp: bulk rdma completion error: %s\n",
+                    fprintf(stderr, "ds4-tp: big gate completion error: %s\n",
                             tp_wc_status_str(wc[i].status));
                     return 0;
                 }
                 if ((wc[i].wr_id & DS4_TP_RDMA_BULK_WR_TAG) == 0) {
-                    /* A final latency-QP send completion can remain queued
-                     * when a later prompt starts a bulk gate. */
                     if (wc[i].opcode & IBV_WC_RECV) {
-                        if (wc[i].wr_id > r->recv_done)
-                            r->recv_done = wc[i].wr_id;
+                        if (wc[i].wr_id > r->recv_done) r->recv_done = wc[i].wr_id;
                     } else if (r->send_outstanding > 0) {
                         r->send_outstanding--;
                     }
@@ -1451,54 +1545,45 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 }
                 if (wc[i].opcode & IBV_WC_RECV) {
                     const uint64_t idx = (wc[i].wr_id & ~DS4_TP_RDMA_BULK_WR_TAG) - 1u;
-                    if (idx >= chunks || wc[i].byte_len != lens[idx]) {
-                        fprintf(stderr,
-                                "ds4-tp: bulk rdma chunk %llu received %u bytes, expected %u\n",
-                                (unsigned long long)idx, wc[i].byte_len,
-                                idx < chunks ? lens[idx] : 0u);
+                    const uint32_t want = idx + 1u < chunks || win_bytes % DS4_TP_RDMA_MAX_MSG == 0u
+                        ? (uint32_t)DS4_TP_RDMA_MAX_MSG : (uint32_t)(win_bytes % DS4_TP_RDMA_MAX_MSG);
+                    if (idx >= chunks || wc[i].byte_len != want) {
+                        fprintf(stderr, "ds4-tp: big gate chunk %llu received %u bytes, expected %u\n",
+                                (unsigned long long)idx, wc[i].byte_len, want);
                         return 0;
                     }
                     recv_done++;
                 } else {
-                    send_done = 1;
+                    send_done++;
                 }
             }
-            if ((peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
-                fprintf(stderr,
-                        "ds4-tp: peer disconnected during bulk RDMA gate\n");
+            if (nwc == 0 && (peer_poll++ & 0x3fffu) == 0 && tp_peer_closed(tp)) {
+                fprintf(stderr, "ds4-tp: peer disconnected during big gate\n");
                 return 0;
             }
-            if (tp_now_sec() > deadline) {
-                struct ibv_qp_attr qa;
-                struct ibv_qp_init_attr qia;
-                memset(&qa, 0, sizeof(qa));
-                memset(&qia, 0, sizeof(qia));
-                const int qrc = r->api.query_qp ? r->api.query_qp(r->qp, &qa, IBV_QP_STATE, &qia) : -1;
-                fprintf(stderr,
-                        "ds4-tp: timeout waiting for bulk RDMA round "
-                        "(%u/%u recvs, send=%d, qp state %d%s, chunks %u x %u bytes, %s)\n",
-                        recv_done, chunks, send_done,
-                        qrc == 0 ? (int)qa.qp_state : -1, qrc == 0 ? "" : " (query failed)",
-                        chunks, chunks ? lens[0] : 0u, direct ? "direct" : "staged");
+            if (nwc == 0 && tp_now_sec() > deadline) {
+                fprintf(stderr, "ds4-tp: timeout in big gate window (%u/%u recvs, %u/%u sends, %u sent)\n",
+                        recv_done, chunks, send_done, signaled, sent);
                 return 0;
             }
         }
         atomic_thread_fence(memory_order_acquire);
         if (!direct) {
-            round_bytes = 0;
-            for (uint32_t i = 0; i < chunks; i++) {
-                memcpy((uint8_t *)in + off + round_bytes,
-                       stage_recv + chunk_off[i], lens[i]);
-                round_bytes += lens[i];
-            }
+            memcpy((uint8_t *)in + off, stage_recv, win_bytes);
         }
-        off += round_bytes;
+        off += win_bytes;
     }
     return 1;
 }
 
 static void tp_rdma_close(ds4_tp *tp) {
     ds4_tp_rdma *r = &tp->rdma;
+    for (uint32_t i = 0; i < r->range_mr_count; i++) {
+        if (r->range_mr[i].mr) r->api.dereg_mr(r->range_mr[i].mr);
+    }
+    r->range_mr_count = 0;
+    free(r->win_sge); free(r->win_rwr); free(r->win_swr);
+    r->win_sge = NULL; r->win_rwr = NULL; r->win_swr = NULL;
     if (r->qp) r->api.destroy_qp(r->qp);
     if (r->mr) r->api.dereg_mr(r->mr);
     if (r->cq) r->api.destroy_cq(r->cq);
@@ -1866,10 +1951,14 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("DS4_TP_BIG_GATE_DEBUG") != NULL;
+    const double t_start = dbg ? tp_now_sec() : 0.0;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
     ds4_tp_gate_header ph;
     if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+    const double t_hs = dbg ? tp_now_sec() : 0.0;
     if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != 0xB16u || ph.seq != seq) {
         fprintf(stderr,
@@ -1881,7 +1970,20 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
         if (!tp_rdma_drain_decode_window(tp)) return 0;
-        return tp_rdma_big_gate_exchange(tp, out, in, bytes);
+        const int ok = tp_rdma_big_gate_exchange(tp, out, in, bytes);
+        if (dbg) {
+            static unsigned n;
+            static double hs_acc, tx_acc;
+            const double t_end = tp_now_sec();
+            hs_acc += t_hs - t_start; tx_acc += t_end - t_hs;
+            if ((++n % 32u) == 0u) {
+                fprintf(stderr, "ds4-tp: big gate %u: %llu bytes, last: handshake wait %.2f ms, transfer %.2f ms; avg over 32: %.2f / %.2f ms\n",
+                        n, (unsigned long long)bytes, (t_hs - t_start) * 1e3, (t_end - t_hs) * 1e3,
+                        hs_acc / 32.0 * 1e3, tx_acc / 32.0 * 1e3);
+                hs_acc = tx_acc = 0.0;
+            }
+        }
+        return ok;
     }
 #endif
     uint64_t off = 0;
