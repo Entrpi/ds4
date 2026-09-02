@@ -936,7 +936,7 @@ README prompt):
 |---|---|---|
 | decode, 128-token context | ~47-48 t/s | ~11 t/s |
 | decode, 2048-token context | ~48 t/s | |
-| prefill | ~240 t/s at 128 tokens, ~785 t/s at 2048 | ~10 t/s |
+| prefill | ~250 t/s at 128 tokens, ~850 t/s at 2048 | ~10 t/s |
 | startup | ~10 s per Mac (pins its shard) | |
 
 Things that cost speed on the coordinator: a remote screen-sharing session
