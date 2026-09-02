@@ -1,3 +1,11 @@
 deepseek4-quantize
 quality-testing/score_official
-quality-testing/data/
+quality-testing/data/*
+# Curated hosted-model continuation fixtures imported from upstream
+# (antirez/ds4 tracks them the same way: ignore data/, un-ignore the
+# curated collections). Local API collections stay ignored.
+!quality-testing/data/README.md
+!quality-testing/data/flash/
+!quality-testing/data/flash/**
+!quality-testing/data/flash-vision-exp-openrouter-novita-100/
+!quality-testing/data/flash-vision-exp-openrouter-novita-100/**

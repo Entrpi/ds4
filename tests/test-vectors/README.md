@@ -43,6 +43,29 @@ prompt file and each expected token is hex-encoded by bytes. The official JSON
 files remain in the tree so the compact fixture can be audited against the raw
 API response.
 
+## Checkpoint directories
+
+Flash checkpoints are not interchangeable for these tests. The flat files in
+this directory are the fixtures the runner defaults to (the checkpoint the
+default GGUF is; `local-golden-0731.vec` is the 0731 local golden — a
+byte-identical copy of the flat `local-golden.vec` under an explicit name,
+kept so the checkpoint is named in the path; commit it alongside the
+checkpoint swap). Other checkpoints get their own directory,
+upstream-style:
+
+- `flash-vision-exp/`: imported verbatim from upstream (antirez/ds4
+  `fc8bf3c`, 2026-08-31) for `DeepSeek-V4-Flash-Vision-Exp`. These are
+  OpenRouter greedy **continuations** (`deepseek/deepseek-v4-flash-vision-exp`,
+  provider Novita, `max_tokens` 32, reasoning off). That provider returns no
+  logprobs, so every `official/*.official.json` carries zero logprob steps and
+  no `official.vec` can be generated from them. Use `continuations/*.txt` with
+  `manifest.tsv` as a greedy-agreement smoke against a Vision-Exp boot (the
+  five prompts are the same as the flat set's), and record a
+  `local-golden-vision-exp.vec` from a known-sane Vision-Exp run for drift
+  regression (`DS4_TEST_LOCAL_GOLDEN_FILE=... ./ds4_test --local-golden-vectors`).
+  Running a 0731 fixture against a Vision-Exp GGUF, or the reverse, is an
+  invalid test, not a model-quality result.
+
 To inspect a local top-logprob dump manually:
 
 ```sh
