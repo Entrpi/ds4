@@ -964,9 +964,6 @@ instead of TensorOps routed-expert prefill GEMMs), `DS4_METAL_DISABLE_QUEUE_KEEP
 ~3 s of GPU idleness then starts 600-800 ms late). `DS4_TP_GATE_PROFILE=1` prints per-gate wait
 statistics on each rank at exit; `DS4_METAL_ENCODER_TIMELINE=<file>` writes
 a per-kernel GPU timeline (`misc/tp_tools/tl_analyze.py` reads it).
-`DS4_TP_LANE_BIAS=1` enables a runtime rank-speed balancing of the shared
-expert (useful only when one Mac is measurably slower; it makes the output
-depend on timing).
 
 ## Tensor Parallelism across CUDA GPUs
 

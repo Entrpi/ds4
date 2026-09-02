@@ -46,7 +46,9 @@
 #include "ds4_tp.h"
 
 /* TP context for the verify-block RDMA window (set with the gate callbacks). */
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
 static ds4_tp *g_tp_block_ctx;
+#endif
 
 /* Wave-2 multi-GPU types are needed in every build because the engine
  * struct embeds ds4_gpu_config and the placement table. ds4_layer_pack.h
@@ -29393,19 +29395,6 @@ static uint32_t metal_graph_tp_prefill_split_min(void) {
     return (uint32_t)cached;
 }
 
-/* Opt-in sub-chunk gate pipelining for the TP prefill row swaps.  Must be
- * set on BOTH ranks (it changes the per-layer gate count; asymmetric
- * settings deadlock the big gates).  Default off: measured net-negative
- * on the M5 Max pair, see the pipelined blocks for the numbers. */
-static bool metal_graph_tp_subgate_pipeline(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("DS4_TP_SUBGATE_PIPELINE");
-        cached = env && env[0] && atoi(env) != 0;
-    }
-    return cached != 0;
-}
-
 static const int32_t *metal_graph_visual_tokens_for_batch(
         const ds4_gpu_graph *g,
         uint32_t             pos0,
@@ -31145,76 +31134,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     metal_graph_batch_heads(g),
                                                                     n_tokens) != 0;
     }
-    uint64_t tp_attn_gate_seq = 0;
-    /* Opt-in sub-chunk gate pipelining (see metal_graph_tp_subgate_pipeline;
-     * measured net-negative on the M5 Max pair, kept for slower wires).
-     * Kernel-path constraint: the output projection picks its kernel by row
-     * count (direct low below 32 rows, the 64-token-tile TensorOps path at
-     * multiples of 64, ids-cache fallback otherwise), and the paths are not
-     * bit-identical per row.  Parity with the single-node reference
-     * therefore requires every sub-call to land on the same path as the
-     * full-chunk call: n_tokens % 256 == 0 puts the chunk, the rank halves,
-     * and the quarter sub-calls all on the TensorOps path.  Other sizes
-     * keep the proven single-gate swap. */
-    const bool tp_attn_pipeline =
-        tp_row_split_attn && (n_tokens % 256u) == 0u &&
-        metal_graph_tp_subgate_pipeline();
     if (!attn_out_f16) {
-        if (ok && tp_attn_pipeline) {
-            /* Sub-chunk pipelined swap: the output projection runs in two
-             * sub-halves of this rank's rows and each sub-half's row swap
-             * is kicked as soon as its rows land in batch_attn_out, so the
-             * first wire exchange overlaps the second sub-half's compute.
-             * The two kicks use opposite flag-slot parities; the wait below
-             * (before the HC post expand) covers both. */
-            const uint32_t tp_sub1 = (tp_half_rows + 1u) / 2u;
-            const uint32_t tp_c1 = tp_rows < tp_sub1 ? tp_rows : tp_sub1;
-            const uint32_t tp_own_base = g->tp_rank == 0 ? 0u : tp_half_rows;
-            const uint32_t tp_peer_base = g->tp_rank == 0 ? tp_half_rows : 0u;
-            for (uint32_t sub = 0; ok && sub < 2u; sub++) {
-                const uint32_t coff = sub == 0 ? 0u : tp_c1;
-                const uint32_t crows = sub == 0 ? tp_c1 : tp_rows - tp_c1;
-                const uint32_t soff = sub == 0 ? 0u : tp_sub1;
-                const uint32_t srows = sub == 0 ? tp_sub1 : tp_half_rows - tp_sub1;
-                if (crows != 0) {
-                    ds4_gpu_tensor *sub_heads = metal_graph_tensor_row_range_view(
-                            metal_graph_batch_heads(g), tp_row0 + coff, crows, q_dim);
-                    ds4_gpu_tensor *sub_out = metal_graph_tensor_row_range_view(
-                            metal_graph_batch_attn_out(g), tp_row0 + coff, crows, DS4_N_EMBD);
-                    ok = sub_heads && sub_out &&
-                         metal_graph_attention_output_dense_quant_batch(sub_out,
-                                                                        metal_graph_batch_attn_low(g),
-                                                                        g,
-                                                                        model,
-                                                                        layer->attn_output_a,
-                                                                        layer->attn_output_b,
-                                                                        group_dim,
-                                                                        rank,
-                                                                        n_groups,
-                                                                        DS4_N_EMBD,
-                                                                        sub_heads,
-                                                                        crows);
-                    ds4_gpu_tensor_free(sub_out);
-                    ds4_gpu_tensor_free(sub_heads);
-                }
-                if (ok && srows != 0) {
-                    ds4_gpu_tensor *send_sub = metal_graph_tensor_row_range_view(
-                            metal_graph_batch_attn_out(g), tp_own_base + soff, srows, DS4_N_EMBD);
-                    ds4_gpu_tensor *recv_sub = metal_graph_tensor_row_range_view(
-                            metal_graph_batch_attn_out(g), tp_peer_base + soff, srows, DS4_N_EMBD);
-                    uint64_t seq = 0;
-                    if (send_sub && recv_sub) {
-                        seq = ds4_gpu_tp_big_gate_kick_flush(il, n_tokens,
-                                                             send_sub, recv_sub,
-                                                             (uint64_t)srows * DS4_N_EMBD * sizeof(float));
-                    }
-                    ok = seq != 0;
-                    if (ok) tp_attn_gate_seq = seq;
-                    ds4_gpu_tensor_free(recv_sub);
-                    ds4_gpu_tensor_free(send_sub);
-                }
-            }
-        } else if (ok) {
+        if (ok) {
             ok = metal_graph_attention_output_dense_quant_batch(tp_attn_out ? tp_attn_out : metal_graph_batch_attn_out(g),
                                                                 metal_graph_batch_attn_low(g),
                                                                 g,
@@ -31241,27 +31162,20 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("output_proj");
     if (ok && tp_row_split_attn) {
-        /* Release point for the pipelined row swaps of batch_attn_out: both
-         * ranks reach the HC post expand with identical full tensors. */
-        if (tp_attn_pipeline) {
-            ok = tp_attn_gate_seq != 0 &&
-                 ds4_gpu_tp_big_gate_wait(tp_attn_gate_seq) != 0;
-        } else {
-            const uint64_t half_bytes =
-                (uint64_t)tp_half_rows * DS4_N_EMBD * sizeof(float);
-            ds4_gpu_tensor *send_half = metal_graph_tensor_row_range_view(
-                    metal_graph_batch_attn_out(g),
-                    g->tp_rank == 0 ? 0 : tp_half_rows, tp_half_rows, DS4_N_EMBD);
-            ds4_gpu_tensor *recv_half = metal_graph_tensor_row_range_view(
-                    metal_graph_batch_attn_out(g),
-                    g->tp_rank == 0 ? tp_half_rows : 0, tp_half_rows, DS4_N_EMBD);
-            ok = send_half && recv_half &&
-                 ds4_gpu_tp_big_gate_encode(il, n_tokens,
-                                            send_half, recv_half,
-                                            half_bytes) != 0;
-            ds4_gpu_tensor_free(send_half);
-            ds4_gpu_tensor_free(recv_half);
-        }
+        const uint64_t half_bytes =
+            (uint64_t)tp_half_rows * DS4_N_EMBD * sizeof(float);
+        ds4_gpu_tensor *send_half = metal_graph_tensor_row_range_view(
+                metal_graph_batch_attn_out(g),
+                g->tp_rank == 0 ? 0 : tp_half_rows, tp_half_rows, DS4_N_EMBD);
+        ds4_gpu_tensor *recv_half = metal_graph_tensor_row_range_view(
+                metal_graph_batch_attn_out(g),
+                g->tp_rank == 0 ? tp_half_rows : 0, tp_half_rows, DS4_N_EMBD);
+        ok = send_half && recv_half &&
+             ds4_gpu_tp_big_gate_encode(il, n_tokens,
+                                        send_half, recv_half,
+                                        half_bytes) != 0;
+        ds4_gpu_tensor_free(send_half);
+        ds4_gpu_tensor_free(recv_half);
         if (!ok) fprintf(stderr, "ds4: TP prefill attention row gate failed (layer %u)\n", il);
     }
     if (ok && !attn_out_f16 && metal_graph_directional_steering_attn_enabled(g)) {
@@ -64420,10 +64334,6 @@ int ds4_engine_tp_vocab_split(ds4_engine *e) {
 }
 
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
-static int ds4_engine_tp_peer_probe(void *ud, uint64_t seq) {
-    return ds4_tp_gate_peer_arrived((ds4_tp *)ud, seq);
-}
-
 static int ds4_engine_tp_exchange(void *ud, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_tp *tp = ud;
     const int ok = ds4_tp_gate_exchange(tp, layer, gate, seq);
@@ -64526,7 +64436,6 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     }
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
     g_tp_block_ctx = tp;
-    ds4_gpu_tp_set_peer_probe(ds4_engine_tp_peer_probe);
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
     /* GLM keeps its replicated output head unsplit in v0: the
      * leader computes full logits and nothing crosses the wire. */
@@ -68567,11 +68476,6 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (ds4_session_tp_leader(s)) {
         ds4_engine *e = s->engine;
-#if defined(__APPLE__)
-        /* Rank-speed balancing: the bias for this token rides in the eval
-         * command and applies identically on both ranks. */
-        ds4_gpu_tp_set_lane_bias(ds4_tp_lane_bias_next(e->tp.ctx, (int32_t)DS4_N_FF_EXP));
-#endif
         if (!ds4_tp_send_eval(e->tp.ctx, s->tp_session_id,
                               ++e->tp.eval_seq, token)) {
             snprintf(err, errlen, "tp: worker eval send failed");

@@ -153,16 +153,6 @@ int ds4_gpu_add_tensor_tp_flag(
  * matvec when its output is that slot; otherwise ignored). */
 void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate);
 
-/* Runtime rank-speed bias for the shared-expert lane split (lanes added to
- * rank 0's range), decided by the coordinator per token and carried to the
- * worker in the eval command; the measured peer wait EWMA per gate kind
- * feeds the decision. */
-void ds4_gpu_tp_set_lane_bias(int32_t bias_lanes);
-int32_t ds4_gpu_tp_lane_bias(void);
-double ds4_gpu_tp_gate_wait_ewma_us(uint32_t gate);
-double ds4_gpu_tp_gate_skew_ewma_us(uint32_t gate);
-void ds4_gpu_tp_set_peer_probe(int (*fn)(void *, uint64_t));
-
 /* Deferred kv norm task: call before ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor
  * to run only its q task now and fold the kv task into the KV staging
  * kernel of the same layer; flush runs it standalone if nothing consumed it. */
@@ -397,23 +387,6 @@ int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
                                const ds4_gpu_tensor *out_t,
                                ds4_gpu_tensor *in_t,
                                uint64_t bytes);
-/* Split big gate: kick publishes the GPU arrival marker (batch shared
- * event, whose completion semantics make the bounce payload visible to
- * the exchange thread) and queues the exchange, returning the gate seq
- * (0 on failure); wait encodes the release.  Multiple kicks may be in
- * flight; waiting on the last seq covers all earlier kicks (monotonic
- * release event, in-order service thread). */
-uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
-                                  const ds4_gpu_tensor *out_t,
-                                  ds4_gpu_tensor *in_t,
-                                  uint64_t bytes);
-/* Same, but ends the command buffer at the kick so the exchange overlaps the
- * caller's further encoding (payload visibility handled by the service thread). */
-uint64_t ds4_gpu_tp_big_gate_kick_flush(uint32_t layer, uint32_t rows,
-                                        const ds4_gpu_tensor *out_t,
-                                        ds4_gpu_tensor *in_t,
-                                        uint64_t bytes);
-int ds4_gpu_tp_big_gate_wait(uint64_t seq);
 /* Pause/resume the DVFS keep-alive around work that keeps the GPU busy.
  * No-op when TP is not bound. */
 void ds4_gpu_tp_keepalive_pause(int paused);

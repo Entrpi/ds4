@@ -173,12 +173,6 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
                             const ds4_tp_batch_item *items,
                             uint32_t count);
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status);
-/* Rank-speed balancing: the coordinator computes the lane bias for the next
- * token from its own FFN-gate wait and the worker's (carried back on the
- * logits frame), and the eval command carries it to the worker. */
-int32_t ds4_tp_lane_bias_next(ds4_tp *tp, int32_t shared_dim);
-int ds4_tp_gate_peer_arrived(ds4_tp *tp, uint64_t seq);
-float ds4_tp_peer_wait_us(const ds4_tp *tp);
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen);
 int ds4_tp_send_stop(ds4_tp *tp);
@@ -221,7 +215,6 @@ typedef struct {
     uint32_t n_items;
     ds4_vision_span *images;
     uint32_t n_images;
-    int32_t lane_bias;          /* EVAL: shared-expert lane bias for this token */
 } ds4_tp_command;
 
 int ds4_tp_recv_command(

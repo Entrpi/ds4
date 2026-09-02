@@ -417,8 +417,6 @@ static id<MTLComputePipelineState> g_dsv4_hc_producer_pre_norm_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand_producer_pre_norm_pipeline;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_dsv4_hc_barrier_cache;
 static NSMutableDictionary<NSString *, NSNumber *> *g_dsv4_hc_barrier_gen;
-static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_dsv4_hc_partials_cache;
-static id<MTLComputePipelineState> g_dsv4_hc_expand_slices_pipeline;
 static id<MTLComputePipelineState> g_hc_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_output_hc_weights4_pipeline;
 static uint32_t g_test_flags;
@@ -5380,22 +5378,6 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     };
 }
 
-/* Q8_0 matvec dispatch for the plain f32 kernel family, honouring
- * DS4_METAL_Q8_MV_NR0 (2 or 4 rows per threadgroup; the four-row kernels
- * are bit-exact with the two-row ones).  Only for call sites that bind the
- * dispatch's own function_name. */
-static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch_r(void) {
-    ds4_gpu_mv_dispatch d = ds4_gpu_make_q8_0_mv_dispatch();
-    static int nr0 = -1;
-    if (nr0 < 0) nr0 = (int)ds4_gpu_env_u64("DS4_METAL_Q8_MV_NR0", 2u, 2u, 4u);
-    if (nr0 == 4) {
-        d.function_name = "kernel_mul_mv_q8_0_f32_r4";
-        d.nr0 = 4;
-        d.smem = 32u * 4u * sizeof(float);
-    }
-    return d;
-}
-
 static ds4_gpu_mv_dispatch ds4_gpu_make_plain_mv_dispatch(
         uint64_t in_dim,
         int      f32_weights) {
@@ -9539,9 +9521,7 @@ typedef struct {
     int32_t shared_dim;
     int32_t lane_granule;
     int32_t shift_q16;
-    int32_t bias_lanes;
 } ds4_gpu_shared_split_args;
-static int32_t g_tp_lane_bias;   /* per-token rank-speed bias, set by the coordinator's decision on both ranks */
 static BOOL g_parallel_split_active;
 static ds4_gpu_shared_split_args g_parallel_split_args;
 static id<MTLBuffer> g_parallel_split_ids;
@@ -9892,7 +9872,6 @@ int ds4_gpu_parallel_ffn_start_split(
         .shared_dim = (int32_t)shared_dim,
         .lane_granule = 64,
         .shift_q16 = (int32_t)shift_q16,
-        .bias_lanes = g_tp_lane_bias,
     };
     g_parallel_split_ids = idsbuf;
     g_parallel_split_ids_offset = ds4_gpu_tensor_offset(selected);
@@ -10169,7 +10148,6 @@ typedef struct {
     void *big_in;
     uint64_t big_bytes;
     uint32_t poll;          /* release through the poll region */
-    void *payload_cb;       /* +1 retained payload command buffer (poll gates) */
 } ds4_gpu_tp_request;
 
 enum { DS4_GPU_TP_QUEUE = 1024 };
@@ -10296,8 +10274,6 @@ static volatile uint32_t *g_tp_gpu_flags;   /* CPU view of the flag words */
 static uint64_t g_tp_gpu_flags_off;
 static uint64_t g_tp_seq;
 static ds4_gpu_tp_exchange_fn g_tp_exchange_fn;
-static int (*g_tp_peer_probe_fn)(void *, uint64_t);
-static double g_tp_skew_ewma_us[2];   /* signed peer skew per gate kind: >0 peer early */
 static ds4_gpu_tp_batch_exchange_fn g_tp_batch_exchange_fn;
 static ds4_gpu_tp_big_exchange_fn g_tp_big_exchange_fn;
 
@@ -10531,8 +10507,6 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
          * on the decode critical path and normally tens of microseconds
          * out; yielding here measurably delays the release wake-up. */
         const double t0 = profile ? ds4_gpu_now_ms() : 0.0;
-        int peer_seen = 0;
-        double t_peer = 0.0;
         uint32_t spins = 0;
         if (req.big_bytes > 0) {
             /* Big gates always signal arrival through the batch shared
@@ -10551,18 +10525,6 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                 if (big_spin_us > 0) usleep((useconds_t)big_spin_us);
                 else if (++spins > (1u << 16)) sched_yield();
             }
-            if (req.payload_cb) {
-                /* Pipelined kick: the buffer ended right after the signal.
-                 * The event fires when the GPU is done, but the payload
-                 * stores are only CPU-visible once the buffer completes
-                 * (~15 us later; measured stale rows without this). */
-                id<MTLCommandBuffer> kick_cb = (__bridge_transfer id<MTLCommandBuffer>)req.payload_cb;
-                [kick_cb waitUntilCompleted];
-                if (kick_cb.status != MTLCommandBufferStatusCompleted)
-                    fprintf(stderr, "ds4: TP kick buffer status %lu\n", (unsigned long)kick_cb.status);
-                kick_cb = nil;
-                req.payload_cb = NULL;
-            }
         } else if (!req.event_arrival) {
             const uint32_t slot =
                 req.layer * DS4_GPU_TP_GATES_PER_LAYER + req.gate;
@@ -10571,11 +10533,6 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                 want = DS4_TP_BATCH_FLAG_TAG | (uint32_t)req.seq;
             while (__atomic_load_n(&g_tp_gpu_flags[slot], __ATOMIC_ACQUIRE) != want) {
                 if (g_tp_shutdown) break;
-                if (!peer_seen && g_tp_peer_probe_fn && (spins & 1023u) == 512u &&
-                    g_tp_peer_probe_fn(g_tp_exchange_ud, req.seq)) {
-                    peer_seen = 1;
-                    t_peer = ds4_gpu_now_ms();
-                }
                 if (++spins > (1u << 20)) {
                     sched_yield();
                     spins = 0;
@@ -10655,11 +10612,6 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
             g_tp_exchange_ewma_us[req.gate] =
                 g_tp_exchange_ewma_us[req.gate] == 0.0 ? ex_us :
                 0.9 * g_tp_exchange_ewma_us[req.gate] + 0.1 * ex_us;
-            /* Signed skew: how early the peer was (probe saw its partial before
-             * our flag) or how late (our wait beyond the ~12 us pickup floor). */
-            const double skew_us = peer_seen ? (t1 - t_peer) * 1000.0 : -(ex_us - 12.0);
-            g_tp_skew_ewma_us[req.gate] =
-                0.9 * g_tp_skew_ewma_us[req.gate] + 0.1 * skew_us;
         }
         /* Release the GPU even on failure so end_commands can drain. */
         if (req.rows > 0) {
@@ -10973,26 +10925,6 @@ static int ds4_gpu_tp_flag_fold_take(const ds4_gpu_tensor *out, uint64_t out_byt
     return 1;
 }
 
-void ds4_gpu_tp_set_lane_bias(int32_t bias_lanes) {
-    g_tp_lane_bias = bias_lanes;
-}
-
-int32_t ds4_gpu_tp_lane_bias(void) {
-    return g_tp_lane_bias;
-}
-
-double ds4_gpu_tp_gate_skew_ewma_us(uint32_t gate) {
-    return gate < 2u ? g_tp_skew_ewma_us[gate] : 0.0;
-}
-
-void ds4_gpu_tp_set_peer_probe(int (*fn)(void *, uint64_t)) {
-    g_tp_peer_probe_fn = fn;
-}
-
-double ds4_gpu_tp_gate_wait_ewma_us(uint32_t gate) {
-    return gate < 2u ? g_tp_exchange_ewma_us[gate] : 0.0;
-}
-
 int ds4_gpu_add_tensor_tp_flag(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *a,
@@ -11105,7 +11037,6 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     const bool poll_gate =
         !event_arrival && g_tp_poll_gates && !g_ssd_streaming_mode &&
         slot < DS4_TP_POLL_MAX_SLOTS;
-    id<MTLCommandBuffer> payload_cb = poll_gate ? g_batch_cb : nil;
     if (poll_gate) {
         /* Ending the command buffer is what makes the flag and the partial
          * CPU-visible; the next buffer, already queued, opens with the poll
@@ -11157,11 +11088,6 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     g_tp_queue[tail].gate = gate;
     g_tp_queue[tail].rows = 0;
     g_tp_queue[tail].poll = poll_gate ? 1u : 0u;
-    /* The flag is the early wake-up; the exchange must not read the partial
-     * before the buffer that wrote it has completed (all of its stores are
-     * then visible to the CPU and the NIC). */
-    (void)payload_cb;
-    g_tp_queue[tail].payload_cb = NULL;
     g_tp_queue[tail].event_arrival = event_arrival ? 1u : 0u;
     g_tp_queue[tail].seq = seq;
     g_tp_queue[tail].big_out = NULL;
@@ -11222,7 +11148,6 @@ int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
     g_tp_queue[tail].gate = DS4_GPU_TP_GATE_FFN;
     g_tp_queue[tail].rows = rows;
     g_tp_queue[tail].poll = 0;
-    g_tp_queue[tail].payload_cb = NULL;
     g_tp_queue[tail].event_arrival = event_arrival ? 1u : 0u;
     g_tp_queue[tail].seq = seq;
     g_tp_queue[tail].big_out = NULL;
@@ -11234,24 +11159,13 @@ int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
     return 1;
 }
 
-/* Prefill batch gate kick: same seq space and release event as the verify
- * batch gate, but the service thread exchanges big_bytes directly between
- * the two shared bounce buffers instead of slab slots.  The kick only
- * publishes the GPU arrival marker and queues the exchange; the caller
- * encodes the release wait later through ds4_gpu_tp_big_gate_wait, which
- * lets it interleave more GPU work with the wire exchange.  Arrival always
- * uses the batch shared event, NOT the flag word: a flag write carries no
- * memory-visibility guarantee for the payload buffer, and once the GPU
- * keeps running past the kick (no event wait right behind it) the service
- * thread can observe the flag before the producing kernels' stores reach
- * CPU-visible memory (measured: stale rows in the first sub-kick).  The
- * shared-event signal only fires after every preceding command completes,
- * which is exactly the payload ordering the exchange needs; the ~10 us
- * slower arrival detection is noise against a multi-ms exchange. */
-static uint64_t ds4_gpu_tp_big_gate_kick_impl(uint32_t layer, uint32_t rows,
-                                              const ds4_gpu_tensor *out_t,
-                                              ds4_gpu_tensor *in_t,
-                                              uint64_t bytes, int flush) {
+/* Prefill batch gate: the service thread exchanges big_bytes directly
+ * between two CPU-visible bounce buffers. The shared-event signal orders
+ * all preceding GPU stores before the service thread reads the payload. */
+static uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
+                                         const ds4_gpu_tensor *out_t,
+                                         ds4_gpu_tensor *in_t,
+                                         uint64_t bytes) {
     if (!g_batch_cb) return 0;
     if (!g_tp_thread_running || rows == 0 || bytes == 0) return 0;
     const void *out_ptr = ds4_gpu_tensor_contents((ds4_gpu_tensor *)out_t);
@@ -11263,26 +11177,10 @@ static uint64_t ds4_gpu_tp_big_gate_kick_impl(uint32_t layer, uint32_t rows,
     const uint64_t seq = ++g_tp_batch_seq;
     ds4_gpu_close_batch_encoder();
     [g_batch_cb encodeSignalEvent:g_tp_batch_gpu_event value:seq];
-    void *kick_cb = NULL;
-    if (flush) {
-        /* End the buffer here so the signal (and the payload stores) are
-         * published while the caller keeps encoding; the service thread
-         * waits for this buffer's completion before reading the payload. */
-        kick_cb = (__bridge_retained void *)g_batch_cb;
-        if (!ds4_gpu_flush_commands()) {
-            id<MTLCommandBuffer> drop = (__bridge_transfer id<MTLCommandBuffer>)kick_cb;
-            (void)drop;
-            return 0;
-        }
-    }
     pthread_mutex_lock(&g_tp_mutex);
     if (g_tp_queue_count >= DS4_GPU_TP_QUEUE) {
         pthread_mutex_unlock(&g_tp_mutex);
         fprintf(stderr, "ds4: TP gate queue overflow\n");
-        if (kick_cb) {
-            id<MTLCommandBuffer> drop = (__bridge_transfer id<MTLCommandBuffer>)kick_cb;
-            (void)drop;
-        }
         return 0;
     }
     uint32_t tail = (g_tp_queue_head + g_tp_queue_count) % DS4_GPU_TP_QUEUE;
@@ -11295,34 +11193,13 @@ static uint64_t ds4_gpu_tp_big_gate_kick_impl(uint32_t layer, uint32_t rows,
     g_tp_queue[tail].big_in = in_ptr;
     g_tp_queue[tail].big_bytes = bytes;
     g_tp_queue[tail].poll = 0;
-    g_tp_queue[tail].payload_cb = kick_cb;
     g_tp_queue_count++;
     pthread_cond_signal(&g_tp_cond);
     pthread_mutex_unlock(&g_tp_mutex);
     return seq;
 }
 
-uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
-                                  const ds4_gpu_tensor *out_t,
-                                  ds4_gpu_tensor *in_t,
-                                  uint64_t bytes) {
-    return ds4_gpu_tp_big_gate_kick_impl(layer, rows, out_t, in_t, bytes, 0);
-}
-
-/* Pipelined kick: signals, ends the command buffer, and lets the caller
- * keep encoding into a fresh one while the exchange runs. */
-uint64_t ds4_gpu_tp_big_gate_kick_flush(uint32_t layer, uint32_t rows,
-                                        const ds4_gpu_tensor *out_t,
-                                        ds4_gpu_tensor *in_t,
-                                        uint64_t bytes) {
-    return ds4_gpu_tp_big_gate_kick_impl(layer, rows, out_t, in_t, bytes, 1);
-}
-
-/* Encode the GPU-side release wait for a previously kicked big gate.  The
- * batch release event is monotonic and the service thread completes queued
- * exchanges in kick order, so waiting on the LAST kicked seq of a stage
- * also covers every earlier kick. */
-int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
+static int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
     if (!g_batch_cb || seq == 0) return 0;
     ds4_gpu_close_batch_encoder();
     [g_batch_cb encodeWaitForEvent:g_tp_batch_cpu_event value:seq];
@@ -19417,7 +19294,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             }
 
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
-            ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch_r();
+            ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
             if (out_dim > 65536u) mv_dispatch.nsg = 8;
             mv_args.nr0 = mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
@@ -19695,7 +19572,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
                 &inner_offset);
         if (!wbuf) return 0;
 
-        ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch_r();
+        ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch();
         if (out_dim > 65536u) dispatch.nsg = 8;
         ds4_gpu_q8_0_matvec_args args =
             ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
@@ -20157,7 +20034,7 @@ int ds4_gpu_matmul_q8_0_rows_scalar_tensor(
         if (!wbuf) return 0;
 
         ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
-        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch_r();
+        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
         if (out_dim > 65536u) mv_dispatch.nsg = 8;
         mv_args.nr0 = mv_dispatch.nr0;
         id<MTLComputePipelineState> pipeline =
@@ -26343,7 +26220,7 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(full_in_dim, out_dim);
         mv_args.ne00 = (int32_t)k_cnt;
         mv_args.ne10 = (int32_t)k_cnt;
-        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch_r();
+        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
         if (out_dim > 65536u) mv_dispatch.nsg = 8;
         mv_args.nr0 = mv_dispatch.nr0;
         /* TP partial producer: publish the gate's checked flag from the
@@ -26353,8 +26230,7 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
             ds4_gpu_tp_flag_fold_take(out, out_dim * sizeof(float), &fold_slot, &fold_value);
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline(
-                fold ? (mv_dispatch.nr0 == 4 ? "kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked_r4"
-                                             : "kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked")
+                fold ? "kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked"
                      : mv_dispatch.function_name,
                 mv_dispatch.nsg);
         if (!pipeline) return 0;
@@ -44806,23 +44682,6 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
         }
         id<MTLComputePipelineState> producer =
             g_dsv4_hc_expand_producer_pre_norm_pipeline;
-        /* Slice-parallel HC step (no spin barrier) behind
-         * DS4_METAL_HC_EXPAND_SLICES=1: measured 16.7 us vs the cluster
-         * kernel's 14.5 (its serial collapse/norm tail and launch cost more
-         * than the barrier saved), so the cluster kernel stays the default. */
-        static int use_slices = -1;
-        if (use_slices < 0) {
-            const char *e = getenv("DS4_METAL_HC_EXPAND_SLICES");
-            use_slices = e ? (atoi(e) != 0) : 0;
-        }
-        if (use_slices) {
-            if (!g_dsv4_hc_expand_slices_pipeline) {
-                g_dsv4_hc_expand_slices_pipeline =
-                    ds4_gpu_get_pipeline("kernel_dsv4_hc_expand4_mix_norm_slices_f16");
-            }
-            if (g_dsv4_hc_expand_slices_pipeline) producer = g_dsv4_hc_expand_slices_pipeline;
-            else use_slices = 0;
-        }
         id<MTLBuffer> blockbuf = ds4_gpu_tensor_buffer(block_out);
         id<MTLBuffer> addbuf = ds4_gpu_tensor_buffer(block_add);
         id<MTLBuffer> prevbuf = ds4_gpu_tensor_buffer(residual_prev);
@@ -44838,7 +44697,7 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
                     "ds4: Metal fused HC expand/producer received undersized expand buffers\n");
             return 0;
         }
-        if (!producer || producer.maxTotalThreadsPerThreadgroup < (use_slices ? 256u : 512u)) {
+        if (!producer || producer.maxTotalThreadsPerThreadgroup < 512u) {
             return 0;
         }
         if (!g_dsv4_completion_cache) return 0;
@@ -44885,18 +44744,6 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
             (uint32_t)[[g_dsv4_hc_barrier_gen objectForKey:barrier_key] unsignedIntValue] + 1u;
         [g_dsv4_hc_barrier_gen setObject:@(gen) forKey:barrier_key];
         const uint32_t barrier_target = 6u * gen;
-        id<MTLBuffer> partials = nil;
-        if (use_slices) {
-            if (!g_dsv4_hc_partials_cache) g_dsv4_hc_partials_cache = [NSMutableDictionary dictionary];
-            partials = [g_dsv4_hc_partials_cache objectForKey:barrier_key];
-            if (!partials) {
-                partials = [g_device newBufferWithLength:64u * 32u * sizeof(float)
-                                                 options:MTLResourceStorageModeShared];
-                if (!partials) return 0;
-                memset([partials contents], 0, 64u * 32u * sizeof(float));
-                [g_dsv4_hc_partials_cache setObject:partials forKey:barrier_key];
-            }
-        }
         [g_transient_buffers addObject:barrier];
         ds4_gpu_hc_expand_args ex = {
             .n_embd = n_embd,
@@ -44973,16 +44820,9 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
         [enc setBuffer:prevbuf offset:ds4_gpu_tensor_offset(residual_prev) atIndex:17];
         [enc setBuffer:postbuf offset:ds4_gpu_tensor_offset(post) atIndex:18];
         [enc setBuffer:combbuf offset:ds4_gpu_tensor_offset(comb) atIndex:19];
-        if (use_slices) {
-            [enc setBuffer:partials offset:0 atIndex:20];
-            [enc setThreadgroupMemoryLength:(64u + 256u + 4u + 32u + 4u + 8u + 64u * 25u + 8u) * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(64, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
-        } else {
         [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(6, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 16, 1)];
-        }
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(

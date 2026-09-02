@@ -197,22 +197,6 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
-// Four rows per threadgroup: the same per-row K walk and reduction tree
-// (bit-exact with the two-row kernel), twice the bytes in flight per
-// threadgroup.  Selected by DS4_METAL_Q8_MV_NR0=4.
-[[host_name("kernel_mul_mv_q8_0_f32_r4")]]
-kernel void kernel_mul_mv_q8_0_f32_r4(
-        constant ds4_metal_args_mul_mv & args,
-        device const char * src0,
-        device const char * src1,
-        device       char * dst,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_q8_0_f32_impl<4, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
-}
-
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
 // K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
 // poll-gate flag published by the last-arriving threadgroup (see
@@ -358,28 +342,6 @@ kernel void kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked(
             args, flag, check, value, ctl, ntg, src0, src1, dst, shmem,
             ctl_shmem, tgpig, tiisg, sgitg);
 }
-
-[[host_name("kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked_r4")]]
-kernel void kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked_r4(
-        constant ds4_metal_args_mul_mv & args,
-        device const char * src0,
-        device const char * src1,
-        device       char * dst,
-        device atomic_uint & flag,
-        device atomic_uint & check,
-        constant uint & value,
-        device atomic_uint * ctl,
-        constant uint & ntg,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        threadgroup  uint * ctl_shmem [[threadgroup(1)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_dsv4_mul_mv_q8_0_f32_tp_flag_impl<4>(
-            args, flag, check, value, ctl, ntg, src0, src1, dst, shmem,
-            ctl_shmem, tgpig, tiisg, sgitg);
-}
-
 
 // Decode Q-A/KV pair. Both projections consume the same activation row but
 // have independent weight ranges and output extents. Keep the standalone Q8_0
@@ -879,7 +841,6 @@ typedef struct {
     int32_t shared_dim;
     int32_t lane_granule;
     int32_t shift_q16;
-    int32_t bias_lanes;   /* runtime rank-speed bias, added to lanes0 */
 } ds4_metal_shared_split_args;
 
 static inline void ds4_shared_split_range(
@@ -898,7 +859,7 @@ static inline void ds4_shared_split_range(
         (int64_t)(n1 - n0) * (int64_t)sp.shift_q16 * (int64_t)sp.shared_dim;
     const int delta = (int)(delta_q16 >= 0 ? (delta_q16 >> 16)
                                           : -((-delta_q16) >> 16));
-    int lanes0 = sp.shared_dim / 2 + delta + sp.bias_lanes;
+    int lanes0 = sp.shared_dim / 2 + delta;
     lanes0 = clamp(lanes0, 0, sp.shared_dim);
     const int granule = sp.lane_granule;
     lanes0 = ((lanes0 + granule / 2) / granule) * granule;
