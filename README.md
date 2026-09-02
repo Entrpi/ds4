@@ -938,6 +938,7 @@ README prompt):
 | decode, 2048-token context | ~48 t/s | |
 | prefill | ~250 t/s at 128 tokens, ~850 t/s at 2048 | ~10 t/s |
 | startup | ~10 s per Mac (pins its shard) | |
+| DSpark (`--dspark`) | slower than plain decode here (30-40 t/s: each draft row re-streams its experts) | |
 
 Things that cost speed on the coordinator: a remote screen-sharing session
 or an animated wallpaper (the display compositor takes GPU time from the
