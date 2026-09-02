@@ -9429,6 +9429,24 @@ static int g_parallel_ffn_mode; /* 2: gate/up + down */
 static int g_parallel_ffn_stage;
 static BOOL g_parallel_q8_pending;
 static BOOL g_parallel_q8_encoded;
+/* GPU-decided shared-expert lane split (see ds4_shared_split_range in
+ * metal/dense.metal): the split kernels read the selected expert ids and
+ * take a complementary lane range per rank sized to balance the bytes each
+ * rank streams; the host binds full weight ranges and the ids buffer. */
+typedef struct {
+    int32_t tp_rank;
+    int32_t tp_world;
+    int32_t n_expert;
+    int32_t n_expert_used;
+    int32_t shared_dim;
+    int32_t lane_granule;
+    int32_t shift_q16;
+    int32_t pad;
+} ds4_gpu_shared_split_args;
+static BOOL g_parallel_split_active;
+static ds4_gpu_shared_split_args g_parallel_split_args;
+static id<MTLBuffer> g_parallel_split_ids;
+static NSUInteger g_parallel_split_ids_offset;
 
 /* Reset is deliberately idempotent. Closing the concurrent encoder preserves
  * work already encoded, while clearing every admission/reference field keeps
@@ -9473,6 +9491,10 @@ static void ds4_gpu_parallel_ffn_reset_state(BOOL close_encoder) {
     g_parallel_gate_up_clamp = 0.0f;
     g_parallel_gate_up_nsg = 0;
     g_parallel_gate_up_nr0 = 0;
+    g_parallel_split_active = NO;
+    g_parallel_split_args = (ds4_gpu_shared_split_args){0};
+    g_parallel_split_ids = nil;
+    g_parallel_split_ids_offset = 0;
     g_parallel_gate_up_smem = 0;
 }
 
@@ -9657,17 +9679,156 @@ int ds4_gpu_parallel_ffn_start_sliced(
         shared_lane_offset, shared_lane_count, x, clamp);
 }
 
+int ds4_gpu_parallel_ffn_start_split(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *shared_out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint32_t              model_dim,
+        uint32_t              shared_dim,
+        const ds4_gpu_tensor *x,
+        float                 clamp,
+        const ds4_gpu_tensor *selected,
+        uint32_t              tp_rank,
+        uint32_t              tp_world,
+        uint32_t              n_expert,
+        uint32_t              n_expert_used,
+        uint32_t              shift_q16) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!g_batch_cb || g_parallel_q8_pending || g_batch_encoder_concurrent ||
+        !gate || !up || !mid || !shared_out || !x || !selected || !model_map ||
+        model_dim == 0 || shared_dim == 0 ||
+        tp_world != 2 || tp_rank >= tp_world ||
+        n_expert == 0 || (n_expert % tp_world) != 0 || n_expert_used == 0 ||
+        n_expert_used > 64 || shift_q16 > 65536u ||
+        (model_dim & 31u) != 0 || (shared_dim & 63u) != 0 ||
+        !isfinite(clamp) || clamp < 0.0f) {
+        return 0;
+    }
+    id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+    id<MTLBuffer> gatebuf = ds4_gpu_tensor_buffer(gate);
+    id<MTLBuffer> upbuf = ds4_gpu_tensor_buffer(up);
+    id<MTLBuffer> midbuf = ds4_gpu_tensor_buffer(mid);
+    id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(shared_out);
+    id<MTLBuffer> idsbuf = ds4_gpu_tensor_buffer(selected);
+    if (!xbuf || !gatebuf || !upbuf || !midbuf || !outbuf || !idsbuf ||
+        ds4_gpu_tensor_bytes(x) < (uint64_t)model_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(gate) < (uint64_t)shared_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(up) < (uint64_t)shared_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(mid) < (uint64_t)shared_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(shared_out) < (uint64_t)model_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(selected) < (uint64_t)n_expert_used * sizeof(int32_t)) {
+        return 0;
+    }
+    const uint64_t gate_row_bytes = ((uint64_t)model_dim / 32u) * 34u;
+    const uint64_t gate_weight_bytes = (uint64_t)shared_dim * gate_row_bytes;
+    const uint64_t down_row_bytes = ((uint64_t)shared_dim / 32u) * 34u;
+    const uint64_t down_weight_bytes = (uint64_t)model_dim * down_row_bytes;
+    if (gate_offset > model_size || gate_weight_bytes > model_size - gate_offset ||
+        up_offset > model_size || gate_weight_bytes > model_size - up_offset ||
+        down_offset > model_size || down_weight_bytes > model_size - down_offset) {
+        return 0;
+    }
+    uint64_t gate_inner = 0, up_inner = 0, down_inner = 0;
+    id<MTLBuffer> gate_wbuf = ds4_gpu_wrap_model_range(
+        model_map, model_size, gate_offset, gate_weight_bytes, &gate_inner);
+    id<MTLBuffer> up_wbuf = ds4_gpu_wrap_model_range(
+        model_map, model_size, up_offset, gate_weight_bytes, &up_inner);
+    id<MTLBuffer> down_wbuf = ds4_gpu_wrap_model_range(
+        model_map, model_size, down_offset, down_weight_bytes, &down_inner);
+    if (!gate_wbuf || !up_wbuf || !down_wbuf) return 0;
+    ds4_gpu_mv_dispatch gate_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+    id<MTLComputePipelineState> gate_pipeline =
+        ds4_gpu_get_mul_mv_pipeline(
+            "kernel_dsv4_shared_gate_up_swiglu_q8_0_split", gate_dispatch.nsg);
+    id<MTLComputePipelineState> down_pipeline =
+        ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_shared_down_q8_0_split", 4);
+    if (!gate_pipeline || !down_pipeline ||
+        down_pipeline.maxTotalThreadsPerThreadgroup < 128u) {
+        return 0;
+    }
+    ds4_gpu_close_batch_encoder();
+    g_batch_encoder_concurrent = YES;
+    g_parallel_gate_up_pipeline = gate_pipeline;
+    g_parallel_gate_weight = gate_wbuf;
+    g_parallel_up_weight = up_wbuf;
+    g_parallel_gate_x = xbuf;
+    g_parallel_gate_out = gatebuf;
+    g_parallel_up_out = upbuf;
+    g_parallel_mid_out = midbuf;
+    g_parallel_gate_weight_offset = (NSUInteger)gate_inner;
+    g_parallel_up_weight_offset = (NSUInteger)up_inner;
+    g_parallel_gate_x_offset = ds4_gpu_tensor_offset(x);
+    g_parallel_gate_out_offset = ds4_gpu_tensor_offset(gate);
+    g_parallel_up_out_offset = ds4_gpu_tensor_offset(up);
+    g_parallel_mid_out_offset = ds4_gpu_tensor_offset(mid);
+    /* Full width: the grid covers every shared row and the kernels trim to
+     * the rank's lane range. */
+    g_parallel_gate_up_args = ds4_gpu_make_q8_0_mv_args(model_dim, shared_dim);
+    g_parallel_gate_up_args.nr0 = gate_dispatch.nr0;
+    g_parallel_gate_up_clamp = clamp;
+    g_parallel_gate_up_nsg = gate_dispatch.nsg;
+    g_parallel_gate_up_nr0 = gate_dispatch.nr0;
+    g_parallel_gate_up_smem = gate_dispatch.smem;
+    g_parallel_q8_pipeline = down_pipeline;
+    g_parallel_q8_weight = down_wbuf;
+    g_parallel_q8_x = midbuf;
+    g_parallel_q8_out = outbuf;
+    g_parallel_q8_weight_offset = (NSUInteger)down_inner;
+    g_parallel_q8_x_offset = ds4_gpu_tensor_offset(mid);
+    g_parallel_q8_out_offset = ds4_gpu_tensor_offset(shared_out);
+    g_parallel_q8_args = ds4_gpu_make_q8_0_mv_args(shared_dim, model_dim);
+    g_parallel_q8_args.nr0 = 2;
+    g_parallel_split_active = YES;
+    g_parallel_split_args = (ds4_gpu_shared_split_args) {
+        .tp_rank = (int32_t)tp_rank,
+        .tp_world = (int32_t)tp_world,
+        .n_expert = (int32_t)n_expert,
+        .n_expert_used = (int32_t)n_expert_used,
+        .shared_dim = (int32_t)shared_dim,
+        .lane_granule = 64,
+        .shift_q16 = (int32_t)shift_q16,
+        .pad = 0,
+    };
+    g_parallel_split_ids = idsbuf;
+    g_parallel_split_ids_offset = ds4_gpu_tensor_offset(selected);
+    g_parallel_ffn_mode = 2;
+    g_parallel_ffn_stage = 0;
+    g_parallel_q8_pending = YES;
+    g_parallel_q8_encoded = NO;
+    return 1;
+}
+
 static void ds4_gpu_encode_parallel_q8_down(
         id<MTLComputeCommandEncoder> enc) {
     [enc setComputePipelineState:g_parallel_q8_pipeline];
     [enc setBytes:&g_parallel_q8_args
            length:sizeof(g_parallel_q8_args)
           atIndex:0];
+    if (g_parallel_split_active) {
+        [enc setBytes:&g_parallel_split_args
+               length:sizeof(g_parallel_split_args)
+              atIndex:1];
+        [enc setBuffer:g_parallel_q8_weight
+                offset:g_parallel_q8_weight_offset
+               atIndex:2];
+        [enc setBuffer:g_parallel_q8_x offset:g_parallel_q8_x_offset atIndex:3];
+        [enc setBuffer:g_parallel_q8_out offset:g_parallel_q8_out_offset atIndex:4];
+        [enc setBuffer:g_parallel_split_ids
+                offset:g_parallel_split_ids_offset
+               atIndex:5];
+    } else {
     [enc setBuffer:g_parallel_q8_weight
             offset:g_parallel_q8_weight_offset
            atIndex:1];
     [enc setBuffer:g_parallel_q8_x offset:g_parallel_q8_x_offset atIndex:2];
     [enc setBuffer:g_parallel_q8_out offset:g_parallel_q8_out_offset atIndex:3];
+    }
     [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake(
              ((NSUInteger)g_parallel_q8_args.ne0 + 1u) / 2u, 1, 1)
@@ -9686,6 +9847,38 @@ static int ds4_gpu_parallel_q8_matvec_encode_pending(
     if (!enc || enc.dispatchType != MTLDispatchTypeConcurrent) return 0;
 
     [enc setComputePipelineState:g_parallel_gate_up_pipeline];
+    if (g_parallel_split_active) {
+        [enc setBytes:&g_parallel_gate_up_args
+               length:sizeof(g_parallel_gate_up_args)
+              atIndex:0];
+        [enc setBytes:&g_parallel_split_args
+               length:sizeof(g_parallel_split_args)
+              atIndex:1];
+        [enc setBuffer:g_parallel_gate_weight
+                offset:g_parallel_gate_weight_offset
+               atIndex:2];
+        [enc setBuffer:g_parallel_up_weight
+                offset:g_parallel_up_weight_offset
+               atIndex:3];
+        [enc setBuffer:g_parallel_gate_x
+                offset:g_parallel_gate_x_offset
+               atIndex:4];
+        [enc setBuffer:g_parallel_gate_out
+                offset:g_parallel_gate_out_offset
+               atIndex:5];
+        [enc setBuffer:g_parallel_up_out
+                offset:g_parallel_up_out_offset
+               atIndex:6];
+        [enc setBuffer:g_parallel_mid_out
+                offset:g_parallel_mid_out_offset
+               atIndex:7];
+        [enc setBytes:&g_parallel_gate_up_clamp
+               length:sizeof(g_parallel_gate_up_clamp)
+              atIndex:8];
+        [enc setBuffer:g_parallel_split_ids
+                offset:g_parallel_split_ids_offset
+               atIndex:9];
+    } else {
         [enc setBytes:&g_parallel_gate_up_args
                length:sizeof(g_parallel_gate_up_args)
               atIndex:0];
@@ -9710,6 +9903,7 @@ static int ds4_gpu_parallel_q8_matvec_encode_pending(
         [enc setBytes:&g_parallel_gate_up_clamp
                length:sizeof(g_parallel_gate_up_clamp)
               atIndex:7];
+    }
         [enc setThreadgroupMemoryLength:2u * g_parallel_gate_up_smem atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(
                  ((NSUInteger)g_parallel_gate_up_args.ne0 +
