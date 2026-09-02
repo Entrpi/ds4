@@ -197,6 +197,152 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
+// K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
+// poll-gate flag published by the last-arriving threadgroup (see
+// kernel_dsv4_add2_f32_tp_flag_checked).  Writes exactly the values the plain
+// kernel writes; the checksum is the integer sum of the stored words.
+template<short NR0>
+void kernel_dsv4_mul_mv_q8_0_f32_tp_flag_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device atomic_uint & flag,
+        device atomic_uint & check,
+        constant uint & value,
+        device atomic_uint * ctl,
+        constant uint & ntg,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        threadgroup uint * ctl_shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00/QK8_0;
+
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    device const float * y = (device const float *) (src1 + offset1);
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+        ax[row] = (device const block_q8_0 *) ((device char *) src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+
+    const int ib0 = sgitg*NQ + ix;
+
+    float yl[NQ];
+
+    device const float * yb = y + ib0*QK8_0 + il*NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        for (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
+
+            sumf[row] += sumq*ax[row][ib].d;
+        }
+
+        yb += NSG*NQ*QK8_0;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    // Reduce and write exactly as the plain kernel does, keeping the stored
+    // words for the checksum.
+    {
+        constexpr short NWR = N_SIMDWIDTH;
+        threadgroup float * shmem_f32[NR0];
+        for (short row = 0; row < NR0; ++row) {
+            shmem_f32[row] = (threadgroup float *) shmem + NWR*row;
+            if (sgitg == 0) {
+                shmem_f32[row][tiisg] = 0.0f;
+            }
+            sumf[row] = simd_sum(sumf[row]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short row = 0; row < NR0; ++row) {
+            if (tiisg == 0) {
+                shmem_f32[row][sgitg] = sumf[row];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint words = 0u;
+        for (short row = 0; row < NR0 && r0 + row < args.ne01; ++row) {
+            float tot = simd_sum(shmem_f32[row][tiisg]);
+            if (tiisg == 0 && sgitg == 0) {
+                dst_f32[r0 + row] = tot;
+                words += as_type<uint>(tot);
+            }
+        }
+        // Publish: accumulate this threadgroup's words, then arrive; the
+        // last arriver writes the checksum and the flag.
+        if (tiisg == 0 && sgitg == 0) ctl_shmem[0] = words;
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+        if (tiisg == 0 && sgitg == 0) {
+            atomic_fetch_add_explicit(&ctl[1], ctl_shmem[0], memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        if (tiisg == 0 && sgitg == 0) {
+            const uint old = atomic_fetch_add_explicit(&ctl[0], 1u, memory_order_relaxed);
+            if (old + 1u == ntg) {
+                const uint total = atomic_exchange_explicit(&ctl[1], 0u, memory_order_relaxed);
+                atomic_store_explicit(&ctl[0], 0u, memory_order_relaxed);
+                atomic_store_explicit(&check, total ^ (value * 0x9E3779B9u), memory_order_relaxed);
+                atomic_store_explicit(&flag, value, memory_order_relaxed);
+            }
+        }
+    }
+}
+
+[[host_name("kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked")]]
+kernel void kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device atomic_uint & flag,
+        device atomic_uint & check,
+        constant uint & value,
+        device atomic_uint * ctl,
+        constant uint & ntg,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        threadgroup  uint * ctl_shmem [[threadgroup(1)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_mul_mv_q8_0_f32_tp_flag_impl<N_R0_Q8_0>(
+            args, flag, check, value, ctl, ntg, src0, src1, dst, shmem,
+            ctl_shmem, tgpig, tiisg, sgitg);
+}
+
 
 // Decode Q-A/KV pair. Both projections consume the same activation row but
 // have independent weight ranges and output extents. Keep the standalone Q8_0

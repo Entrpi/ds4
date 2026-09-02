@@ -136,6 +136,22 @@ int ds4_gpu_parallel_ffn_start_split(
         uint32_t              n_expert,
         uint32_t              n_expert_used,
         uint32_t              shift_q16);
+
+/* out = a + b into this rank's TP slab slot for (layer, gate), publishing the
+ * gate's checked flag from the same kernel; falls back to ds4_gpu_add_tensor
+ * when the fold does not apply.  Call right before ds4_gpu_tp_gate_encode. */
+int ds4_gpu_add_tensor_tp_flag(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        uint32_t              n,
+        uint32_t              layer,
+        uint32_t              gate);
+
+/* Register that the next TP partial producer for (layer, gate) may publish
+ * the gate's checked flag itself (taken by the attention output K-slice
+ * matvec when its output is that slot; otherwise ignored). */
+void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate);
 #endif
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);

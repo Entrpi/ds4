@@ -24454,6 +24454,11 @@ static bool metal_graph_encode_decode_layer_phase(
          * output groups and the matching k-window of the expand projection,
          * leaving a partial block output in the gate slot. */
         const uint32_t tp_groups = n_groups / 2;
+#if defined(__APPLE__)
+        /* The K-slice matvec that writes the partial may publish the gate's
+         * checked flag itself (see ds4_gpu_tp_flag_fold_request). */
+        ds4_gpu_tp_flag_fold_request(il, DS4_TP_GATE_ATTN);
+#endif
         ok = metal_graph_attention_output_dense_quant_tp(
                 g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN],
                 metal_graph_attn_low(g),
@@ -26107,8 +26112,9 @@ static bool metal_graph_encode_decode_layer_phase(
          * routed_out. */
         const uint32_t tp_slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
         if (!tp_fold_ffn) {
-            ok = ds4_gpu_add_tensor(g->tp_out[tp_slot], metal_graph_shared_out(g), metal_graph_routed_out(g),
-                                    DS4_N_EMBD) != 0;
+            ok = ds4_gpu_add_tensor_tp_flag(g->tp_out[tp_slot], metal_graph_shared_out(g),
+                                            metal_graph_routed_out(g), DS4_N_EMBD,
+                                            il, DS4_TP_GATE_FFN) != 0;
         }
         if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
         if (ok) {

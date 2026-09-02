@@ -4627,6 +4627,25 @@ static const char *ds4_gpu_source =
 "    dst[dst_offset + (ulong)gid] = src[off];\n"
 "}\n"
 "\n"
+"// Gate-time prefetch: one dispatch over up to 8 ranges given as GPU\n"
+"// addresses (bindless views over the model), 128 B per thread, ranges\n"
+"// assigned by cumulative line counts.  One launch instead of one per\n"
+"// range: the fixed cost per dispatch is what a rank pays when its peer's\n"
+"// partial is already there.\n"
+"kernel void kernel_touch_u8_stride_table(\n"
+"        constant ulong        *addr       [[buffer(0)]],\n"
+"        constant uint         *lines      [[buffer(1)]],\n"
+"        constant uint         &count      [[buffer(2)]],\n"
+"        device uchar          *dst        [[buffer(3)]],\n"
+"        uint gid [[thread_position_in_grid]]) {\n"
+"    uint line = gid;\n"
+"    uint i = 0;\n"
+"    while (i < count && line >= lines[i]) { line -= lines[i]; i++; }\n"
+"    if (i >= count) return;\n"
+"    device const uchar *src = (device const uchar *)addr[i];\n"
+"    dst[gid] = src[(ulong)line * 128ul];\n"
+"}\n"
+"\n"
 "enum ds4_sort_order {\n"
 "    DS4_SORT_ORDER_ASC,\n"
 "    DS4_SORT_ORDER_DESC,\n"
@@ -10166,6 +10185,12 @@ static uint64_t g_tp_poll_prev_seq;
 static double g_tp_exchange_ewma_us[2];        /* per gate kind, always on */
 typedef struct { uint64_t offset; uint64_t bytes; } ds4_tp_prefetch_range;
 static ds4_tp_prefetch_range g_tp_prefetch_plan[2][DS4_TP_PREFETCH_MAX]; /* per gate kind */
+/* Gate flag folded into the payload producer (see
+ * kernel_dsv4_add2_f32_tp_flag_checked): the producer publishes the checked
+ * flag for the sequence number the next gate encode will use, and the gate
+ * encode skips its own flag kernel. */
+static uint64_t g_tp_flag_prepublished_seq;
+static id<MTLBuffer> g_tp_fold_ctl;
 static uint32_t g_tp_prefetch_count[2];
 static const void *g_tp_prefetch_map;
 static uint64_t g_tp_prefetch_map_size;
@@ -10268,6 +10293,8 @@ int ds4_gpu_tp_gate_prefetch_plan(uint32_t gate,
 }
 
 /* Encode the touch dispatches of one gate's plan into the open batch. */
+static uint64_t ds4_gpu_buffer_address(id<MTLBuffer> buffer, NSUInteger inner);
+
 static int ds4_gpu_tp_encode_gate_prefetch(uint32_t gate) {
     const uint32_t n = g_tp_prefetch_count[gate];
     g_tp_prefetch_count[gate] = 0;
@@ -10278,40 +10305,63 @@ static int ds4_gpu_tp_encode_gate_prefetch(uint32_t gate) {
                                   options:MTLResourceStorageModePrivate];
         if (!g_tp_prefetch_scratch) return 1;
     }
-    id<MTLComputePipelineState> touch = ds4_gpu_get_pipeline("kernel_touch_u8_stride");
+    id<MTLComputePipelineState> touch = ds4_gpu_get_pipeline("kernel_touch_u8_stride_table");
     if (!touch) return 1;
     /* Budget: what fits in this rank's typical wait at this gate kind. The
      * first observations use a small default so a slow rank never delays
      * its own release pickup. */
     const double wait_us = g_tp_exchange_ewma_us[gate];
-    uint64_t budget = wait_us > DS4_TP_PREFETCH_MARGIN_US
-        ? (uint64_t)((wait_us - DS4_TP_PREFETCH_MARGIN_US) * (double)DS4_TP_PREFETCH_BYTES_PER_US)
+    /* Diagnostics: DS4_TP_PREFETCH_MARGIN_US and DS4_TP_PREFETCH_BYTES_PER_US
+     * override the sizing constants for experiments. */
+    static double margin_us = -1.0;
+    static double bytes_per_us = -1.0;
+    if (margin_us < 0.0) {
+        margin_us = (double)ds4_gpu_env_u64("DS4_TP_PREFETCH_MARGIN_US",
+                                            (uint64_t)DS4_TP_PREFETCH_MARGIN_US, 0u, 1000u);
+        bytes_per_us = (double)ds4_gpu_env_u64("DS4_TP_PREFETCH_BYTES_PER_US",
+                                               DS4_TP_PREFETCH_BYTES_PER_US, 1000u, 10000000ull);
+    }
+    uint64_t budget = wait_us > margin_us
+        ? (uint64_t)((wait_us - margin_us) * bytes_per_us)
         : 0u;
     if (wait_us == 0.0) budget = 4u << 20;
     if (budget == 0u) return 1;
-    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
-    [enc setComputePipelineState:touch];
     const uint64_t stride = 128;
+    uint64_t addr[DS4_TP_PREFETCH_MAX] = {0};
+    uint32_t lines[DS4_TP_PREFETCH_MAX] = {0};
+    id<MTLResource> views[DS4_TP_PREFETCH_MAX];
+    uint32_t count = 0;
+    uint64_t total_lines = 0;
     for (uint32_t i = 0; i < n && budget != 0u; i++) {
         uint64_t inner = 0;
         uint64_t bytes = g_tp_prefetch_plan[gate][i].bytes;
         if (bytes > budget) bytes = budget;
         budget -= bytes;
+        if (bytes == 0u) continue;
         id<MTLBuffer> src = ds4_gpu_wrap_model_range(
             g_tp_prefetch_map, g_tp_prefetch_map_size,
             g_tp_prefetch_plan[gate][i].offset, bytes, &inner);
         if (!src) continue;
-        const uint64_t lines = (bytes + stride - 1u) / stride;
-        if (lines > (1u << 20)) continue;
-        const uint64_t dst_offset = 0;
-        [enc setBuffer:src offset:(NSUInteger)inner atIndex:0];
-        [enc setBuffer:g_tp_prefetch_scratch offset:0 atIndex:1];
-        [enc setBytes:&stride length:sizeof(stride) atIndex:2];
-        [enc setBytes:&bytes length:sizeof(bytes) atIndex:3];
-        [enc setBytes:&dst_offset length:sizeof(dst_offset) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((lines + 255u) / 256u), 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        const uint64_t range_lines = (bytes + stride - 1u) / stride;
+        if (total_lines + range_lines > (1u << 20)) break;
+        const uint64_t address = ds4_gpu_buffer_address(src, (NSUInteger)inner);
+        if (address == 0u) continue;
+        addr[count] = address;
+        lines[count] = (uint32_t)range_lines;
+        views[count] = src;
+        total_lines += range_lines;
+        count++;
     }
+    if (count == 0u) return 1;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+    [enc setComputePipelineState:touch];
+    [enc useResources:views count:count usage:MTLResourceUsageRead];
+    [enc setBytes:addr length:sizeof(addr) atIndex:0];
+    [enc setBytes:lines length:sizeof(lines) atIndex:1];
+    [enc setBytes:&count length:sizeof(count) atIndex:2];
+    [enc setBuffer:g_tp_prefetch_scratch offset:0 atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((total_lines + 255u) / 256u), 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     ds4_gpu_end_compute_encoder(g_batch_cb, enc);
     return 1;
 }
@@ -10709,6 +10759,127 @@ void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
     g_tp_split_world = suspend ? 1 : 2;
 }
 
+/* Fold request for producers that write the TP partial with a generic matvec
+ * (the attention output K-slice): the layer code registers (layer, gate)
+ * right before the producer call; the producer takes the request when its
+ * output is that slot and publishes the checked flag itself. */
+static int g_tp_fold_req_active;
+static uint32_t g_tp_fold_req_layer;
+static uint32_t g_tp_fold_req_gate;
+
+static bool ds4_gpu_tp_flag_fold_ok(uint32_t slot, uint64_t bytes) {
+    return g_initialized && g_batch_cb && g_tp_thread_running &&
+           !g_tp_session_batch_mode && g_tp_flag_gates && g_tp_poll_gates &&
+           !g_ssd_streaming_mode && g_tp_check_words != NULL &&
+           slot < DS4_TP_POLL_MAX_SLOTS && g_tp_vec_bytes == bytes &&
+           getenv("DS4_TP_DISABLE_FLAG_FOLD") == NULL;
+}
+
+static bool ds4_gpu_tp_fold_ctl_ready(void) {
+    if (g_tp_fold_ctl) return true;
+    g_tp_fold_ctl = [g_device newBufferWithLength:(NSUInteger)DS4_TP_POLL_MAX_SLOTS * 8u
+                                          options:MTLResourceStorageModeShared];
+    if (!g_tp_fold_ctl) return false;
+    memset(g_tp_fold_ctl.contents, 0, (size_t)DS4_TP_POLL_MAX_SLOTS * 8u);
+    return true;
+}
+
+void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate) {
+    g_tp_fold_req_active = 0;
+    const uint32_t slot = layer * DS4_GPU_TP_GATES_PER_LAYER + gate;
+    static int debug_left = -1;
+    if (debug_left < 0) debug_left = getenv("DS4_TP_FOLD_DEBUG") ? 8 : 0;
+    if (debug_left > 0) {
+        debug_left--;
+        fprintf(stderr, "ds4: fold request slot %u ok=%d init=%d cb=%d thr=%d batch=%d flag=%d poll=%d ssd=%d chk=%d vec=%llu\n",
+                slot, (int)ds4_gpu_tp_flag_fold_ok(slot, g_tp_vec_bytes), (int)g_initialized,
+                (int)(g_batch_cb != nil), (int)g_tp_thread_running, (int)g_tp_session_batch_mode,
+                (int)g_tp_flag_gates, (int)g_tp_poll_gates, (int)g_ssd_streaming_mode,
+                (int)(g_tp_check_words != NULL), (unsigned long long)g_tp_vec_bytes);
+    }
+    if (!ds4_gpu_tp_flag_fold_ok(slot, g_tp_vec_bytes) || g_tp_vec_bytes == 0) return;
+    g_tp_fold_req_active = 1;
+    g_tp_fold_req_layer = layer;
+    g_tp_fold_req_gate = gate;
+}
+
+/* Returns the slot when `out` (out_bytes long) is the requested partial. */
+static int ds4_gpu_tp_flag_fold_take(const ds4_gpu_tensor *out, uint64_t out_bytes,
+                                     uint32_t *slot_out, uint32_t *value_out) {
+    if (!g_tp_fold_req_active || !out) return 0;
+    const uint32_t slot = g_tp_fold_req_layer * DS4_GPU_TP_GATES_PER_LAYER + g_tp_fold_req_gate;
+    static int debug_left = -1;
+    if (debug_left < 0) debug_left = getenv("DS4_TP_FOLD_DEBUG") ? 8 : 0;
+    if (debug_left > 0) {
+        debug_left--;
+        fprintf(stderr, "ds4: fold take slot %u ok=%d buf_eq=%d off=%llu want=%llu bytes=%llu vec=%llu\n",
+                slot, (int)ds4_gpu_tp_flag_fold_ok(slot, out_bytes),
+                (int)(ds4_gpu_tensor_buffer(out) == g_tp_slab_buffer),
+                (unsigned long long)ds4_gpu_tensor_offset(out),
+                (unsigned long long)(g_tp_slab_buffer_off + g_tp_out_off + (uint64_t)slot * g_tp_vec_bytes),
+                (unsigned long long)out_bytes, (unsigned long long)g_tp_vec_bytes);
+    }
+    if (!ds4_gpu_tp_flag_fold_ok(slot, out_bytes) ||
+        ds4_gpu_tensor_buffer(out) != g_tp_slab_buffer ||
+        ds4_gpu_tensor_offset(out) !=
+            (uint64_t)(g_tp_slab_buffer_off + g_tp_out_off + (uint64_t)slot * g_tp_vec_bytes) ||
+        !ds4_gpu_tp_fold_ctl_ready()) {
+        return 0;
+    }
+    g_tp_fold_req_active = 0;
+    *slot_out = slot;
+    *value_out = (uint32_t)(g_tp_seq + 1u);
+    return 1;
+}
+
+int ds4_gpu_add_tensor_tp_flag(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        uint32_t              n,
+        uint32_t              layer,
+        uint32_t              gate) {
+    const uint32_t slot = layer * DS4_GPU_TP_GATES_PER_LAYER + gate;
+    const bool fold =
+        g_initialized && g_batch_cb && g_tp_thread_running &&
+        !g_tp_session_batch_mode && g_tp_flag_gates && g_tp_poll_gates &&
+        !g_ssd_streaming_mode && g_tp_check_words != NULL &&
+        slot < DS4_TP_POLL_MAX_SLOTS && g_tp_vec_bytes == (uint64_t)n * 4u &&
+        out && a && b && n != 0 && (n % 256u) == 0u &&
+        ds4_gpu_tensor_buffer(out) == g_tp_slab_buffer &&
+        ds4_gpu_tensor_offset(out) ==
+            (uint64_t)(g_tp_slab_buffer_off + g_tp_out_off + (uint64_t)slot * g_tp_vec_bytes) &&
+        getenv("DS4_TP_DISABLE_FLAG_FOLD") == NULL;
+    if (!fold) return ds4_gpu_add_tensor(out, a, b, n);
+    if (!ds4_gpu_tp_fold_ctl_ready()) return ds4_gpu_add_tensor(out, a, b, n);
+    id<MTLComputePipelineState> pipeline =
+        ds4_gpu_get_pipeline("kernel_dsv4_add2_f32_tp_flag_checked");
+    if (!pipeline) return ds4_gpu_add_tensor(out, a, b, n);
+    id<MTLBuffer> abuf = ds4_gpu_tensor_buffer(a);
+    id<MTLBuffer> bbuf = ds4_gpu_tensor_buffer(b);
+    if (!abuf || !bbuf) return ds4_gpu_add_tensor(out, a, b, n);
+    const uint32_t value = (uint32_t)(g_tp_seq + 1u);
+    const uint32_t ntg = n / 256u;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&n length:sizeof(n) atIndex:0];
+    [enc setBuffer:abuf offset:ds4_gpu_tensor_offset(a) atIndex:1];
+    [enc setBuffer:bbuf offset:ds4_gpu_tensor_offset(b) atIndex:2];
+    [enc setBuffer:g_tp_slab_buffer offset:ds4_gpu_tensor_offset(out) atIndex:3];
+    [enc setBuffer:g_tp_slab_buffer
+            offset:(NSUInteger)(g_tp_slab_buffer_off + g_tp_gpu_flags_off + (uint64_t)slot * 4u)
+           atIndex:4];
+    [enc setBuffer:g_tp_check_buffer offset:(NSUInteger)slot * 4u atIndex:5];
+    [enc setBytes:&value length:sizeof(value) atIndex:6];
+    [enc setBuffer:g_tp_fold_ctl offset:(NSUInteger)slot * 8u atIndex:7];
+    [enc setBytes:&ntg length:sizeof(ntg) atIndex:8];
+    [enc setThreadgroupMemoryLength:8 * sizeof(uint32_t) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(ntg, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    g_tp_flag_prepublished_seq = g_tp_seq + 1u;
+    return 1;
+}
+
 int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     if (!g_batch_cb) {
         fprintf(stderr, "ds4: TP gate encode without an open command batch (layer %u gate %u)\n",
@@ -10719,6 +10890,7 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         fprintf(stderr, "ds4: TP gate encode without the gate service (layer %u)\n", layer);
         return 0;
     }
+    g_tp_fold_req_active = 0;
     const uint64_t seq = ++g_tp_seq;
     const bool event_arrival = g_tp_session_batch_mode || !g_tp_flag_gates;
     const uint32_t slot = layer * DS4_GPU_TP_GATES_PER_LAYER + gate;
@@ -10732,6 +10904,12 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         const bool checked =
             g_tp_poll_gates && !g_ssd_streaming_mode && g_tp_check_words != NULL &&
             slot < DS4_TP_POLL_MAX_SLOTS && g_tp_vec_bytes != 0;
+        /* The payload producer may already have published this flag. */
+        const bool prepublished = checked && g_tp_flag_prepublished_seq == seq;
+        g_tp_flag_prepublished_seq = 0;
+        if (prepublished) {
+            ds4_gpu_close_batch_encoder();
+        } else {
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
             checked ? "kernel_dsv4_tp_flag_set_checked" : "kernel_dsv4_tp_flag_set");
         if (!pipeline) return 0;
@@ -10758,6 +10936,7 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         }
         ds4_gpu_end_compute_encoder(cb, enc);
         ds4_gpu_close_batch_encoder();
+        }
     } else {
         ds4_gpu_close_batch_encoder();
         [g_batch_cb encodeSignalEvent:g_tp_gpu_event value:seq];
@@ -25777,9 +25956,18 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
         if (out_dim > 65536u) mv_dispatch.nsg = 8;
         mv_args.nr0 = mv_dispatch.nr0;
+        /* TP partial producer: publish the gate's checked flag from the
+         * same kernel (last-arriving threadgroup) when requested. */
+        uint32_t fold_slot = 0, fold_value = 0;
+        const int fold = !owned &&
+            ds4_gpu_tp_flag_fold_take(out, out_dim * sizeof(float), &fold_slot, &fold_value);
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
+            ds4_gpu_get_mul_mv_pipeline(
+                fold ? "kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked" : mv_dispatch.function_name,
+                mv_dispatch.nsg);
         if (!pipeline) return 0;
+        const NSUInteger ntg =
+            ((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         [enc setComputePipelineState:pipeline];
@@ -25789,12 +25977,22 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
                 offset:(NSUInteger)(ds4_gpu_tensor_offset(x) + x_elem_off * sizeof(float))
                atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        if (fold) {
+            const uint32_t ntg32 = (uint32_t)ntg;
+            [enc setBuffer:g_tp_slab_buffer
+                    offset:(NSUInteger)(g_tp_slab_buffer_off + g_tp_gpu_flags_off + (uint64_t)fold_slot * 4u)
+                   atIndex:4];
+            [enc setBuffer:g_tp_check_buffer offset:(NSUInteger)fold_slot * 4u atIndex:5];
+            [enc setBytes:&fold_value length:sizeof(fold_value) atIndex:6];
+            [enc setBuffer:g_tp_fold_ctl offset:(NSUInteger)fold_slot * 8u atIndex:7];
+            [enc setBytes:&ntg32 length:sizeof(ntg32) atIndex:8];
+            [enc setThreadgroupMemoryLength:16 atIndex:1];
+        }
         [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
-                                              1,
-                                              1)
+        [enc dispatchThreadgroups:MTLSizeMake(ntg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
+        if (fold) g_tp_flag_prepublished_seq = g_tp_seq + 1u;
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "Q8_0 kslice matvec")) {
             return 0;
