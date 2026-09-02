@@ -962,9 +962,19 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
 
 /* One decode gate: ensure the receive window is armed, send our partial,
  * wait for the peer's receive completion, and advance the window. */
+/* Per-gate-kind RDMA timing (DS4_TP_GATE_PROFILE): post cost and the wait
+ * for the peer's partial, printed every 860 gates. */
+static double g_rdma_stat_post_us[2];
+static double g_rdma_stat_wait_us[2];
+static uint64_t g_rdma_stat_count[2];
+static int g_rdma_stat_enabled = -1;
+
 static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_tp_rdma *r = &tp->rdma;
     const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
+    if (g_rdma_stat_enabled < 0) g_rdma_stat_enabled = getenv("DS4_TP_GATE_PROFILE") != NULL;
+    const double st0 = g_rdma_stat_enabled ? tp_now_sec() : 0.0;
+    double st1 = 0.0;
     if (getenv("DS4_TP_GATE_TRACE")) {
         fprintf(stderr, "ds4-tp: gate trace l=%u g=%u seq=%llu want_slot=%u\n",
                 layer, gate, (unsigned long long)seq, tp_gate_slot(tp, seq));
@@ -1010,6 +1020,7 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
             r->send_outstanding++;
         }
     }
+    if (g_rdma_stat_enabled) st1 = tp_now_sec();
 
     double deadline = 0.0;
     uint32_t peer_poll = 0;
@@ -1026,6 +1037,17 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
             fprintf(stderr, "ds4-tp: timeout waiting gate seq %llu (recv_done %llu)\n",
                     (unsigned long long)seq, (unsigned long long)r->recv_done);
             ok = 0;
+        }
+    }
+    if (g_rdma_stat_enabled && ok && gate < 2u) {
+        const double st2 = tp_now_sec();
+        g_rdma_stat_post_us[gate] += (st1 - st0) * 1e6;
+        g_rdma_stat_wait_us[gate] += (st2 - st1) * 1e6;
+        if (++g_rdma_stat_count[gate] % 430 == 0) {
+            fprintf(stderr, "ds4-tp: rdma gate %u: post %.1f us, peer wait %.1f us (n=%llu)\n",
+                    gate, g_rdma_stat_post_us[gate] / (double)g_rdma_stat_count[gate],
+                    g_rdma_stat_wait_us[gate] / (double)g_rdma_stat_count[gate],
+                    (unsigned long long)g_rdma_stat_count[gate]);
         }
     }
     if (ok) ok = tp_rdma_post_gate_recv(tp, seq + DS4_TP_RDMA_RECV_WINDOW);
