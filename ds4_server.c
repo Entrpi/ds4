@@ -716,6 +716,17 @@ typedef struct {
     bool responses_requires_live_reasoning;
     stop_list responses_live_call_ids;
     char *responses_live_suffix_text;
+    /* Rendered-byte frontier bookkeeping for the tool-call reminder's depth
+     * gate on output-only Responses chains (issue #18 option E).
+     * responses_live_output_only: the request carried NO rendered history
+     * (only tool outputs), so prompt_text is a render of the outputs alone,
+     * not the transcript.  cont_frontier_bytes: parse-time snapshot of the
+     * LIVE registry record's rendered-byte frontier for this request's
+     * continuation ids (0 = unknown / none) -- the base the output-only
+     * tail's reminder verdict was evaluated against, and the base this
+     * turn's own record advances from at publication. */
+    bool responses_live_output_only;
+    size_t cont_frontier_bytes;
     bool anthropic_requires_live_tool_state;
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
@@ -745,6 +756,10 @@ typedef struct {
 
 /* Inc 5b: parse-time hard-pin acquisition (defined with the registry). */
 static void request_acquire_cont_pin(server *s, request *r);
+/* Parse-time read of a LIVE record's rendered-byte frontier (defined with
+ * the registry; consumed by the output-only Responses tail render). */
+static size_t cont_registry_live_frontier_bytes(server *s, api_style proto,
+                                                const stop_list *ids);
 
 static void tool_call_free(tool_call *tc) {
     free(tc->id);
@@ -996,6 +1011,9 @@ static size_t g_tool_reminder_min_bytes = 98304;
 #define DS4_TOOL_CALL_REMINDER_TEXT \
     "\n\n[Reminder: respond with exactly one tool call in the required " \
     "format. Plain-text replies are not accepted by this harness.]"
+/* The assistant-turn terminator every live tool tail splices at. */
+#define DS4_EOS_TEXT "<｜end▁of▁sentence｜>"
+#define DS4_EOS_TEXT_LEN (sizeof(DS4_EOS_TEXT) - 1)
 
 static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
     if (!s) return false;
@@ -2622,6 +2640,20 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
+/* issue #18 option E depth gate.  rendered_len is the byte count of the
+ * rendered conversation BEFORE the reminder append -- the full renderer's
+ * out.len, or a live tail's frontier base + out.len -- so every verdict is
+ * a pure function of the conversation prefix that any later full re-render
+ * reproduces byte for byte. */
+static bool tool_call_reminder_armed(const char *tool_schemas) {
+    return g_tool_call_reminder && tool_schemas && tool_schemas[0];
+}
+
+static bool tool_call_reminder_due(const char *tool_schemas, size_t rendered_len) {
+    return tool_call_reminder_armed(tool_schemas) &&
+           rendered_len >= g_tool_reminder_min_bytes;
+}
+
 /* Core renderer.  mark_idx/mark_out are the live-tail extraction hook: when
  * mark_idx names a message index, *mark_out reports the byte offset of out at
  * the top of that message's loop iteration -- i.e. where that message's bytes
@@ -2679,7 +2711,7 @@ static char *render_chat_prompt_text_mark(const chat_msgs *msgs, const char *too
              * bodies cannot fake the terminator (append_tool_result_text
              * escapes it), so the last occurrence is always parser-built. */
             const char *inject_at = NULL;
-            if (g_tool_call_reminder && tool_schemas && tool_schemas[0] &&
+            if (tool_call_reminder_armed(tool_schemas) &&
                 ((m->tool_call_id && m->tool_call_id[0]) ||
                  m->tool_call_ids_len > 0)) {
                 const char *scan = c;
@@ -2690,7 +2722,7 @@ static char *render_chat_prompt_text_mark(const chat_msgs *msgs, const char *too
             }
             if (inject_at) {
                 buf_append(&out, c, (size_t)(inject_at - c));
-                if (out.len >= g_tool_reminder_min_bytes)
+                if (tool_call_reminder_due(tool_schemas, out.len))
                     buf_puts(&out, DS4_TOOL_CALL_REMINDER_TEXT);
                 buf_puts(&out, inject_at);
             } else {
@@ -2713,10 +2745,8 @@ static char *render_chat_prompt_text_mark(const chat_msgs *msgs, const char *too
              * into spurious calls.  The condition reads out.len BEFORE the
              * append, so each result's verdict is a pure function of the
              * conversation prefix. */
-            if (g_tool_call_reminder && tool_schemas && tool_schemas[0] &&
-                out.len >= g_tool_reminder_min_bytes) {
+            if (tool_call_reminder_due(tool_schemas, out.len))
                 buf_puts(&out, DS4_TOOL_CALL_REMINDER_TEXT);
-            }
             buf_puts(&out, "</tool_result>");
             pending_assistant = true;
             pending_tool_result = true;
@@ -2779,15 +2809,28 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
  *
  * Since the tool-call reminder landed this is the FALLBACK tail lane, used
  * only when the request has no rendered history to anchor an exact extraction
- * to (output-only continuations, or an unanchored tail).  It renders the tail
- * independently and therefore cannot evaluate the reminder's depth predicate,
- * so its tails never carry the reminder; the primary lane is
+ * to (output-only continuations, or an unanchored tail).  The reminder's
+ * depth verdict is a function of the FULL rendered prefix length, which an
+ * independent tail render cannot see on its own, so the caller supplies it:
+ * frontier_bytes is the rendered-byte frontier of the turn this tail
+ * continues (the transcript length through the anchor assistant's EOS, as
+ * the next full re-render lays it out -- cont_record.frontier_bytes), and
+ * the tail evaluates the full renderer's predicate at exactly the byte the
+ * full render would: that frontier minus the EOS this tail re-emits, plus
+ * the tail bytes so far.  An unknown frontier (0) never injects -- where
+ * exactness is impossible, under-injection is the safe direction, since a
+ * reminder no later full re-render reproduces would desync the live KV
+ * bytes from every replay.  The primary lane is
  * render_live_tool_tail_exact() below. */
 static char *render_live_tool_tail(const chat_msgs *msgs, int start,
+                                   const char *tool_schemas,
+                                   size_t frontier_bytes,
                                    ds4_think_mode think_mode) {
     const bool think = ds4_think_mode_enabled(think_mode);
+    const bool base_known = frontier_bytes >= DS4_EOS_TEXT_LEN;
+    const size_t base = base_known ? frontier_bytes - DS4_EOS_TEXT_LEN : 0;
     buf out = {0};
-    buf_puts(&out, "<｜end▁of▁sentence｜>");
+    buf_puts(&out, DS4_EOS_TEXT);
 
     bool pending_assistant = false;
     bool pending_tool_result = false;
@@ -2797,13 +2840,36 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
             continue;
         } else if (!strcmp(m->role, "user")) {
             buf_puts(&out, "<｜User｜>");
-            buf_puts(&out, m->content ? m->content : "");
+            const char *c = m->content ? m->content : "";
+            /* Mirror of the full renderer's user-embedded result shape,
+             * verdict taken at base + out.len. */
+            const char *inject_at = NULL;
+            if (base_known && tool_call_reminder_armed(tool_schemas) &&
+                ((m->tool_call_id && m->tool_call_id[0]) ||
+                 m->tool_call_ids_len > 0)) {
+                const char *scan = c;
+                while ((scan = strstr(scan, "</tool_result>")) != NULL) {
+                    inject_at = scan;
+                    scan++;
+                }
+            }
+            if (inject_at) {
+                buf_append(&out, c, (size_t)(inject_at - c));
+                if (tool_call_reminder_due(tool_schemas, base + out.len))
+                    buf_puts(&out, DS4_TOOL_CALL_REMINDER_TEXT);
+                buf_puts(&out, inject_at);
+            } else {
+                buf_puts(&out, c);
+            }
             pending_assistant = true;
             pending_tool_result = false;
         } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
             if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
             buf_puts(&out, "<tool_result>");
             append_tool_result_text(&out, m->content);
+            if (base_known &&
+                tool_call_reminder_due(tool_schemas, base + out.len))
+                buf_puts(&out, DS4_TOOL_CALL_REMINDER_TEXT);
             buf_puts(&out, "</tool_result>");
             pending_assistant = true;
             pending_tool_result = true;
@@ -2849,15 +2915,13 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
 static char *render_live_tool_tail_exact(const chat_msgs *msgs, int tail_start,
                                          const char *tool_schemas,
                                          ds4_think_mode think_mode) {
-    static const char eos[] = "<｜end▁of▁sentence｜>";
-    const size_t eos_len = sizeof(eos) - 1;
     size_t mark = 0;
     char *full = render_chat_prompt_text_mark(msgs, tool_schemas, NULL,
                                               think_mode, tail_start, &mark);
     char *suffix = NULL;
-    if (full && mark >= eos_len &&
-        !memcmp(full + mark - eos_len, eos, eos_len)) {
-        suffix = xstrdup(full + mark - eos_len);
+    if (full && mark >= DS4_EOS_TEXT_LEN &&
+        !memcmp(full + mark - DS4_EOS_TEXT_LEN, DS4_EOS_TEXT, DS4_EOS_TEXT_LEN)) {
+        suffix = xstrdup(full + mark - DS4_EOS_TEXT_LEN);
     }
     free(full);
     return suffix;
@@ -2951,8 +3015,17 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
  * This only prepares evidence.  generate_job() later checks that the live
  * server state is still exactly at the remembered token frontier before using
  * it.  If another request already replaced the session, normal token/text/disk
- * prefix matching handles the request instead. */
-static void responses_prepare_live_continuation(request *r,
+ * prefix matching handles the request instead.
+ *
+ * Output-only shape (no rendered history -- the stateless-chain form): the
+ * tail cannot be sliced from this request's own render, so its reminder
+ * verdict takes the registry record's rendered-byte frontier for the
+ * continued turn as its base.  Records are immutable once published and
+ * the same ids resolve the same record at admission, so the verdict baked
+ * into the tail here is the one this turn's own record advances from at
+ * publication and the one every later full re-render reproduces; an
+ * unknown frontier renders the bare tail (no reminder). */
+static void responses_prepare_live_continuation(server *s, request *r,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas) {
     if (!r || r->api != API_RESPONSES || !msgs || msgs->len == 0) return;
@@ -2986,12 +3059,19 @@ static void responses_prepare_live_continuation(request *r,
                                     r->think_mode) : NULL;
     if (!r->responses_live_suffix_text) {
         /* Output-only continuation (or unanchored slice): no rendered history
-         * in this request to extract from, so the legacy independent tail is
-         * the only renderable shape.  It cannot evaluate the reminder's
-         * depth predicate (the server tracks no rendered-byte frontier
-         * across output-only chains), so these tails never carry it. */
+         * in this request to extract from, so the independent tail is the
+         * only renderable shape.  Its depth verdict comes from the continued
+         * record's rendered-byte frontier; an unanchored slice of a
+         * history-carrying request has no such base and renders bare. */
+        if (tail_start == 0) {
+            r->responses_live_output_only = true;
+            r->cont_frontier_bytes = cont_registry_live_frontier_bytes(
+                s, API_RESPONSES, &r->responses_live_call_ids);
+        }
         r->responses_live_suffix_text =
-            render_live_tool_tail(msgs, tail_start, r->think_mode);
+            render_live_tool_tail(msgs, tail_start, tool_schemas,
+                                  tail_start == 0 ? r->cont_frontier_bytes : 0,
+                                  r->think_mode);
     }
 }
 
@@ -3084,8 +3164,12 @@ static void anthropic_prepare_live_continuation(request *r,
         render_live_tool_tail_exact(msgs, tail_start, tool_schemas,
                                     r->think_mode) : NULL;
     if (!r->anthropic_live_suffix_text) {
+        /* Unanchored shape: no rendered-byte frontier is tracked for the
+         * Anthropic surface (its records publish 0), so the tail renders
+         * bare. */
         r->anthropic_live_suffix_text =
-            render_live_tool_tail(msgs, tail_start, r->think_mode);
+            render_live_tool_tail(msgs, tail_start, tool_schemas, 0,
+                                  r->think_mode);
     }
 }
 
@@ -4469,7 +4553,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_preserves_reasoning =
         !g_reasoning_replay_drop &&
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    responses_prepare_live_continuation(r, &msgs, active_tool_schemas);
+    responses_prepare_live_continuation(s, r, &msgs, active_tool_schemas);
     request_acquire_cont_pin(s, r);   /* Inc 5b: pin the LIVE record */
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
@@ -8717,6 +8801,16 @@ struct cont_record {   /* typedef'd cont_record above the tool_memory structs */
     int      owner_id;    /* bank index for BATCH_BANK; 0 for the session */
     uint64_t owner_gen;   /* engine generation at publication */
     int      frontier;    /* committed tokens at publication */
+    /* Rendered-byte frontier: the transcript length, through this turn's
+     * closing EOS, as the next full re-render lays it out (the visible-
+     * replay convention: prompt_text + the visible assistant suffix on a
+     * turn whose prompt IS the transcript; the continued record's frontier
+     * advanced by the live tail and the visible suffix on an output-only
+     * turn -- cont_frontier_bytes_seed/advance).  The tool-call reminder's
+     * depth gate on an output-only continuation is evaluated against this
+     * base, so its verdict is the one a full re-render reproduces.  0 =
+     * unknown (the tail never injects).  Immutable after publication. */
+    size_t   frontier_bytes;
     stop_list call_ids;   /* ids minted by this turn */
     double   publish_time;
     /* Inc 5b: queued T2 hard pins (parse-time acquisition, released at job
@@ -9023,6 +9117,7 @@ static void terminal_sink_release(size_t n);
 static void serial_terminal_commit(server *s, job *j, api_style proto,
                                    const tool_calls *calls,
                                    uint64_t gen, int frontier,
+                                   size_t frontier_bytes,
                                    const buf *tb, const char *ctx_span);
 
 /* v0.5.6 Inc 0a: route observation -- record which serving lane took each
@@ -9390,7 +9485,8 @@ static void cont_registry_prune_locked(server *s) {
 static void cont_registry_publish(server *s, api_style proto,
                                   const tool_calls *calls,
                                   cont_record_owner owner, int owner_id,
-                                  uint64_t gen, int frontier) {
+                                  uint64_t gen, int frontier,
+                                  size_t frontier_bytes) {
     if (!s || !calls || calls->len == 0 || gen == 0 || frontier <= 0) return;
     pthread_mutex_lock(&s->tool_mu);
     cont_registry *r = &s->creg;
@@ -9418,6 +9514,7 @@ static void cont_registry_publish(server *s, api_style proto,
     rec->protocol = (uint8_t)proto;
     rec->owner_gen = gen;
     rec->frontier = frontier;
+    rec->frontier_bytes = frontier_bytes;
     rec->publish_time = now_sec();
     for (int i = 0; i < calls->len; i++) {
         if (calls->v[i].id && calls->v[i].id[0])
@@ -9459,9 +9556,10 @@ static void cont_registry_publish(server *s, api_style proto,
 
 static void cont_registry_publish_serial(server *s, api_style proto,
                                          const tool_calls *calls,
-                                         uint64_t gen, int frontier) {
+                                         uint64_t gen, int frontier,
+                                         size_t frontier_bytes) {
     cont_registry_publish(s, proto, calls, CONT_OWNER_SERIAL_SESSION, 0,
-                          gen, frontier);
+                          gen, frontier, frontier_bytes);
 }
 
 /* Inc 5c: publish one record for a CONTINUOUS tool-call turn -- the bank
@@ -9476,10 +9574,11 @@ static void cont_registry_publish_serial(server *s, api_style proto,
  * first, unit-gated, so the consumer arrives against a proven registry. */
 static void cont_registry_publish_bank(server *s, api_style proto,
                                        const tool_calls *calls,
-                                       int bank, uint64_t gen, int frontier) {
+                                       int bank, uint64_t gen, int frontier,
+                                       size_t frontier_bytes) {
     if (bank < 0) return;
     cont_registry_publish(s, proto, calls, CONT_OWNER_BATCH_BANK, bank,
-                          gen, frontier);
+                          gen, frontier, frontier_bytes);
 }
 
 /* The serial session's tip no longer matches its LIVE record (a
@@ -9657,6 +9756,31 @@ static bool cont_registry_live_has_id(server *s, api_style proto,
     const bool ok = rec && rec->state == CONT_REC_LIVE_FRONTIER;
     pthread_mutex_unlock(&s->tool_mu);
     return ok;
+}
+
+/* Parser-side read of a LIVE record's rendered-byte frontier for an exact
+ * continuation id set: the resolve's LIVE + protocol + id-set-equality
+ * checks without the execution reference (that is revalidated at
+ * admission, and a record that fails it there never has its tail consumed,
+ * so a verdict computed against it is never fed).  Owner-agnostic: the
+ * serial session and a bank publish the same bookkeeping.  0 when unknown
+ * or not LIVE -- the output-only tail then renders without the reminder. */
+static size_t cont_registry_live_frontier_bytes(server *s, api_style proto,
+                                                const stop_list *ids) {
+    if (!s || !ids || ids->len == 0) return 0;
+    pthread_mutex_lock(&s->tool_mu);
+    cont_registry_expire_locked(s, now_sec());   /* Inc 5b lazy TTL */
+    cont_record *rec = cont_registry_find_locked(&s->creg, (uint8_t)proto,
+                                                 ids->v[0]);
+    bool ok = rec &&
+              rec->state == CONT_REC_LIVE_FRONTIER &&
+              rec->protocol == (uint8_t)proto &&
+              rec->call_ids.len == ids->len;
+    for (int i = 0; ok && i < ids->len; i++)
+        ok = id_list_contains(&rec->call_ids, ids->v[i]);
+    const size_t bytes = ok ? rec->frontier_bytes : 0;
+    pthread_mutex_unlock(&s->tool_mu);
+    return bytes;
 }
 
 /* Worker admission resolve: exact set-equality on the turn's ids plus
@@ -12255,8 +12379,64 @@ static char *build_responses_visible_assistant_suffix(const request *r,
     }
     buf_puts(&suffix, content ? content : "");
     append_dsml_tool_calls_text(&suffix, calls);
-    buf_puts(&suffix, "<｜end▁of▁sentence｜>");
+    buf_puts(&suffix, DS4_EOS_TEXT);
     return buf_take(&suffix);
+}
+
+/* Rendered-byte frontier arithmetic for the continuation registry
+ * (cont_record.frontier_bytes; 0 = unknown).  Both forms yield the
+ * transcript length THROUGH the turn's closing EOS as the next full
+ * re-render lays it out:
+ *   seed    -- a turn whose prompt_text IS the transcript (full replay, or a
+ *              history-carrying live continuation whose exact tail was
+ *              sliced from that same render): prompt bytes + the visible
+ *              assistant suffix (which ends with the EOS);
+ *   advance -- an output-only continuation: the continued record's
+ *              frontier, whose trailing EOS the live tail re-emits as its
+ *              first bytes (counted once), plus the tail bytes -- reminder
+ *              included, exactly as the full renderer would have laid them
+ *              out at that depth -- plus the visible suffix.
+ * A shape that does not splice at the EOS yields 0: no verdict is better
+ * than one a later full re-render would not reproduce. */
+static bool text_ends_with_eos(const char *text) {
+    const size_t n = text ? strlen(text) : 0;
+    return n >= DS4_EOS_TEXT_LEN &&
+           !memcmp(text + n - DS4_EOS_TEXT_LEN, DS4_EOS_TEXT, DS4_EOS_TEXT_LEN);
+}
+
+static size_t cont_frontier_bytes_seed(const char *prompt_text,
+                                       const char *visible_suffix) {
+    if (!prompt_text || !prompt_text[0] || !text_ends_with_eos(visible_suffix))
+        return 0;
+    return strlen(prompt_text) + strlen(visible_suffix);
+}
+
+static size_t cont_frontier_bytes_advance(size_t base, const char *live_suffix,
+                                          const char *visible_suffix) {
+    if (base < DS4_EOS_TEXT_LEN || !live_suffix ||
+        strncmp(live_suffix, DS4_EOS_TEXT, DS4_EOS_TEXT_LEN) != 0 ||
+        !text_ends_with_eos(visible_suffix))
+        return 0;
+    return base - DS4_EOS_TEXT_LEN + strlen(live_suffix) + strlen(visible_suffix);
+}
+
+/* The frontier a Responses tool turn publishes with its record.  chained =
+ * the turn was admitted as an output-only live continuation (its
+ * prompt_text is a render of the outputs alone, so the record advances the
+ * continued frontier); every other turn's prompt_text is the transcript
+ * and seeds.  An output-only turn that reached publication any other way
+ * has no trustworthy base and publishes unknown. */
+static size_t responses_publish_frontier_bytes(const request *req,
+                                               bool chained,
+                                               const char *visible_suffix) {
+    if (!req) return 0;
+    if (req->responses_live_output_only) {
+        if (!chained) return 0;
+        return cont_frontier_bytes_advance(req->cont_frontier_bytes,
+                                           req->responses_live_suffix_text,
+                                           visible_suffix);
+    }
+    return cont_frontier_bytes_seed(req->prompt_text, visible_suffix);
 }
 
 /* In thinking mode without tools, old assistant reasoning is intentionally not
@@ -12508,6 +12688,7 @@ static void generate_job(server *s, job *j) {
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
     const bool responses_protocol = j->req.api == API_RESPONSES;
     bool responses_live_continuation = false;
+    bool responses_tool_output_continuation = false;   /* the call-id lane won */
     bool anthropic_live_continuation = false;
     bool thinking_live_continuation = false;
     const char *responses_live_match = NULL;
@@ -12537,7 +12718,10 @@ static void generate_job(server *s, job *j) {
                                                     &effective_prompt,
                                                     &responses_live_match_ids);
         cache_source = cached > 0 ? "responses-tool-output" : "none";
-        if (cached > 0) responses_live_match = "tool-output-ids";
+        if (cached > 0) {
+            responses_live_match = "tool-output-ids";
+            responses_tool_output_continuation = true;
+        }
     }
     if (cached > 0) {
         responses_live_continuation = true;
@@ -12663,11 +12847,12 @@ static void generate_job(server *s, job *j) {
               j->req.has_tools, false, false, false);
     if (responses_live_continuation) {
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d",
+                   "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d frontier_bytes=%zu",
                    responses_live_match ? responses_live_match : "unknown",
                    responses_live_match_ids,
                    cached,
-                   prompt_tokens);
+                   prompt_tokens,
+                   j->req.cont_frontier_bytes);
     } else if (anthropic_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: anthropic live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
@@ -13396,6 +13581,7 @@ decode_again:
     api_style pub_proto = API_OPENAI;
     uint64_t pub_gen = 0;
     int pub_frontier = 0;
+    size_t pub_frontier_bytes = 0;
     if (j->req.api == API_RESPONSES) {
         if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
             /* Store the post-turn visible transcript plus the live token
@@ -13412,15 +13598,22 @@ decode_again:
             buf_puts(&visible, visible_suffix ? visible_suffix : "");
             responses_live_remember(s, visible.ptr ? visible.ptr : "");
             buf_free(&visible);
-            free(visible_suffix);
             if (parsed_calls.len) {
                 pub_pending = true;
                 pub_proto = API_RESPONSES;
                 pub_gen = ds4_session_generation(s->session);
                 pub_frontier = ds4_session_pos(s->session);
+                /* The record's rendered-byte frontier: seeded from this
+                 * render when the prompt is the transcript, advanced from
+                 * the continued record when the call-id lane consumed an
+                 * output-only tail (issue #18 option E chains). */
+                pub_frontier_bytes = responses_publish_frontier_bytes(
+                    &j->req, responses_tool_output_continuation,
+                    visible_suffix);
             } else {
                 cont_registry_demote_serial(s);
             }
+            free(visible_suffix);
         } else {
             responses_live_clear(s);
             cont_registry_demote_serial(s);
@@ -13525,7 +13718,8 @@ decode_again:
                                            &wsess, &res);
             t_capture_buf = NULL;
             serial_terminal_commit(s, j, pub_proto, &parsed_calls,
-                                   pub_gen, pub_frontier, &tb, ctx_span);
+                                   pub_gen, pub_frontier, pub_frontier_bytes,
+                                   &tb, ctx_span);
             buf_free(&tb);
         } else if (j->req.stream) {
             if (!wire_finish_stream(j->fd, s, &j->req, &wsess, &res)) {
@@ -14292,6 +14486,7 @@ static void terminal_sink_release(size_t n) {
 static void serial_terminal_commit(server *s, job *j, api_style proto,
                                    const tool_calls *calls,
                                    uint64_t gen, int frontier,
+                                   size_t frontier_bytes,
                                    const buf *tb, const char *ctx_span) {
     if (!terminal_sink_reserve(tb->len)) {
         server_log(DS4_LOG_WARNING,
@@ -14303,7 +14498,7 @@ static void serial_terminal_commit(server *s, job *j, api_style proto,
         j->outcome = JOB_OUT_SHED;
         return;
     }
-    cont_registry_publish_serial(s, proto, calls, gen, frontier);
+    cont_registry_publish_serial(s, proto, calls, gen, frontier, frontier_bytes);
     if (j->client_gone || client_disconnected(j->fd)) {
         cont_registry_demote_serial(s);
         j->client_gone = true;   /* settle counts CANCELED, never completed */
@@ -16280,9 +16475,24 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
          * 409 surface -- the 5a scoping). */
         if ((j->req.api == API_ANTHROPIC || j->req.api == API_RESPONSES) &&
             s->batch_ctx && j->cont_bank >= 0) {
+            size_t frontier_bytes = 0;
+            if (j->req.api == API_RESPONSES) {
+                /* Rendered-byte frontier, the bank owner's twin of the
+                 * serial site.  An output-only row reaches this lane only
+                 * through cont_bank_continuation_admit (a failed claim
+                 * finishes the job), so BANK_FRONTIER on an output-only
+                 * request means the live tail was consumed. */
+                char *visible_suffix = build_responses_visible_assistant_suffix(
+                    &j->req, *content, *reasoning, calls);
+                frontier_bytes = responses_publish_frontier_bytes(
+                    &j->req, (j->req.needs & DS4_NEED_BANK_FRONTIER) != 0,
+                    visible_suffix);
+                free(visible_suffix);
+            }
             cont_registry_publish_bank(s, j->req.api, calls, j->cont_bank,
                 ds4_batch_ctx_bank_generation(s->batch_ctx, j->cont_bank),
-                ds4_batch_ctx_bank_committed(s->batch_ctx, j->cont_bank, NULL));
+                ds4_batch_ctx_bank_committed(s->batch_ctx, j->cont_bank, NULL),
+                frontier_bytes);
         }
         *fin_io = "tool_calls";
     } else {
@@ -19147,10 +19357,10 @@ static void usage(FILE *fp) {
         "      report (measured 50%% of turns at 70-80K tokens; the reminder measured\n"
         "      0/72 slips vs 6/72 without at the same states, and fixed the failing\n"
         "      agent task end to end). Covers every surface: chat/completions,\n"
-        "      Anthropic /v1/messages (including live tool-result continuations), and\n"
-        "      Responses -- except Responses continuations that send ONLY tool\n"
-        "      outputs without history, where the depth of the conversation is not\n"
-        "      renderable and the reminder is skipped. Shallow conversations are\n"
+        "      Anthropic /v1/messages, and Responses, including the live tool-result\n"
+        "      continuation lanes and Responses chains that send only tool outputs\n"
+        "      without history (the depth of such a chain is tracked as a rendered-\n"
+        "      byte frontier on its continuation record). Shallow conversations are\n"
         "      never touched, so chat-with-tools flows that answer in prose after a\n"
         "      tool result are unaffected. Env twins: DS4_TOOL_CALL_REMINDER=0\n"
         "      disables, DS4_TOOL_CALL_REMINDER_MIN_BYTES retunes the depth gate.\n"
@@ -22391,7 +22601,9 @@ static void test_tool_call_reminder_live_tail_paths(void) {
      * render's tail region -- reminder verdicts included -- at the exact
      * depth-gate boundary, for BOTH tail lanes (Responses role-tool tails
      * and Anthropic user-embedded tails).  Output-only tails (no rendered
-     * history in the request) keep the legacy render and never carry it.
+     * history in the request) take their base from the registry record's
+     * rendered-byte frontier (test_tool_call_reminder_output_only_frontier);
+     * without one they render bare.
      * The gate probe works because the full render's predicate reads
      * out.len just before the reminder append: with gate 0, the reminder's
      * byte offset IS the out.len the predicate read, so gate == offset
@@ -22440,7 +22652,7 @@ static void test_tool_call_reminder_live_tail_paths(void) {
             request_init(&r, REQ_CHAT, 128);
             r.api = API_RESPONSES;
             r.think_mode = DS4_THINK_LOW;
-            responses_prepare_live_continuation(&r, &msgs, schemas);
+            responses_prepare_live_continuation(NULL, &r, &msgs, schemas);
             TEST_ASSERT(r.responses_live_suffix_text != NULL);
             const size_t sl = strlen(r.responses_live_suffix_text);
             const size_t fl = strlen(full);
@@ -22522,9 +22734,9 @@ static void test_tool_call_reminder_live_tail_paths(void) {
         chat_msgs_free(&msgs);
     }
 
-    /* Output-only Responses continuation (tail_start == 0): the legacy
-     * independent tail, which never carries the reminder (no rendered
-     * history to evaluate the depth predicate against). */
+    /* Output-only Responses continuation (tail_start == 0) with no registry
+     * to read a frontier from: the independent tail renders bare -- no
+     * reminder without a replay-consistent depth base. */
     {
         chat_msgs msgs = {0};
         chat_msg m0 = {0};
@@ -22538,7 +22750,7 @@ static void test_tool_call_reminder_live_tail_paths(void) {
         request_init(&r, REQ_CHAT, 128);
         r.api = API_RESPONSES;
         r.think_mode = DS4_THINK_LOW;
-        responses_prepare_live_continuation(&r, &msgs, schemas);
+        responses_prepare_live_continuation(NULL, &r, &msgs, schemas);
         TEST_ASSERT(r.responses_live_suffix_text != NULL);
         TEST_ASSERT(!strncmp(r.responses_live_suffix_text, eos,
                              sizeof(eos) - 1));
@@ -22551,6 +22763,417 @@ static void test_tool_call_reminder_live_tail_paths(void) {
 
     g_tool_call_reminder = saved_on;
     g_tool_reminder_min_bytes = saved_gate;
+}
+
+static void test_reminder_push_user(chat_msgs *msgs, const char *text) {
+    chat_msg m = {0};
+    m.role = xstrdup("user");
+    m.content = xstrdup(text);
+    chat_msgs_push(msgs, m);
+}
+
+static void test_reminder_push_call(chat_msgs *msgs, const char *id,
+                                    const char *command) {
+    chat_msg m = {0};
+    m.role = xstrdup("assistant");
+    m.content = xstrdup("");
+    tool_call tc = {0};
+    tc.id = xstrdup(id);
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup(command);
+    tool_calls_push(&m.calls, tc);
+    chat_msgs_push(msgs, m);
+}
+
+static void test_reminder_push_tool(chat_msgs *msgs, const char *id,
+                                    const char *content) {
+    chat_msg m = {0};
+    m.role = xstrdup("tool");
+    m.tool_call_id = xstrdup(id);
+    m.content = xstrdup(content);
+    chat_msgs_push(msgs, m);
+}
+
+static void test_reminder_publish_responses(server *s, const tool_calls *calls,
+                                            uint64_t gen, int frontier,
+                                            size_t frontier_bytes) {
+    tool_calls copy = {0};
+    for (int i = 0; i < calls->len; i++) {
+        tool_call tc = {0};
+        tc.id = xstrdup(calls->v[i].id);
+        tool_calls_push(&copy, tc);
+    }
+    cont_registry_publish_serial(s, API_RESPONSES, &copy, gen, frontier,
+                                 frontier_bytes);
+    tool_calls_free(&copy);
+}
+
+static void test_tool_call_reminder_output_only_frontier(void) {
+    /* Output-only Responses continuations (no rendered history in the
+     * request -- the stateless-chain shape) take their reminder verdict from
+     * the registry record's rendered-byte frontier.  The proof is
+     * replay-consistency over a two-hop chain against the FULL re-render of
+     * the same conversation at the exact depth-gate boundary:
+     *
+     *   T1  full-replay turn [user] mints call_1; its record SEEDS the
+     *       frontier from prompt_text + the visible assistant suffix, which
+     *       must equal the full render's byte offset of the next tail;
+     *   T2  sends ONLY call_1's output; its tail must be byte-identical to
+     *       the full render's tail region, reminder verdict included, and
+     *       the record it publishes ADVANCES the frontier to the full
+     *       render's offset of the NEXT tail (reminder bytes counted);
+     *   T3  sends ONLY call_2's output against the advanced record and must
+     *       again match the full render, probed at the SECOND result's
+     *       predicate point (so hop 1's verdict is off and hop 2's is at
+     *       the boundary: gate == offset injects, gate == offset + 1 not).
+     *
+     * An unknown frontier (no registry, no LIVE record, demoted record)
+     * renders the bare tail -- under-injection is the safe direction. */
+    const bool saved_on = g_tool_call_reminder;
+    const size_t saved_gate = g_tool_reminder_min_bytes;
+    const char *schemas = "## bash\ndescription";
+    g_tool_call_reminder = true;
+
+    /* The conversation exactly as a full re-render sees it. */
+    chat_msgs conv = {0};
+    test_reminder_push_user(&conv, "start the run");
+    test_reminder_push_call(&conv, "call_1", "{\"command\": \"pwd\"}");
+    test_reminder_push_tool(&conv, "call_1", "ok-first");
+    test_reminder_push_call(&conv, "call_2", "{\"command\": \"ls\"}");
+    test_reminder_push_tool(&conv, "call_2", "ok-second");
+    chat_msgs conv1 = { conv.v, 1, 0 };   /* T1's rendered prompt */
+    chat_msgs conv3 = { conv.v, 3, 0 };   /* through call_1's output */
+
+    /* Output-only requests: T2 carries call_1's output, T3 call_2's. */
+    chat_msgs t2 = {0};
+    test_reminder_push_tool(&t2, "call_1", "ok-first");
+    chat_msgs t3 = {0};
+    test_reminder_push_tool(&t3, "call_2", "ok-second");
+
+    /* Predicate points: the reminder text starts with "\n\n", and its
+     * offset IS the out.len the predicate read.  pred1 from a gate-0
+     * render; pred2 from a render with the first result's reminder OFF
+     * (gate just past pred1), since hop 2 is probed with hop 1 off and the
+     * first reminder's bytes would otherwise shift the second point. */
+    g_tool_reminder_min_bytes = 0;
+    size_t pred1 = 0, pred2 = 0;
+    {
+        char *full0 = render_chat_prompt_text(&conv, schemas, NULL,
+                                              DS4_THINK_LOW);
+        const char *rem = strstr(full0, "\n\n[Reminder:");
+        TEST_ASSERT(rem != NULL);
+        pred1 = (size_t)(rem - full0);
+        free(full0);
+        g_tool_reminder_min_bytes = pred1 + 1;
+        char *full1 = render_chat_prompt_text(&conv, schemas, NULL,
+                                              DS4_THINK_LOW);
+        rem = strstr(full1, "\n\n[Reminder:");
+        TEST_ASSERT(rem != NULL);
+        pred2 = (size_t)(rem - full1);
+        TEST_ASSERT(strstr(rem + 1, "\n\n[Reminder:") == NULL);
+        TEST_ASSERT(pred2 > pred1);
+        free(full1);
+    }
+
+    /* T1's seed is gate-independent: prompt_text + visible suffix. */
+    request r1;
+    request_init(&r1, REQ_CHAT, 128);
+    r1.api = API_RESPONSES;
+    r1.think_mode = DS4_THINK_LOW;
+    r1.prompt_text = render_chat_prompt_text(&conv1, schemas, NULL,
+                                             DS4_THINK_LOW);
+    char *vs1 = build_responses_visible_assistant_suffix(&r1, "", NULL,
+                                                         &conv.v[1].calls);
+    const size_t seed = responses_publish_frontier_bytes(&r1, false, vs1);
+    TEST_ASSERT(seed == strlen(r1.prompt_text) + strlen(vs1));
+    {
+        size_t mark = 0;
+        char *full = render_chat_prompt_text_mark(&conv3, schemas, NULL,
+                                                  DS4_THINK_LOW, 2, &mark);
+        TEST_ASSERT(mark == seed);   /* the tail's byte offset, through EOS */
+        free(full);
+    }
+
+    /* Hop 1 at the FIRST result's boundary, hop 2 at the SECOND's. */
+    for (int hop = 1; hop <= 2; hop++) {
+        for (int past = 0; past < 2; past++) {
+            g_tool_reminder_min_bytes = (hop == 1 ? pred1 : pred2) + (size_t)past;
+            server s = {0};
+            pthread_mutex_init(&s.tool_mu, NULL);
+            test_reminder_publish_responses(&s, &conv.v[1].calls, 7, 10, seed);
+            {
+                stop_list ids = {0};
+                id_list_push_unique(&ids, "call_1");
+                TEST_ASSERT(cont_registry_live_frontier_bytes(&s, API_RESPONSES,
+                                                              &ids) == seed);
+                id_list_free(&ids);
+            }
+
+            /* T2: output-only against the seeded record. */
+            char *full3 = render_chat_prompt_text(&conv3, schemas, NULL,
+                                                  DS4_THINK_LOW);
+            request r2;
+            request_init(&r2, REQ_CHAT, 128);
+            r2.api = API_RESPONSES;
+            r2.think_mode = DS4_THINK_LOW;
+            responses_prepare_live_continuation(&s, &r2, &t2, schemas);
+            TEST_ASSERT(r2.responses_live_output_only);
+            TEST_ASSERT(r2.cont_frontier_bytes == seed);
+            TEST_ASSERT(r2.responses_live_suffix_text != NULL);
+            {
+                const size_t sl = strlen(r2.responses_live_suffix_text);
+                const size_t fl = strlen(full3);
+                TEST_ASSERT(fl > sl);
+                TEST_ASSERT(!strcmp(full3 + fl - sl, r2.responses_live_suffix_text));
+                TEST_ASSERT(!strncmp(r2.responses_live_suffix_text, DS4_EOS_TEXT,
+                                     DS4_EOS_TEXT_LEN));
+                TEST_ASSERT((strstr(r2.responses_live_suffix_text,
+                                    "[Reminder:") != NULL) ==
+                            (hop == 1 && past == 0));
+            }
+            free(full3);
+
+            /* T2 mints call_2: its record advances the frontier to the full
+             * render's offset of T3's tail -- reminder bytes included. */
+            char *vs2 = build_responses_visible_assistant_suffix(&r2, "", NULL,
+                                                                 &conv.v[3].calls);
+            const size_t adv = responses_publish_frontier_bytes(&r2, true, vs2);
+            TEST_ASSERT(adv == seed - DS4_EOS_TEXT_LEN +
+                               strlen(r2.responses_live_suffix_text) +
+                               strlen(vs2));
+            {
+                size_t mark = 0;
+                char *full = render_chat_prompt_text_mark(&conv, schemas, NULL,
+                                                          DS4_THINK_LOW, 4, &mark);
+                TEST_ASSERT(mark == adv);
+                free(full);
+            }
+            /* An output-only turn that was not admitted through the call-id
+             * lane has no trustworthy base: it publishes unknown. */
+            TEST_ASSERT(responses_publish_frontier_bytes(&r2, false, vs2) == 0);
+            test_reminder_publish_responses(&s, &conv.v[3].calls, 7, 20, adv);
+            free(vs2);
+            request_free(&r2);
+
+            /* T3: output-only against the advanced record. */
+            char *full5 = render_chat_prompt_text(&conv, schemas, NULL,
+                                                  DS4_THINK_LOW);
+            request r3;
+            request_init(&r3, REQ_CHAT, 128);
+            r3.api = API_RESPONSES;
+            r3.think_mode = DS4_THINK_LOW;
+            responses_prepare_live_continuation(&s, &r3, &t3, schemas);
+            TEST_ASSERT(r3.responses_live_output_only);
+            TEST_ASSERT(r3.cont_frontier_bytes == adv);
+            TEST_ASSERT(r3.responses_live_suffix_text != NULL);
+            {
+                const size_t sl = strlen(r3.responses_live_suffix_text);
+                const size_t fl = strlen(full5);
+                TEST_ASSERT(fl > sl);
+                TEST_ASSERT(!strcmp(full5 + fl - sl, r3.responses_live_suffix_text));
+                TEST_ASSERT((strstr(r3.responses_live_suffix_text,
+                                    "[Reminder:") != NULL) ==
+                            (hop == 1 || past == 0));
+                if (hop == 2 && past == 0) {
+                    TEST_ASSERT(strstr(r3.responses_live_suffix_text,
+                                       "ok-second\n\n[Reminder:") != NULL);
+                    /* Only hop 2's result is past this gate in the full
+                     * render as well: exactly one reminder there. */
+                    int n = 0;
+                    for (const char *p = full5;
+                         (p = strstr(p, "[Reminder:")) != NULL; p++) n++;
+                    TEST_ASSERT(n == 1);
+                }
+            }
+            free(full5);
+            request_free(&r3);
+            cont_registry_free(&s);
+            pthread_mutex_destroy(&s.tool_mu);
+        }
+    }
+
+    /* Unknown frontier: bare tail, no reminder even at gate 0. */
+    g_tool_reminder_min_bytes = 0;
+    {
+        server s = {0};
+        pthread_mutex_init(&s.tool_mu, NULL);
+        request r;
+
+        /* No registry at all (parser without a server). */
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_RESPONSES;
+        r.think_mode = DS4_THINK_LOW;
+        responses_prepare_live_continuation(NULL, &r, &t2, schemas);
+        TEST_ASSERT(r.responses_live_output_only);
+        TEST_ASSERT(r.cont_frontier_bytes == 0);
+        TEST_ASSERT(r.responses_live_suffix_text != NULL);
+        TEST_ASSERT(strstr(r.responses_live_suffix_text, "ok-first") != NULL);
+        TEST_ASSERT(strstr(r.responses_live_suffix_text, "[Reminder:") == NULL);
+        request_free(&r);
+
+        /* A registry that never saw call_1. */
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_RESPONSES;
+        r.think_mode = DS4_THINK_LOW;
+        responses_prepare_live_continuation(&s, &r, &t2, schemas);
+        TEST_ASSERT(r.cont_frontier_bytes == 0);
+        TEST_ASSERT(strstr(r.responses_live_suffix_text, "[Reminder:") == NULL);
+        request_free(&r);
+
+        /* A LIVE record that published no frontier (unknown stays unknown). */
+        test_reminder_publish_responses(&s, &conv.v[1].calls, 7, 10, 0);
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_RESPONSES;
+        r.think_mode = DS4_THINK_LOW;
+        responses_prepare_live_continuation(&s, &r, &t2, schemas);
+        TEST_ASSERT(r.cont_frontier_bytes == 0);
+        TEST_ASSERT(strstr(r.responses_live_suffix_text, "[Reminder:") == NULL);
+        request_free(&r);
+
+        /* Known frontier, but the knob is off / no tools declared. */
+        test_reminder_publish_responses(&s, &conv.v[1].calls, 8, 10, seed);
+        g_tool_call_reminder = false;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_RESPONSES;
+        r.think_mode = DS4_THINK_LOW;
+        responses_prepare_live_continuation(&s, &r, &t2, schemas);
+        TEST_ASSERT(r.cont_frontier_bytes == seed);
+        TEST_ASSERT(strstr(r.responses_live_suffix_text, "[Reminder:") == NULL);
+        request_free(&r);
+        g_tool_call_reminder = true;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_RESPONSES;
+        r.think_mode = DS4_THINK_LOW;
+        responses_prepare_live_continuation(&s, &r, &t2, NULL);
+        TEST_ASSERT(r.cont_frontier_bytes == seed);
+        TEST_ASSERT(strstr(r.responses_live_suffix_text, "[Reminder:") == NULL);
+        request_free(&r);
+
+        /* Demoted record: not LIVE, so no base and no reminder. */
+        cont_registry_demote_serial(&s);
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_RESPONSES;
+        r.think_mode = DS4_THINK_LOW;
+        responses_prepare_live_continuation(&s, &r, &t2, schemas);
+        TEST_ASSERT(r.cont_frontier_bytes == 0);
+        TEST_ASSERT(strstr(r.responses_live_suffix_text, "[Reminder:") == NULL);
+        request_free(&r);
+
+        cont_registry_free(&s);
+        pthread_mutex_destroy(&s.tool_mu);
+    }
+
+    /* A history-carrying request never takes the registry base: its exact
+     * tail comes from its own render, and it is not output-only. */
+    {
+        server s = {0};
+        pthread_mutex_init(&s.tool_mu, NULL);
+        test_reminder_publish_responses(&s, &conv.v[1].calls, 7, 10, 12345);
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_RESPONSES;
+        r.think_mode = DS4_THINK_LOW;
+        responses_prepare_live_continuation(&s, &r, &conv3, schemas);
+        TEST_ASSERT(!r.responses_live_output_only);
+        TEST_ASSERT(r.cont_frontier_bytes == 0);
+        TEST_ASSERT(r.responses_live_suffix_text != NULL);
+        request_free(&r);
+        cont_registry_free(&s);
+        pthread_mutex_destroy(&s.tool_mu);
+    }
+
+    free(vs1);
+    request_free(&r1);
+    chat_msgs_free(&t2);
+    chat_msgs_free(&t3);
+    chat_msgs_free(&conv);
+    g_tool_call_reminder = saved_on;
+    g_tool_reminder_min_bytes = saved_gate;
+}
+
+static void test_cont_registry_frontier_bytes_lookup(void) {
+    /* The parse-time frontier read has the resolve's id semantics (exact
+     * set, protocol-scoped, LIVE only) and is owner-agnostic; the frontier
+     * arithmetic refuses every shape that does not splice at the EOS. */
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    {
+        tool_calls calls = {0};
+        tool_call a = {0}, b = {0};
+        a.id = xstrdup("call_fa");
+        b.id = xstrdup("call_fb");
+        tool_calls_push(&calls, a);
+        tool_calls_push(&calls, b);
+        cont_registry_publish_serial(&s, API_RESPONSES, &calls, 7, 100, 5000);
+        tool_calls_free(&calls);
+    }
+    stop_list ids = {0};
+    id_list_push_unique(&ids, "call_fb");
+    id_list_push_unique(&ids, "call_fa");
+    TEST_ASSERT(cont_registry_live_frontier_bytes(&s, API_RESPONSES, &ids) == 5000);
+    TEST_ASSERT(cont_registry_live_frontier_bytes(&s, API_ANTHROPIC, &ids) == 0);
+    TEST_ASSERT(cont_registry_live_frontier_bytes(NULL, API_RESPONSES, &ids) == 0);
+    {
+        stop_list sub = {0};
+        id_list_push_unique(&sub, "call_fa");
+        TEST_ASSERT(cont_registry_live_frontier_bytes(&s, API_RESPONSES, &sub) == 0);
+        id_list_push_unique(&sub, "call_fb");
+        id_list_push_unique(&sub, "call_fc");
+        TEST_ASSERT(cont_registry_live_frontier_bytes(&s, API_RESPONSES, &sub) == 0);
+        id_list_free(&sub);
+    }
+    /* Bank owner: same bookkeeping. */
+    {
+        tool_calls calls = {0};
+        tool_call c = {0};
+        c.id = xstrdup("call_fc");
+        tool_calls_push(&calls, c);
+        cont_registry_publish_bank(&s, API_RESPONSES, &calls, 2, 3, 80, 7000);
+        tool_calls_free(&calls);
+        stop_list bank_ids = {0};
+        id_list_push_unique(&bank_ids, "call_fc");
+        TEST_ASSERT(cont_registry_live_frontier_bytes(&s, API_RESPONSES,
+                                                      &bank_ids) == 7000);
+        id_list_free(&bank_ids);
+    }
+    /* Demoted: not LIVE, no frontier. */
+    cont_registry_demote_serial(&s);
+    TEST_ASSERT(cont_registry_live_frontier_bytes(&s, API_RESPONSES, &ids) == 0);
+    id_list_free(&ids);
+    cont_registry_free(&s);
+    pthread_mutex_destroy(&s.tool_mu);
+
+    /* Arithmetic. */
+    const char *vs = "</think>reply" DS4_EOS_TEXT;
+    const char *tail = DS4_EOS_TEXT "<｜User｜><tool_result>x</tool_result>"
+                       "<｜Assistant｜><think>";
+    TEST_ASSERT(cont_frontier_bytes_seed("prompt", vs) == 6 + strlen(vs));
+    TEST_ASSERT(cont_frontier_bytes_seed(NULL, vs) == 0);
+    TEST_ASSERT(cont_frontier_bytes_seed("", vs) == 0);
+    TEST_ASSERT(cont_frontier_bytes_seed("prompt", "no terminator") == 0);
+    TEST_ASSERT(cont_frontier_bytes_advance(1000, tail, vs) ==
+                1000 - DS4_EOS_TEXT_LEN + strlen(tail) + strlen(vs));
+    TEST_ASSERT(cont_frontier_bytes_advance(0, tail, vs) == 0);
+    TEST_ASSERT(cont_frontier_bytes_advance(1000, tail + 1, vs) == 0);
+    TEST_ASSERT(cont_frontier_bytes_advance(1000, NULL, vs) == 0);
+    TEST_ASSERT(cont_frontier_bytes_advance(1000, tail, "no terminator") == 0);
+    {
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_RESPONSES;
+        r.prompt_text = xstrdup("prompt");
+        TEST_ASSERT(responses_publish_frontier_bytes(&r, false, vs) ==
+                    6 + strlen(vs));
+        r.responses_live_output_only = true;
+        r.responses_live_suffix_text = xstrdup(tail);
+        TEST_ASSERT(responses_publish_frontier_bytes(&r, true, vs) == 0);   /* base unknown */
+        TEST_ASSERT(responses_publish_frontier_bytes(&r, false, vs) == 0);
+        r.cont_frontier_bytes = 1000;
+        TEST_ASSERT(responses_publish_frontier_bytes(&r, true, vs) ==
+                    1000 - DS4_EOS_TEXT_LEN + strlen(tail) + strlen(vs));
+        TEST_ASSERT(responses_publish_frontier_bytes(&r, false, vs) == 0);
+        request_free(&r);
+    }
 }
 
 static void test_cont_slip_resample_contract(void) {
@@ -23666,7 +24289,7 @@ static void test_anthropic_tool_result_id_validation(void) {
         tool_call tc = {0};
         tc.id = xstrdup("toolu_missing");
         tool_calls_push(&calls, tc);
-        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 7, 10);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 7, 10, 0);
         tool_calls_free(&calls);
     }
     bool needs_live_tool_state = false;
@@ -23727,7 +24350,7 @@ static void test_anthropic_tool_use_parses_before_role(void) {
         tool_call tc = {0};
         tc.id = xstrdup("toolu_current");
         tool_calls_push(&calls, tc);
-        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 5, 100);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 5, 100, 0);
         tool_calls_free(&calls);
     }
 
@@ -23776,7 +24399,7 @@ static void test_cont_registry_publish_resolve_demote(void) {
     tool_call b = {0};
     b.id = xstrdup("toolu_regB");
     tool_calls_push(&calls, b);
-    cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 7, 100);
+    cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 7, 100, 0);
     tool_calls_free(&calls);
 
     /* LIVE visibility is protocol-scoped (plan §4.6 collision/bleed). */
@@ -23833,7 +24456,7 @@ static void test_cont_registry_supersede_and_cap(void) {
         tc.id = xstrdup(idbuf);
         tool_calls_push(&calls, tc);
         cont_registry_publish_serial(&s, API_ANTHROPIC, &calls,
-                                     3, 50 * t);
+                                     3, 50 * t, 0);
         tool_calls_free(&calls);
     }
     /* Turn 2 superseded turn 1: exactly one LIVE record. */
@@ -23851,7 +24474,7 @@ static void test_cont_registry_supersede_and_cap(void) {
         tc.id = xstrdup(idbuf);
         tool_calls_push(&calls, tc);
         cont_registry_publish_serial(&s, API_ANTHROPIC, &calls,
-                                     3, 50 * t);
+                                     3, 50 * t, 0);
         tool_calls_free(&calls);
     }
     TEST_ASSERT(s.creg.n_records <= 4);
@@ -23877,7 +24500,7 @@ static void test_cont_registry_pins_exact_dsml(void) {
         tool_call tc = {0};
         tc.id = xstrdup("toolu_pinned");
         tool_calls_push(&calls, tc);
-        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 9, 40);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 9, 40, 0);
         tool_calls_free(&calls);
     }
     /* Flood the tiny LRU: the pinned entry is the tail yet survives; the
@@ -23916,7 +24539,7 @@ static void test_cont_registry_grace_and_pin_hold(void) {
         tool_call tc = {0};
         tc.id = xstrdup("toolu_hold");
         tool_calls_push(&calls, tc);
-        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 4, 70);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 4, 70, 0);
         tool_calls_free(&calls);
     }
 
@@ -23988,7 +24611,7 @@ static void test_cont_registry_ttl_expire(void) {
         tool_call tc = {0};
         tc.id = xstrdup("toolu_ttl");
         tool_calls_push(&calls, tc);
-        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 4, 70);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 4, 70, 0);
         tool_calls_free(&calls);
     }
     TEST_ASSERT(anthropic_live_has_call_id(&s, "toolu_ttl"));
@@ -24027,7 +24650,7 @@ static void test_cont_registry_record_unit_eviction(void) {
         tool_call b = {0};
         b.id = xstrdup("toolu_u2");
         tool_calls_push(&calls, b);
-        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 6, 90);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 6, 90, 0);
         tool_calls_free(&calls);
     }
     cont_registry_demote_serial(&s);   /* REPLAY_ONLY, unpinned */
@@ -24100,10 +24723,19 @@ static void test_serial_terminal_commit_ladder(void) {
         tool_call tc = {0};
         tc.id = xstrdup("toolu_txnA");
         tool_calls_push(&calls, tc);
-        serial_terminal_commit(&s, &j, API_ANTHROPIC, &calls, 3, 50, &tb, "t");
+        serial_terminal_commit(&s, &j, API_ANTHROPIC, &calls, 3, 50, 4096,
+                               &tb, "t");
         tool_calls_free(&calls);
     }
     TEST_ASSERT(anthropic_live_has_call_id(&s, "toolu_txnA"));
+    {
+        /* The rendered-byte frontier rides the same publication. */
+        stop_list ids = {0};
+        id_list_push_unique(&ids, "toolu_txnA");
+        TEST_ASSERT(cont_registry_live_frontier_bytes(&s, API_ANTHROPIC,
+                                                      &ids) == 4096);
+        id_list_free(&ids);
+    }
     TEST_ASSERT(!j.client_gone && j.outcome == JOB_OUT_COMPLETED);
     TEST_ASSERT(ds4_metric_read(&m->out_backlog_bytes) == backlog0);
     {
@@ -24121,7 +24753,7 @@ static void test_serial_terminal_commit_ladder(void) {
         tool_call tc = {0};
         tc.id = xstrdup("toolu_txnB");
         tool_calls_push(&calls, tc);
-        serial_terminal_commit(&s, &j, API_ANTHROPIC, &calls, 4, 60, &tb, "t");
+        serial_terminal_commit(&s, &j, API_ANTHROPIC, &calls, 4, 60, 0, &tb, "t");
         tool_calls_free(&calls);
         g_out_agg_cap = cap_save;
     }
@@ -24147,7 +24779,7 @@ static void test_serial_terminal_commit_ladder(void) {
         tool_call tc = {0};
         tc.id = xstrdup("toolu_txnC");
         tool_calls_push(&calls, tc);
-        serial_terminal_commit(&s, &j, API_ANTHROPIC, &calls, 5, 70, &tb, "t");
+        serial_terminal_commit(&s, &j, API_ANTHROPIC, &calls, 5, 70, 0, &tb, "t");
         tool_calls_free(&calls);
     }
     TEST_ASSERT(!anthropic_live_has_call_id(&s, "toolu_txnC"));
@@ -24175,7 +24807,7 @@ static void test_cont_registry_bank_publish_claim(void) {
         tool_call tc = {0};
         tc.id = xstrdup("toolu_bk1");
         tool_calls_push(&calls, tc);
-        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, 2, 7, 100);
+        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, 2, 7, 100, 0);
         tool_calls_free(&calls);
     }
     TEST_ASSERT(anthropic_live_has_call_id(&s, "toolu_bk1"));
@@ -24208,7 +24840,7 @@ static void test_cont_registry_bank_publish_claim(void) {
         tool_call tc = {0};
         tc.id = xstrdup("toolu_ser1");
         tool_calls_push(&calls, tc);
-        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 9, 40);
+        cont_registry_publish_serial(&s, API_ANTHROPIC, &calls, 9, 40, 0);
         tool_calls_free(&calls);
     }
     TEST_ASSERT(s.creg.n_live == 2);
@@ -24223,7 +24855,7 @@ static void test_cont_registry_bank_publish_claim(void) {
         tool_call tc = {0};
         tc.id = xstrdup("toolu_bk2");
         tool_calls_push(&calls, tc);
-        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, 2, 8, 120);
+        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, 2, 8, 120, 0);
         tool_calls_free(&calls);
     }
     TEST_ASSERT(!anthropic_live_has_call_id(&s, "toolu_bk1"));
@@ -24233,7 +24865,7 @@ static void test_cont_registry_bank_publish_claim(void) {
         tool_call tc = {0};
         tc.id = xstrdup("toolu_bk3");
         tool_calls_push(&calls, tc);
-        cont_registry_publish_bank(&s, API_RESPONSES, &calls, 3, 2, 80);
+        cont_registry_publish_bank(&s, API_RESPONSES, &calls, 3, 2, 80, 0);
         tool_calls_free(&calls);
     }
     TEST_ASSERT(s.creg.n_live == 2);
@@ -24245,8 +24877,8 @@ static void test_cont_registry_bank_publish_claim(void) {
         tool_call tc = {0};
         tc.id = xstrdup("toolu_bk_dead");
         tool_calls_push(&calls, tc);
-        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, 4, 0, 100);
-        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, 4, 5, 0);
+        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, 4, 0, 100, 0);
+        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, 4, 5, 0, 0);
         tool_calls_free(&calls);
     }
     TEST_ASSERT(!cont_registry_id_known(&s, "toolu_bk_dead"));
@@ -24282,7 +24914,7 @@ static void test_cont_registry_bank_protection(void) {
         tool_call tc = {0};
         tc.id = xstrdup("toolu_prot1");
         tool_calls_push(&calls, tc);
-        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, 5, 3, 200);
+        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, 5, 3, 200, 0);
         tool_calls_free(&calls);
     }
     const double now = now_sec();
@@ -24371,7 +25003,7 @@ static void test_responses_live_tail_renders_tool_outputs_only(void) {
     tool.content = xstrdup("/tmp");
     chat_msgs_push(&msgs, tool);
 
-    responses_prepare_live_continuation(&r, &msgs, NULL);
+    responses_prepare_live_continuation(NULL, &r, &msgs, NULL);
     TEST_ASSERT(r.responses_live_call_ids.len == 1);
     TEST_ASSERT(!strcmp(r.responses_live_call_ids.v[0], "call_live"));
     TEST_ASSERT(r.responses_live_suffix_text != NULL);
@@ -24408,7 +25040,7 @@ static void test_responses_tool_output_id_validation(void) {
         tool_call tc = {0};
         tc.id = xstrdup("call_missing");
         tool_calls_push(&calls, tc);
-        cont_registry_publish_serial(&s, API_RESPONSES, &calls, 7, 10);
+        cont_registry_publish_serial(&s, API_RESPONSES, &calls, 7, 10, 0);
         tool_calls_free(&calls);
     }
     err[0] = '\0';
@@ -24459,7 +25091,7 @@ static void test_responses_stateless_tool_replay_requires_reasoning(void) {
         tool_call tc = {0};
         tc.id = xstrdup("call_replay");
         tool_calls_push(&calls, tc);
-        cont_registry_publish_serial(&s, API_RESPONSES, &calls, 7, 123);
+        cont_registry_publish_serial(&s, API_RESPONSES, &calls, 7, 123, 0);
         tool_calls_free(&calls);
     }
     err[0] = '\0';
@@ -29337,7 +29969,7 @@ static void test_serial_reclaim_rank_order(void) {
         snprintf(id, sizeof(id), "toolu_rk%d", b);
         tc.id = xstrdup(id);
         tool_calls_push(&calls, tc);
-        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, b, 3, 50);
+        cont_registry_publish_bank(&s, API_ANTHROPIC, &calls, b, 3, 50, 0);
         tool_calls_free(&calls);
     }
     uint32_t out[DS4_COALESCE_HARD_MAX];
@@ -30748,6 +31380,8 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_call_reminder_render();
     test_tool_call_reminder_anthropic_user_shape();
     test_tool_call_reminder_live_tail_paths();
+    test_tool_call_reminder_output_only_frontier();
+    test_cont_registry_frontier_bytes_lookup();
     test_cont_slip_resample_contract();
     test_slip_requeue_and_age_exemption();
     test_api_thinking_controls_parse();

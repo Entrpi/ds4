@@ -7,10 +7,11 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased
 
-- **`--tool-call-reminder` now covers the Anthropic surface and live
-  tool-result continuations** — closing two coverage gaps in the v0.6.5
-  feature, which despite its help text only fired on the general
-  render path for `tool`/`function`-role results:
+- **`--tool-call-reminder` now covers the Anthropic surface, live
+  tool-result continuations, and output-only Responses chains** —
+  closing the coverage gaps in the v0.6.5 feature, which despite its
+  help text only fired on the general render path for
+  `tool`/`function`-role results:
   - Anthropic `/v1/messages` tool results are embedded into user-role
     content at parse time, so they never reached the reminder
     injection on ANY path. Past the depth gate, a tool-result-bearing
@@ -30,16 +31,28 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
     the tail carries exactly the reminders — at exactly the bytes — a
     later full re-render produces, and warm prefix reuse and
     continuation revalidation see one consistent byte stream.
-  - Disclosed exception: Responses continuations that send ONLY tool
-    outputs without history (the stateless-chain shape) keep the
-    legacy independent tail render and never carry the reminder — the
-    server tracks no rendered-byte frontier across such chains, so no
-    replay-consistent depth verdict exists there yet. The usage text
-    says so.
+  - Responses continuations that send ONLY tool outputs without
+    history (the stateless-chain shape) carry it too. A chained turn's
+    `prompt_text` is a render of the outputs alone, not the transcript,
+    so the depth verdict cannot come from the request: every
+    continuation record (serial-session and batch-bank owners alike)
+    now carries a rendered-byte frontier, seeded from `prompt_text` +
+    the visible assistant suffix on a turn whose prompt is the
+    transcript, and advanced by the consumed live tail + visible
+    suffix on an output-only turn. The output-only tail evaluates the
+    full renderer's predicate against that base, so its verdict is a
+    pure function a later full re-render reproduces byte for byte
+    (warm prefix reuse and continuation revalidation stay consistent).
+    Where no base exists (no LIVE record, a record that published no
+    frontier, the Anthropic unanchored fallback) the tail renders
+    bare: under-injection stays the safe direction.
   - New server-group units: the Anthropic user-embedded shape
-    (injection point, id guard, terminator literals in plain text)
-    and both live-tail lanes probed at the exact depth-gate boundary
-    for byte-identity with the full render.
+    (injection point, id guard, terminator literals in plain text),
+    both live-tail lanes probed at the exact depth-gate boundary for
+    byte-identity with the full render, a two-hop output-only chain
+    (seed, advance, second-hop boundary) proven byte-identical to the
+    full re-render, and the registry frontier lookup + arithmetic
+    edge cases.
 - **DeepSeek-V4-Flash-Vision-Exp loads as a text-only checkpoint
   (opt-in)** — the 2026-08-31 continued-training checkpoint's language
   GGUF (`antirez/deepseek-v4-gguf`, the same IQ2_XXS/Q2_K asymmetric
