@@ -5496,6 +5496,7 @@ typedef struct {
     uint64_t q_row_stride;
     uint64_t kv_row_stride;
     float    eps;
+    uint32_t tasks;
 } ds4_gpu_qkv_rms_norm_args;
 
 static ds4_gpu_rms_norm_args ds4_gpu_make_rms_norm_args(uint32_t n, uint32_t rows, float eps) {
@@ -5868,6 +5869,8 @@ typedef struct {
     uint32_t pad_rows;
     uint32_t shared_pad;
 } ds4_gpu_flash_kv_stage_f16_args;
+
+
 
 typedef struct {
     int32_t  ne01;
@@ -22189,6 +22192,102 @@ int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
  * Same arithmetic, order and rounding as the three separate dispatches (see
  * metal/norm.metal); gated and verified against full-vocabulary logits.
  * Returns 1 on success, 0 on unsupported shape (caller falls back). */
+/* Deferred kv norm/RoPE/FP8 task: the q/kv norm dispatch runs its q task
+ * only and the kv task is folded into the KV staging kernel of the same
+ * layer (ds4_gpu_kv_norm_task_flush runs it standalone if no staging
+ * consumed it). */
+static struct {
+    int pending;
+    id<MTLBuffer> kv, kv_out, kv_w, q, q_out, q_w, raw;
+    NSUInteger kv_off, kv_out_off, kv_w_off, q_off, q_out_off, q_w_off, raw_off;
+    ds4_gpu_qkv_rms_norm_args nargs;
+    ds4_gpu_rope_affine_pair_args rope;
+    ds4_gpu_dsv4_kv_fp8_store_args store;
+    NSUInteger norm_threads;
+} g_kv_task;
+
+static int g_qkv_norm_defer_kv;
+
+void ds4_gpu_dsv4_qkv_norm_defer_kv_next(void) {
+    g_qkv_norm_defer_kv = 1;
+}
+
+int ds4_gpu_kv_norm_task_pending(void) {
+    return g_kv_task.pending;
+}
+
+/* Run a deferred kv task standalone (the full q/kv norm kernel; the q task
+ * recomputes identical values).  Used when no KV staging consumed it. */
+int ds4_gpu_kv_norm_task_flush(void) {
+    if (!g_kv_task.pending) return 1;
+    g_kv_task.pending = 0;
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return 0;
+    id<MTLComputePipelineState> pipeline =
+        ds4_gpu_get_pipeline("kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32");
+    if (!pipeline) return 0;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&g_kv_task.nargs length:sizeof(g_kv_task.nargs) atIndex:0];
+    [enc setBytes:&g_kv_task.rope length:sizeof(g_kv_task.rope) atIndex:1];
+    [enc setBytes:&g_kv_task.store length:sizeof(g_kv_task.store) atIndex:2];
+    [enc setBuffer:g_kv_task.q offset:g_kv_task.q_off atIndex:3];
+    [enc setBuffer:g_kv_task.q_w offset:g_kv_task.q_w_off atIndex:4];
+    [enc setBuffer:g_kv_task.q_out offset:g_kv_task.q_out_off atIndex:5];
+    [enc setBuffer:g_kv_task.kv offset:g_kv_task.kv_off atIndex:6];
+    [enc setBuffer:g_kv_task.kv_w offset:g_kv_task.kv_w_off atIndex:7];
+    [enc setBuffer:g_kv_task.kv_out offset:g_kv_task.kv_out_off atIndex:8];
+    [enc setBuffer:g_kv_task.raw offset:g_kv_task.raw_off atIndex:9];
+    [enc setThreadgroupMemoryLength:(32u + 64u) * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 2, 1)
+         threadsPerThreadgroup:MTLSizeMake(g_kv_task.norm_threads, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "deferred kv norm task");
+}
+
+/* Run the deferred kv task in a concurrent encoder left open for the
+ * caller's next dispatch (the q_b projection), so its ~9 us of serial work
+ * hides under that stream.  End closes the section. */
+int ds4_gpu_kv_norm_task_begin_concurrent(void) {
+    if (!g_kv_task.pending || !g_batch_cb || g_batch_encoder_concurrent) return 0;
+    id<MTLComputePipelineState> pipeline =
+        ds4_gpu_get_pipeline("kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32");
+    if (!pipeline) return 0;
+    g_kv_task.pending = 0;
+    ds4_gpu_close_batch_encoder();
+    g_batch_encoder_concurrent = YES;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+    if (!enc || enc.dispatchType != MTLDispatchTypeConcurrent) {
+        ds4_gpu_close_batch_encoder();
+        g_batch_encoder_concurrent = NO;
+        g_kv_task.pending = 1;
+        return 0;
+    }
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&g_kv_task.nargs length:sizeof(g_kv_task.nargs) atIndex:0];
+    [enc setBytes:&g_kv_task.rope length:sizeof(g_kv_task.rope) atIndex:1];
+    [enc setBytes:&g_kv_task.store length:sizeof(g_kv_task.store) atIndex:2];
+    [enc setBuffer:g_kv_task.q offset:g_kv_task.q_off atIndex:3];
+    [enc setBuffer:g_kv_task.q_w offset:g_kv_task.q_w_off atIndex:4];
+    [enc setBuffer:g_kv_task.q_out offset:g_kv_task.q_out_off atIndex:5];
+    [enc setBuffer:g_kv_task.kv offset:g_kv_task.kv_off atIndex:6];
+    [enc setBuffer:g_kv_task.kv_w offset:g_kv_task.kv_w_off atIndex:7];
+    [enc setBuffer:g_kv_task.kv_out offset:g_kv_task.kv_out_off atIndex:8];
+    [enc setBuffer:g_kv_task.raw offset:g_kv_task.raw_off atIndex:9];
+    [enc setThreadgroupMemoryLength:(32u + 64u) * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 2, 1)
+         threadsPerThreadgroup:MTLSizeMake(g_kv_task.norm_threads, 1, 1)];
+    ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+    return 1;
+}
+
+void ds4_gpu_kv_norm_task_end_concurrent(void) {
+    if (!g_batch_encoder_concurrent) return;
+    ds4_gpu_close_batch_encoder();
+    g_batch_encoder_concurrent = NO;
+}
+
 int ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor(
         ds4_gpu_tensor       *q_out,
         const ds4_gpu_tensor *q,
@@ -22309,8 +22408,30 @@ int ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor(
         [enc setBuffer:kvoutbuf offset:ds4_gpu_tensor_offset(kv_out) atIndex:8];
         [enc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_cache) atIndex:9];
         [enc setThreadgroupMemoryLength:(32u + 64u) * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 2, 1)
-             threadsPerThreadgroup:MTLSizeMake(ds4_gpu_rms_norm_threads(q_n), 1, 1)];
+        const NSUInteger norm_threads = ds4_gpu_rms_norm_threads(q_n);
+        const bool defer_kv = g_qkv_norm_defer_kv && !g_kv_task.pending;
+        g_qkv_norm_defer_kv = 0;
+        if (defer_kv) {
+            args.tasks = 1u;   /* q task now; kv task later, concurrently with q_b */
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+        }
+        [enc dispatchThreadgroups:MTLSizeMake(1, defer_kv ? 1 : 2, 1)
+             threadsPerThreadgroup:MTLSizeMake(norm_threads, 1, 1)];
+        if (defer_kv) {
+            g_kv_task.pending = 1;
+            g_kv_task.kv = kvbuf; g_kv_task.kv_off = ds4_gpu_tensor_offset(kv);
+            g_kv_task.kv_out = kvoutbuf; g_kv_task.kv_out_off = ds4_gpu_tensor_offset(kv_out);
+            g_kv_task.kv_w = kv_wbuf; g_kv_task.kv_w_off = (NSUInteger)kv_inner_offset;
+            g_kv_task.q = qbuf; g_kv_task.q_off = ds4_gpu_tensor_offset(q);
+            g_kv_task.q_out = qoutbuf; g_kv_task.q_out_off = ds4_gpu_tensor_offset(q_out);
+            g_kv_task.q_w = q_wbuf; g_kv_task.q_w_off = (NSUInteger)q_inner_offset;
+            g_kv_task.raw = rawbuf; g_kv_task.raw_off = ds4_gpu_tensor_offset(raw_cache);
+            g_kv_task.nargs = args;
+            g_kv_task.nargs.tasks = 2u;   /* kv task only */
+            g_kv_task.rope = rope;
+            g_kv_task.store = store;
+            g_kv_task.norm_threads = norm_threads;
+        }
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "fused q/kv norm RoPE store")) return 0;
@@ -27107,6 +27228,13 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
         const NSUInteger groups = (total_vecs + nth - 1u) / nth;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (g_kv_task.pending) {
+            /* Safety net: a deferred kv task nothing consumed runs before the
+             * staging reads the cache row. */
+            ds4_gpu_end_compute_encoder(cb, enc);
+            if (!ds4_gpu_kv_norm_task_flush()) return 0;
+            enc = ds4_gpu_compute_encoder(cb);
+        }
         [enc setComputePipelineState:g_flash_kv_stage_f16_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:raw offset:raw_offset atIndex:1];
@@ -30532,6 +30660,10 @@ int ds4_gpu_attention_decode_heads_tensor(
         if (!sinks_buf) return 0;
 
         if (n_comp == 0) {
+            /* The raw-only path stages through the same kernel when it
+             * stages at all; a pending deferred kv task that nothing
+             * consumes must run before the attention reads the cache. */
+            if (g_kv_task.pending && !ds4_gpu_kv_norm_task_flush()) return 0;
             int owned = 0;
             id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
             if (!cb) return 0;
@@ -30577,6 +30709,14 @@ int ds4_gpu_attention_decode_heads_tensor(
             return 0;
         }
 
+        if (g_kv_task.pending) {
+            static int warned;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr, "ds4: deferred kv norm task was not consumed by the attention path\n");
+            }
+            if (!ds4_gpu_kv_norm_task_flush()) return 0;
+        }
         if (!ds4_gpu_finish_command_buffer(cb, owned, "graph attention heads")) return 0;
     }
 
