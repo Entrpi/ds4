@@ -2160,15 +2160,15 @@ int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
                                  drafts, n);
 }
 
-int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t full_accept, int32_t replay_n) {
-    struct { int32_t full; int32_t replay; } msg = { full_accept, replay_n };
+int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t mode, int32_t token_count) {
+    struct { int32_t mode; int32_t count; } msg = { mode, token_count };
     return tp_send_frame(tp->control_fd, DS4_TP_FRAME_VERIFY_COMMIT,
                          &msg, sizeof(msg));
 }
 
-int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *full_accept, int32_t *replay_n) {
+int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *mode, int32_t *token_count) {
     uint32_t type = 0, bytes = 0;
-    struct { int32_t full; int32_t replay; } msg;
+    struct { int32_t mode; int32_t count; } msg;
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
         type != DS4_TP_FRAME_VERIFY_COMMIT || bytes != sizeof(msg) ||
         !tp_read_full(tp->control_fd, &msg, sizeof(msg))) {
@@ -2176,8 +2176,8 @@ int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *full_accept, int32_t *replay_
                 type, bytes);
         return 0;
     }
-    *full_accept = msg.full;
-    *replay_n = msg.replay;
+    *mode = msg.mode;
+    *token_count = msg.count;
     return 1;
 }
 

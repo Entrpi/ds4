@@ -229,13 +229,19 @@ int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count);
 
 /* Speculative verify mirroring.  The leader announces a draft block right
  * before both ranks run the expert-split batch verify; the worker then blocks
- * on the commit frame, which carries the leader's decision: full_accept keeps
- * the pushed rows, otherwise both sides roll back and replay replay_n tokens
- * through the gated single-token decode in lockstep. */
+ * on the commit frame. A full commit keeps the entire verified block, a prefix
+ * commit restores the matching verifier prefix on both ranks, and rollback
+ * restores the original frontier before replaying token_count tokens. */
+typedef enum {
+    DS4_TP_VERIFY_ROLLBACK_REPLAY = 0,
+    DS4_TP_VERIFY_COMMIT_FULL = 1,
+    DS4_TP_VERIFY_COMMIT_PREFIX = 2,
+} ds4_tp_verify_commit_mode;
+
 int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
                        const int *drafts, uint32_t n);
-int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t full_accept, int32_t replay_n);
-int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *full_accept, int32_t *replay_n);
+int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t mode, int32_t token_count);
+int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *mode, int32_t *token_count);
 
 /* Standalone worker mode entry. Loads nothing itself: the engine is already
  * open. */
