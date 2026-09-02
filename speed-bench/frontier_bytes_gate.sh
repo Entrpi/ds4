@@ -142,13 +142,32 @@ boot(){
   note "boot: up (BINDIR=$BINDIR rev=$(ssh "$R" "cd $BINDIR && git rev-parse --short HEAD 2>/dev/null || echo unknown") ctx=$CTX trace=$TRACE)"
 }
 
+# 503 "retry shortly" = the serial lane is reserved for a LIVE tool
+# continuation (the previous chain's retention grace, 60 s by default); a
+# client retries, so the gate does too (up to 90 s), and notes how long.
 post(){ # $1=name $2=path $3=body-file -> writes $OUT/$1.json, echoes http code
-  curl -s -m 900 -o "$OUT/$1.json" -w '%{http_code}' "$BASE$2" \
-       -H 'Content-Type: application/json' -d @"$3"
+  local i=0 c
+  while :; do
+    c=$(curl -s -m 900 -o "$OUT/$1.json" -w '%{http_code}' "$BASE$2" \
+         -H 'Content-Type: application/json' -d @"$3")
+    if [ "$c" = "503" ] && grep -q 'reserved for a live tool continuation' "$OUT/$1.json" 2>/dev/null && [ $i -lt 18 ]; then
+      i=$((i+1)); sleep 5; continue
+    fi
+    [ $i -gt 0 ] && note "$1: retried $i x 5 s on 503 serial-reserve (live continuation retention)" >&2
+    printf '%s' "$c"; return
+  done
 }
 sse(){ # $1=name $2=path $3=body-file -> writes $OUT/$1.sse, echoes http code
-  curl -s -m 900 --no-buffer -o "$OUT/$1.sse" -w '%{http_code}' "$BASE$2" \
-       -H 'Content-Type: application/json' -d @"$3"
+  local i=0 c
+  while :; do
+    c=$(curl -s -m 900 --no-buffer -o "$OUT/$1.sse" -w '%{http_code}' "$BASE$2" \
+         -H 'Content-Type: application/json' -d @"$3")
+    if [ "$c" = "503" ] && grep -q 'reserved for a live tool continuation' "$OUT/$1.sse" 2>/dev/null && [ $i -lt 18 ]; then
+      i=$((i+1)); sleep 5; continue
+    fi
+    [ $i -gt 0 ] && note "$1: retried $i x 5 s on 503 serial-reserve (live continuation retention)" >&2
+    printf '%s' "$c"; return
+  done
 }
 has(){ grep -q "$2" "$OUT/$1.json" || fail "$1: missing [$2] in $(head -c 300 "$OUT/$1.json")"; }
 shas(){ grep -q "$2" "$OUT/$1.sse" || fail "$1: missing [$2] in the stream"; }
@@ -229,7 +248,10 @@ call_id_of(){ # $1=file (json or sse) -> first call_id
 }
 
 # ==================== boot =================================================
-BOOT_ENV="DS4_MEM_FLOOR_GB=2" boot
+# Serial-lane boot.  SERIAL_BOOT_ENV (e.g. DS4_SERIAL_RESERVE_CTX=40960) is
+# appended so a wrapper can name the serial-lane lever without being
+# shadowed by the floor setting (run 5 trap).
+BOOT_ENV="DS4_MEM_FLOOR_GB=2 ${SERIAL_BOOT_ENV:-}" boot
 note "gate=$GATE_BYTES REM_BYTES=$REM_BYTES EOS_BYTES=$EOS_BYTES ctrl_user_bytes=$CTRL_BYTES deep_user_bytes=$DEEP_BYTES"
 
 # ==================== serial lane (buffered) ================================
@@ -321,6 +343,16 @@ grep -qF "$REM_HEAD" "$OUT/s_deep_t3.tail.txt" || fail "s_deep_t3: reminder byte
 note "s_deep_t3 PASS (frontier advanced $S_DEEP_F -> $F; reminder=1 on hop 2)"
 
 # ==================== bank lane (streamed) ==================================
+# REBOOT between the lanes (run 5 trap): the 35k-token serial session stays
+# resident after s_deep_t3 and the cont lane refuses even the control T1 at
+# the 2 GiB floor.  The serial-lane srv.log/trace.log are saved first (boot
+# truncates both); counters restart, and every bank-lane check reads its own
+# before/after deltas.  BANK_BOOT_ENV lets a wrapper shape the bank boot.
+scp -q "$R:$RWORK/srv.log" "$OUT/srv_serial.log" || fail "serial srv.log scp failed"
+scp -q "$R:$RWORK/trace.log" "$OUT/trace_serial.log" || fail "serial trace.log scp failed"
+note "serial lane complete; rebooting for the bank lane (serial receipts in srv_serial.log / trace_serial.log)"
+BOOT_ENV="DS4_MEM_FLOOR_GB=2 ${BANK_BOOT_ENV:-}" boot
+sleep 2; curl -s -m 10 "$BASE/v1/models" >/dev/null || fail "bank-lane boot: tunnel dead after reboot"
 # b_ctrl_t1: streamed tool turn rides cont (LANE-ENTRY TRAP: cont entry AND
 # serial unmoved) and publishes a BANK record.
 n=$(t1_body "$OUT/b_ctrl_t1.req" "$CTRL_BYTES" 1) || fail "b_ctrl_t1: body build failed"
