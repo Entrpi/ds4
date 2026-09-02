@@ -2148,11 +2148,6 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
     static int dbg = -1;
     if (dbg < 0) dbg = getenv("DS4_TP_BIG_GATE_DEBUG") != NULL;
-    /* Timing diagnostic only: skip the exchange entirely (results are
-     * garbage) to measure the compute-only prefill bound. */
-    static int fake = -1;
-    if (fake < 0) fake = getenv("DS4_TP_FAKE_BIG_GATE") != NULL;
-    if (fake) return 1;
     const double t_start = dbg ? tp_now_sec() : 0.0;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
     if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
