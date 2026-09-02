@@ -19,3 +19,5 @@ __pycache__/
 .*.swp
 .DS_Store
 /.antigravitycli/
+# Track B: image substrate unit test binary
+tests/test_deepseek4_vision_image

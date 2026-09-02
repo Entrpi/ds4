@@ -17,8 +17,8 @@ CUDA_EXTRA_BINS :=
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_distributed.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
+CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_metal.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -61,8 +61,8 @@ MMQ_INCLUDES := -Icuda/mmq
 # -lcuda is required for the in-process VMM weight arena (CUDA driver API).
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcuda
 MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
-CORE_OBJS = ds4.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
+CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o
 METAL_LDLIBS := $(LDLIBS)
 CUDA_EXTRA_BINS := ds4_weight_server
 endif
@@ -233,6 +233,17 @@ ds4_web.o: ds4_web.c ds4_web.h
 ds4_kvstore.o: ds4_kvstore.c ds4_kvstore.h ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_kvstore.c
 
+# Track B inc 0: image substrate (upstream antirez/ds4 110afdd, DeepSeek half;
+# libc + the vendored iris decoders only, no engine symbols).
+ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_image.c
+
+tests/test_deepseek4_vision_image.o: tests/test_deepseek4_vision_image.c ds4_image.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_deepseek4_vision_image.c
+
+tests/test_deepseek4_vision_image: tests/test_deepseek4_vision_image.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ -lm
+
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
@@ -308,9 +319,10 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o ds4_kvstore.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4-eval
+test: ds4_test ds4-eval tests/test_deepseek4_vision_image
 	./ds4-eval --self-test-extractors
 	./ds4_test
+	./tests/test_deepseek4_vision_image
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_deepseek4_vision_image tests/test_deepseek4_vision_image.o
