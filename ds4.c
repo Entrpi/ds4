@@ -37320,6 +37320,22 @@ static bool metal_graph_verify_suffix_tops_impl(
         fprintf(stderr, "ds4: TP verify-block window did not complete\n");
         ok = false;
     }
+    if (ok && getenv("DS4_DSPARK_EXPERT_OVERLAP")) {
+        /* Diagnostic: distinct routed experts selected by the block's rows
+         * in the last layer (bounds the gain of a multi-row expert kernel). */
+        const int32_t *sel = ds4_gpu_tensor_contents(metal_graph_batch_router_selected(g));
+        if (sel) {
+            uint8_t seen[1024] = {0};
+            uint32_t distinct = 0;
+            for (uint32_t r = 0; r < n_tokens; r++)
+                for (uint32_t k = 0; k < DS4_N_EXPERT_USED; k++) {
+                    const int32_t id = sel[r * DS4_N_EXPERT_USED + k];
+                    if (id >= 0 && id < 1024 && !seen[id]) { seen[id] = 1; distinct++; }
+                }
+            fprintf(stderr, "ds4: DSpark verify block: %u rows, %u distinct experts of %u slots (last layer)\n",
+                    n_tokens, distinct, n_tokens * DS4_N_EXPERT_USED);
+        }
+    }
 #ifdef DS4_ROCM_BUILD
     if (rocm_dspark_fast) ds4_gpu_set_dspark_verify_mode(false);
 #endif
@@ -70435,7 +70451,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
         {
             static int cycle_trace = -1;
             if (cycle_trace < 0) cycle_trace = getenv("DS4_DSPARK_CYCLE_TRACE") != NULL;
-            if (cycle_trace)
+            if (cycle_trace && stats_enabled)
                 fprintf(stderr, "ds4: DSpark cycle: draft_n=%d since-entry-at-verify %.1f ms, verify %.1f ms (upload %.1f layer %.1f head %.1f read %.1f)\n",
                         draft_n, (verify_t0 - stats_t0) * 1000.0,
                         (now_sec() - verify_t0) * 1000.0, verify_timing.upload_ms, verify_timing.layer_ms,
@@ -70508,7 +70524,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
                     n_accept);
         }
         spec_frontier_free(&frontier);
-        if (getenv("DS4_DSPARK_CYCLE_TRACE"))
+        if (getenv("DS4_DSPARK_CYCLE_TRACE") && stats_enabled)
             fprintf(stderr, "ds4: DSpark cycle: direct-full commit, total since entry %.1f ms\n", (now_sec() - stats_t0) * 1000.0);
         DS4_DSPARK_STATS_FINISH();
         return n_accept;
@@ -70582,7 +70598,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
                         n_accept);
             }
             spec_frontier_free(&frontier);
-            if (getenv("DS4_DSPARK_CYCLE_TRACE"))
+            if (getenv("DS4_DSPARK_CYCLE_TRACE") && stats_enabled)
                 fprintf(stderr, "ds4: DSpark cycle: direct-partial commit %d, total since entry %.1f ms\n", commit_drafts, (now_sec() - stats_t0) * 1000.0);
             DS4_DSPARK_STATS_FINISH();
             return n_accept;

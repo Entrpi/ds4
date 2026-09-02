@@ -42975,10 +42975,17 @@ int ds4_gpu_routed_moe_batch_tensor(
              getenv("DS4_METAL_Q4_TABLE_RESIDENCY_SET") != NULL ||
              q4_batch_table_queue_residency ||
              ds4_gpu_q4_table_model_residency_enabled());
+        /* DS4_METAL_MM_ID_MIN_ROWS lowers the batch size at which the
+         * expert-major grouped GEMM replaces the per-row pair kernels (an
+         * experiment for speculative verify blocks: the grouped path streams
+         * each distinct expert once for all rows that select it). */
+        static uint32_t mm_id_min_rows = 0;
+        if (mm_id_min_rows == 0)
+            mm_id_min_rows = (uint32_t)ds4_gpu_env_u64("DS4_METAL_MM_ID_MIN_ROWS", 32u, 2u, 4096u);
         const bool use_mm_id =
             !use_q4_batch_expert_table &&
             !use_iq2_batch_selected_addr &&
-            n_tokens >= 32u &&
+            n_tokens >= mm_id_min_rows &&
             ds4_gpu_mul_mm_id_map0_name(n_expert) != NULL;
         /*
          * MTP verification is neither normal decode nor large prefill: the
