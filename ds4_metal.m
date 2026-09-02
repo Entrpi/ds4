@@ -10317,6 +10317,10 @@ static uint32_t g_tp_queue_head;
 static uint32_t g_tp_queue_count;
 
 static uint64_t g_tp_stat_gates;
+static uint64_t g_tp_stat_batch_gates;      /* verify-block batch gates */
+static double g_tp_stat_batch_gpu_wait_ms;   /* arrival spin (GPU compute + park) */
+static double g_tp_stat_batch_exchange_ms;   /* exchange callback (peer wait + wire) */
+static double g_tp_stat_batch_release_ms;    /* exchange end -> cpu event signaled */
 static double g_tp_stat_gpu_wait_ms;
 static double g_tp_stat_exchange_ms;
 enum { DS4_GPU_TP_GATE_ATTN = 0, DS4_GPU_TP_GATE_FFN = 1,
@@ -10626,9 +10630,15 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                                               req.seq, req.big_out,
                                               req.big_in, req.big_bytes);
             } else if (req.rows > 0) {
+                const double bx0 = profile ? ds4_gpu_now_ms() : 0.0;
                 if (g_tp_batch_exchange_fn)
                     ok = g_tp_batch_exchange_fn(g_tp_exchange_ud, req.layer,
                                                 req.rows, req.seq);
+                if (profile) {
+                    g_tp_stat_batch_gates++;
+                    g_tp_stat_batch_gpu_wait_ms += t1 - t0;
+                    g_tp_stat_batch_exchange_ms += ds4_gpu_now_ms() - bx0;
+                }
             } else if (g_tp_exchange_fn) {
                 ok = g_tp_exchange_fn(g_tp_exchange_ud, req.layer, req.gate,
                                       req.seq);
@@ -10656,7 +10666,9 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
         }
         /* Release the GPU even on failure so end_commands can drain. */
         if (req.rows > 0) {
+            const double br0 = profile ? ds4_gpu_now_ms() : 0.0;
             g_tp_batch_cpu_event.signaledValue = req.seq;
+            if (profile) g_tp_stat_batch_release_ms += ds4_gpu_now_ms() - br0;
         } else if (req.poll) {
             /* The flag we just consumed was published by the command buffer
              * that ran the previous poll, so that poll's result is visible:
@@ -10730,6 +10742,12 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                             ffn_count * 1000.0,
                         g_tp_stat_gate_exchange_ms[DS4_GPU_TP_GATE_FFN] /
                             ffn_count * 1000.0);
+                if (g_tp_stat_batch_gates)
+                    fprintf(stderr, "ds4: TP batch gates: %llu, arrival wait %.1f us, exchange %.1f us, release %.1f us per gate\n",
+                            (unsigned long long)g_tp_stat_batch_gates,
+                            g_tp_stat_batch_gpu_wait_ms * 1e3 / (double)g_tp_stat_batch_gates,
+                            g_tp_stat_batch_exchange_ms * 1e3 / (double)g_tp_stat_batch_gates,
+                            g_tp_stat_batch_release_ms * 1e3 / (double)g_tp_stat_batch_gates);
                 fprintf(stderr,
                         "ds4: TP gates: encode lead %.2f gates; verify %.1f us; release %.1f us; poll hit line avg %.1f max %llu over %llu\n",
                         (double)g_tp_stat_encode_lead / (double)g_tp_stat_gates,

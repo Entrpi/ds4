@@ -918,10 +918,25 @@ int main(int argc, char **argv) {
             int toks[17];
             int ntok = 1;
             if (speculative) {
+                const double spec_t0 = bench_now_sec();
                 ntok = ds4_session_eval_speculative_argmax(
                     session, token, cfg.gen_tokens - gen_done, eos,
                     toks, (int)(sizeof(toks) / sizeof(toks[0])),
                     err, sizeof(err));
+                if (getenv("DS4_BENCH_SPEC_TRACE") && ntok > 0 && ntok < 17) {
+                    static double call_ms[17];
+                    static unsigned call_n[17];
+                    static unsigned calls_total;
+                    call_ms[ntok] += (bench_now_sec() - spec_t0) * 1e3;
+                    call_n[ntok]++;
+                    if (++calls_total % 32u == 0u) {
+                        fprintf(stderr, "ds4-bench: spec calls %u:", calls_total);
+                        for (int k = 1; k < 17; k++)
+                            if (call_n[k])
+                                fprintf(stderr, " %d-tok x%u avg %.1f ms", k, call_n[k], call_ms[k] / call_n[k]);
+                        fprintf(stderr, "\n");
+                    }
+                }
                 if (ntok < 0) {
                     fprintf(stderr, "ds4-bench: DSpark decode at frontier %d failed: %s\n", frontier, err);
                     rc = 1;

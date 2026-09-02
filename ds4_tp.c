@@ -136,6 +136,7 @@ typedef struct {
 #define DS4_TP_RDMA_RECV_WINDOW 16
 #define DS4_TP_RDMA_BULK_SLOTS 64
 #define DS4_TP_RDMA_BULK_WR_TAG (UINT64_C(1) << 63)
+#define DS4_TP_RDMA_BLOCK_WR_TAG (UINT64_C(1) << 61)
 
 typedef struct {
     ds4_tp_verbs_api api;
@@ -167,6 +168,14 @@ typedef struct {
     struct ibv_sge *win_sge;    /* window work request arrays (recv_depth) */
     struct ibv_recv_wr *win_rwr;
     struct ibv_send_wr *win_swr;
+    /* Verify-block window (speculative decoding): one batch gate per layer,
+     * receives posted a layer ahead of every send, no per-gate control
+     * traffic (see ds4_tp_batch_block_begin). */
+    bool block_active;
+    uint32_t block_rows;
+    uint32_t block_layers;
+    uint32_t block_posted;      /* layers whose receives are posted */
+    uint64_t block_recv_done;   /* row messages received in this block */
 } ds4_tp_rdma;
 #endif
 
@@ -1113,12 +1122,134 @@ static int tp_rdma_drain_cq(ds4_tp *tp) {
             return 0;
         }
         if (wc[i].opcode & IBV_WC_RECV) {
-            if (wc[i].wr_id > r->recv_done) r->recv_done = wc[i].wr_id;
+            if (wc[i].wr_id & DS4_TP_RDMA_BLOCK_WR_TAG) {
+                if (wc[i].byte_len == 0) {
+                    fprintf(stderr, "ds4-tp: rdma verify-block receive of 0 bytes\n");
+                    return 0;
+                }
+                r->block_recv_done++;
+            } else if (wc[i].wr_id > r->recv_done) {
+                r->recv_done = wc[i].wr_id;
+            }
         } else if (r->send_outstanding > 0) {
             r->send_outstanding--;
         }
     }
     return 1;
+}
+
+/* Verify-block window helpers. */
+static int tp_rdma_block_post_layer(ds4_tp *tp, uint32_t layer) {
+    ds4_tp_rdma *r = &tp->rdma;
+    const uint32_t rows = r->block_rows;
+    const uint32_t chunks = (uint32_t)((tp->vec_bytes + DS4_TP_RDMA_MAX_MSG - 1u) /
+                                       DS4_TP_RDMA_MAX_MSG);
+    const uint32_t n = rows * chunks;
+    if (n == 0 || n > r->recv_depth) return 0;
+    struct ibv_sge *sge = r->win_sge;
+    struct ibv_recv_wr *wr = r->win_rwr;
+    memset(wr, 0, (size_t)n * sizeof(*wr));
+    const uintptr_t base =
+        (uintptr_t)(tp->slab + ds4_tp_slab_batch_in_offset(tp, layer));
+    uint32_t wi = 0;
+    for (uint32_t row = 0; row < rows; row++) {
+        for (uint64_t off = 0; off < tp->vec_bytes; ) {
+            const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
+                DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+            const int last = off + len == tp->vec_bytes;
+            sge[wi].addr = base + (uintptr_t)row * tp->vec_bytes + off;
+            sge[wi].length = (uint32_t)len;
+            sge[wi].lkey = r->mr->lkey;
+            wr[wi].wr_id = last ?
+                (DS4_TP_RDMA_BLOCK_WR_TAG | ((uint64_t)layer * rows + row + 1u)) : 0;
+            wr[wi].sg_list = &sge[wi];
+            wr[wi].num_sge = 1;
+            if (wi != 0) wr[wi - 1u].next = &wr[wi];
+            wi++;
+            off += len;
+        }
+    }
+    struct ibv_recv_wr *bad = NULL;
+    if (ibv_post_recv(r->qp, wr, &bad) != 0) {
+        fprintf(stderr, "ds4-tp: rdma verify-block post_recv(layer %u): %s\n",
+                layer, strerror(errno));
+        return 0;
+    }
+    r->block_posted = layer + 1u;
+    return 1;
+}
+
+static int tp_rdma_block_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows) {
+    ds4_tp_rdma *r = &tp->rdma;
+    if (!r->block_active || rows != r->block_rows || layer >= r->block_layers ||
+        layer + 1u != r->block_posted) {
+        fprintf(stderr, "ds4-tp: verify-block gate out of order (layer %u rows %u, posted %u/%u rows %u)\n",
+                layer, rows, r->block_posted, r->block_layers, r->block_rows);
+        return 0;
+    }
+    pthread_mutex_lock(&r->post_lock);
+    int ok = 1;
+    /* Post the next layer's receives BEFORE this layer's sends: the peer
+     * can only send layer+1 after it has received this send, so its send
+     * never reaches an unposted queue. */
+    if (layer + 1u < r->block_layers) ok = tp_rdma_block_post_layer(tp, layer + 1u);
+    const uint32_t chunks = (uint32_t)((tp->vec_bytes + DS4_TP_RDMA_MAX_MSG - 1u) /
+                                       DS4_TP_RDMA_MAX_MSG);
+    const uint32_t n = rows * chunks;
+    if (ok) {
+        struct ibv_sge *sge = r->win_sge + r->recv_depth / 2u;   /* separate half of the arrays */
+        struct ibv_send_wr *wr = r->win_swr;
+        if (n > r->recv_depth / 2u || n > r->send_depth) ok = 0;
+        if (ok) {
+            memset(wr, 0, (size_t)n * sizeof(*wr));
+            const uintptr_t base =
+                (uintptr_t)(tp->slab + ds4_tp_slab_batch_out_offset(tp, layer));
+            uint32_t wi = 0;
+            for (uint32_t row = 0; row < rows; row++) {
+                for (uint64_t off = 0; off < tp->vec_bytes; ) {
+                    const uint64_t len = tp->vec_bytes - off > DS4_TP_RDMA_MAX_MSG ?
+                        DS4_TP_RDMA_MAX_MSG : tp->vec_bytes - off;
+                    sge[wi].addr = base + (uintptr_t)row * tp->vec_bytes + off;
+                    sge[wi].length = (uint32_t)len;
+                    sge[wi].lkey = r->mr->lkey;
+                    wr[wi].wr_id = DS4_TP_RDMA_BLOCK_WR_TAG | 1u;
+                    wr[wi].sg_list = &sge[wi];
+                    wr[wi].num_sge = 1;
+                    wr[wi].opcode = IBV_WR_SEND;
+                    wr[wi].send_flags = wi + 1u == n ? IBV_SEND_SIGNALED : 0;
+                    if (wi != 0) wr[wi - 1u].next = &wr[wi];
+                    wi++;
+                    off += len;
+                }
+            }
+            struct ibv_send_wr *bad = NULL;
+            if (ibv_post_send(r->qp, wr, &bad) != 0) {
+                fprintf(stderr, "ds4-tp: rdma verify-block post_send(layer %u): %s\n",
+                        layer, strerror(errno));
+                ok = 0;
+            } else {
+                r->send_outstanding++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&r->post_lock);
+    const uint64_t want = (uint64_t)(layer + 1u) * rows;
+    double deadline = 0.0;
+    uint32_t peer_poll = 0;
+    while (ok && r->block_recv_done < want) {
+        ok = tp_rdma_drain_cq(tp);
+        if (ok && (++peer_poll & 0x3fffu) == 0 && tp_peer_closed(tp)) {
+            fprintf(stderr, "ds4-tp: peer disconnected during verify-block gate\n");
+            ok = 0;
+        }
+        if (deadline == 0.0) deadline = tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
+        else if (tp_now_sec() > deadline) {
+            fprintf(stderr, "ds4-tp: timeout waiting verify-block gate layer %u (%llu/%llu rows)\n",
+                    layer, (unsigned long long)r->block_recv_done, (unsigned long long)want);
+            ok = 0;
+        }
+    }
+    return ok;
 }
 
 /* Arm the receive for gate seq: UC delivery order pairs the peer's seq'th
@@ -1877,6 +2008,68 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
 /* Verify-block batch gate: one exchange per layer moving all block rows at
  * once. The payload lives in the registered slab, so RDMA sends it directly;
  * TCP remains the symmetric write-then-read fallback. */
+/* Verify-block window: called on both ranks right before a speculative
+ * verify block whose every layer ends in one batch gate of `rows` rows.
+ * Drains the decode receive window, posts the first layer's receives,
+ * crosses one control-byte barrier (so both sides are posted before any
+ * send), and from then on each gate posts the next layer's receives and
+ * sends its rows without any handshake.  Returns 1 also when RDMA is not
+ * in use (the TCP fallback keeps its per-gate headers). */
+int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers) {
+#ifdef DS4_TP_HAVE_VERBS
+    if (!tp->rdma_active || !tp_rdma_big_gate_capable(tp)) return 1;
+    if (getenv("DS4_TP_DISABLE_VERIFY_WINDOW")) return 1;
+    ds4_tp_rdma *r = &tp->rdma;
+    if (rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS || n_layers == 0 || r->block_active) return 0;
+    if (!tp_rdma_drain_decode_window(tp)) return 0;
+    pthread_mutex_lock(&r->post_lock);
+    r->block_active = true;
+    r->block_rows = rows;
+    r->block_layers = n_layers;
+    r->block_posted = 0;
+    r->block_recv_done = 0;
+    const int ok = tp_rdma_block_post_layer(tp, 0);
+    pthread_mutex_unlock(&r->post_lock);
+    if (!ok) { r->block_active = false; return 0; }
+    if (!tp_rdma_window_barrier(tp, 0xB5u)) { r->block_active = false; return 0; }
+    if (getenv("DS4_TP_BIG_GATE_DEBUG"))
+        fprintf(stderr, "ds4-tp: verify window armed: %u rows x %u layers\n", rows, n_layers);
+    return 1;
+#else
+    (void)tp; (void)rows; (void)n_layers;
+    return 1;
+#endif
+}
+
+/* End of the verify block: every gate must have been exchanged (all
+ * posted receives consumed) and our signaled sends reaped. */
+int ds4_tp_batch_block_end(ds4_tp *tp) {
+#ifdef DS4_TP_HAVE_VERBS
+    ds4_tp_rdma *r = &tp->rdma;
+    if (!r->block_active) return 1;
+    int ok = 1;
+    const uint64_t want = (uint64_t)r->block_layers * r->block_rows;
+    double deadline = tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
+    while (ok && (r->block_recv_done < want || r->send_outstanding > 0)) {
+        ok = tp_rdma_drain_cq(tp);
+        if (ok && tp_now_sec() > deadline) {
+            fprintf(stderr, "ds4-tp: verify-block end: %llu/%llu rows received, %u sends pending\n",
+                    (unsigned long long)r->block_recv_done, (unsigned long long)want,
+                    r->send_outstanding);
+            ok = 0;
+        }
+    }
+    if (getenv("DS4_TP_BIG_GATE_DEBUG"))
+        fprintf(stderr, "ds4-tp: verify window closed: %llu/%llu rows, ok=%d\n",
+                (unsigned long long)r->block_recv_done, (unsigned long long)want, ok);
+    r->block_active = false;
+    return ok;
+#else
+    (void)tp;
+    return 1;
+#endif
+}
+
 int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                                uint64_t seq) {
     if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
@@ -1884,6 +2077,8 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
                              (uint16_t)rows, seq };
 #ifdef DS4_TP_HAVE_VERBS
+    if (tp->rdma_active && tp->rdma.block_active)
+        return tp_rdma_block_gate_exchange(tp, layer, rows);
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
         if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
         ds4_tp_gate_header ph;

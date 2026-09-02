@@ -45,6 +45,9 @@
 #include "ds4_image.h"
 #include "ds4_tp.h"
 
+/* TP context for the verify-block RDMA window (set with the gate callbacks). */
+static ds4_tp *g_tp_block_ctx;
+
 /* Wave-2 multi-GPU types are needed in every build because the engine
  * struct embeds ds4_gpu_config and the placement table. ds4_layer_pack.h
  * is included unconditionally for the same reason (engine helpers call
@@ -37227,7 +37230,15 @@ static bool metal_graph_verify_suffix_tops_impl(
     if (rocm_dspark_fast) ds4_gpu_set_dspark_verify_mode(true);
 #endif
     const double layer_t0 = timing ? now_sec() : 0.0;
-    ok = ds4_gpu_begin_commands() != 0;
+    const bool tp_block = g->tp_batch_rows != 0 && g_tp_block_ctx != NULL;
+    if (getenv("DS4_TP_BIG_GATE_DEBUG"))
+        fprintf(stderr, "ds4: verify block: rows %u world %d ctx %p tp_block %d\n",
+                g->tp_batch_rows, g->tp_world, (void *)g_tp_block_ctx, (int)tp_block);
+    if (tp_block && !ds4_tp_batch_block_begin(g_tp_block_ctx, g->tp_batch_rows, DS4_N_LAYER)) {
+        fprintf(stderr, "ds4: TP verify-block window setup failed\n");
+        ok = false;
+    }
+    ok = ok && ds4_gpu_begin_commands() != 0;
     const bool dspark_capture_active =
         ok &&
         capture_dspark_hidden &&
@@ -37305,6 +37316,10 @@ static bool metal_graph_verify_suffix_tops_impl(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
+    if (tp_block && !ds4_tp_batch_block_end(g_tp_block_ctx)) {
+        fprintf(stderr, "ds4: TP verify-block window did not complete\n");
+        ok = false;
+    }
 #ifdef DS4_ROCM_BUILD
     if (rocm_dspark_fast) ds4_gpu_set_dspark_verify_mode(false);
 #endif
@@ -64594,6 +64609,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         return 0;
     }
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
+    g_tp_block_ctx = tp;
     ds4_gpu_tp_set_peer_probe(ds4_engine_tp_peer_probe);
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
     /* GLM keeps its replicated output head unsplit in v0: the
@@ -70416,6 +70432,15 @@ static int ds4_session_eval_dspark_speculative_argmax(
             if (verify_timing.fused_head) {
                 s->dspark_stats.verifier_fused_head++;
             }
+        {
+            static int cycle_trace = -1;
+            if (cycle_trace < 0) cycle_trace = getenv("DS4_DSPARK_CYCLE_TRACE") != NULL;
+            if (cycle_trace)
+                fprintf(stderr, "ds4: DSpark cycle: draft_n=%d since-entry-at-verify %.1f ms, verify %.1f ms (upload %.1f layer %.1f head %.1f read %.1f)\n",
+                        draft_n, (verify_t0 - stats_t0) * 1000.0,
+                        (now_sec() - verify_t0) * 1000.0, verify_timing.upload_ms, verify_timing.layer_ms,
+                        verify_timing.head_ms, verify_timing.read_ms);
+        }
         }
     }
 
@@ -70483,6 +70508,8 @@ static int ds4_session_eval_dspark_speculative_argmax(
                     n_accept);
         }
         spec_frontier_free(&frontier);
+        if (getenv("DS4_DSPARK_CYCLE_TRACE"))
+            fprintf(stderr, "ds4: DSpark cycle: direct-full commit, total since entry %.1f ms\n", (now_sec() - stats_t0) * 1000.0);
         DS4_DSPARK_STATS_FINISH();
         return n_accept;
     }
@@ -70555,6 +70582,8 @@ static int ds4_session_eval_dspark_speculative_argmax(
                         n_accept);
             }
             spec_frontier_free(&frontier);
+            if (getenv("DS4_DSPARK_CYCLE_TRACE"))
+                fprintf(stderr, "ds4: DSpark cycle: direct-partial commit %d, total since entry %.1f ms\n", commit_drafts, (now_sec() - stats_t0) * 1000.0);
             DS4_DSPARK_STATS_FINISH();
             return n_accept;
         }
@@ -71217,17 +71246,12 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
             return 1;
         }
         s->checkpoint.len = start;
-        const bool preserve_seed_capture =
-            ds4_session_dspark_seed_batch_enabled(s);
-        if (!preserve_seed_capture) {
-            ds4_session_dspark_capture_invalidate(s);
-        }
+        /* The worker runs no draft model: it never holds a DSpark capture
+         * to preserve, so a plain prefix restore is the whole commit here
+         * (with DS4_DSPARK_SEED_BATCH set, the capture commit would fail). */
+        ds4_session_dspark_capture_invalidate(s);
         bool prefix_ok = spec_frontier_commit_prefix(
                 s, (uint32_t)token_count);
-        if (prefix_ok && preserve_seed_capture) {
-            prefix_ok = metal_graph_dspark_capture_commit_prefix(
-                    &s->graph, (uint32_t)token_count);
-        }
         if (!prefix_ok) {
             spec_frontier_free(&frontier);
             snprintf(err, errlen, "tp: verifier prefix restore failed");
@@ -74220,10 +74244,14 @@ static int ds4_session_eval_speculative_argmax_impl(
             }
         }
     }
+    /* Under TP the fused seed batch is an experiment (DS4_DSPARK_SEED_BATCH_TP=1):
+     * the worker verifies the same block, so it needs no draft of its own. */
+    static int seed_batch_tp = -1;
+    if (seed_batch_tp < 0) seed_batch_tp = getenv("DS4_DSPARK_SEED_BATCH_TP") != NULL;
     const bool seed_batch_dspark =
         can_prepare_support_draft &&
         e->support_kind == DS4_SUPPORT_DSPARK &&
-        !e->tp.active &&
+        (!e->tp.active || seed_batch_tp) &&
         ds4_session_dspark_seed_batch_enabled(s) &&
         sample_argmax(s->logits, DS4_N_VOCAB) == first_token;
     if (seed_batch_dspark) {

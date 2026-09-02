@@ -137,6 +137,10 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
  * the GPU gate service thread. */
 int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                                uint64_t seq);
+/* Verify-block RDMA window (speculative decoding): call on both ranks right
+ * before/after a verify block with one batch gate per layer. */
+int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers);
+int ds4_tp_batch_block_end(ds4_tp *tp);
 
 /* Prefill batch gate: arbitrary-size symmetric payload exchange over bulk
  * RDMA, with interleaved 2MB TCP rounds as fallback (see ds4_tp.c). */
