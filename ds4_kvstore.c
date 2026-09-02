@@ -330,6 +330,35 @@ void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]) {
     hex20(digest, out);
 }
 
+/* Record identity hash = the on-disk file name.  SHA1(text) for the
+ * original Flash id 0, so every existing cache directory stays valid;
+ * SHA1(id byte || text) for any other model id (1 = Pro, 2 = Flash
+ * Vision-Exp), so two checkpoints sharing one --kv-dir can never collide
+ * on a file name.  A collision is destructive, not just a miss: the
+ * incompatible record at that name gets unlinked and the two generations
+ * would keep erasing each other's records on the same prompts. */
+static void kv_text_sha(int model_id, const void *text, size_t len, char out[41]) {
+    if (model_id == 0) {
+        ds4_kvstore_sha1_bytes_hex(text, len, out);
+        return;
+    }
+    sha1_ctx c;
+    const uint8_t id = (uint8_t)model_id;
+    sha1_init(&c);
+    sha1_update(&c, &id, 1);
+    sha1_update(&c, text, len);
+    uint8_t digest[20];
+    sha1_final(&c, digest);
+    hex20(digest, out);
+}
+
+/* Public form of the record-name digest (tests and tools): model id 0 keeps
+ * the legacy SHA1(text) name, every other id is SHA1(id byte || text). */
+void ds4_kvstore_text_sha_hex(int model_id, const void *text, size_t len,
+                              char out[41]) {
+    kv_text_sha(model_id, text, len, out);
+}
+
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]) {
     if (strlen(name) != 43 || strcmp(name + 40, ".kv")) return false;
     for (int i = 0; i < 40; i++) {
@@ -525,8 +554,8 @@ static bool kv_cache_incoming_supersedes_continued(
     if (incoming->ctx_size > e->ctx_size) return false;
 
     char prefix_sha[41];
-    ds4_kvstore_sha1_bytes_hex(incoming->text, (size_t)e->text_bytes,
-                               prefix_sha);
+    kv_text_sha(incoming->model_id, incoming->text, (size_t)e->text_bytes,
+                prefix_sha);
     return !strcmp(prefix_sha, e->sha);
 }
 
@@ -841,7 +870,8 @@ bool ds4_kvstore_file_size_fits(const ds4_kvstore *kc,
 }
 
 static bool kv_cache_file_text_matches(const char *path, const char sha[41],
-                                       const char *text, size_t text_len) {
+                                       const char *text, size_t text_len,
+                                       int model_id) {
     if (text_len > UINT32_MAX) return false;
     FILE *fp = fopen(path, "rb");
     if (!fp) return false;
@@ -862,7 +892,7 @@ static bool kv_cache_file_text_matches(const char *path, const char sha[41],
     }
 
     char stored_sha[41];
-    ds4_kvstore_sha1_bytes_hex(stored, text_bytes, stored_sha);
+    kv_text_sha(model_id, stored, text_bytes, stored_sha);
     ok = !strcmp(stored_sha, sha) &&
          (text_len == 0 || memcmp(stored, text, text_len) == 0);
     free(stored);
@@ -880,7 +910,7 @@ static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
                       (!kc->reject_different_quant ||
                        e.quant_bits == (uint8_t)quant_bits) &&
                       e.ctx_size <= (uint32_t)ctx_size &&
-                      kv_cache_file_text_matches(path, sha, text, text_len);
+                      kv_cache_file_text_matches(path, sha, text, text_len, model_id);
     ds4_kvstore_entry_free(&e);
     if (!compatible) {
         if (unlink(path) == 0) {
@@ -1029,7 +1059,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         return false;
     }
     char sha[41];
-    ds4_kvstore_sha1_bytes_hex(text, text_len, sha);
+    kv_text_sha(model_id, text, text_len, sha);
     char *path = ds4_kvstore_path_for_sha(kc, sha);
     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
 
@@ -1249,7 +1279,7 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
             if (e->text_bytes == b->text_bytes && e->tokens <= b->tokens) continue;
         }
         char sha[41];
-        ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
+        kv_text_sha(model_id, prompt_text, (size_t)e->text_bytes, sha);
         if (!strcmp(sha, e->sha)) best = i;
     }
     return best;

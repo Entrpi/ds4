@@ -406,6 +406,43 @@ static char *json_minify_raw_value(const char *json) {
     return buf_take(&b);
 }
 
+/* Media content blocks (images, files, audio) are refused with a named 400
+ * instead of being silently flattened away: this engine serves the
+ * Vision-Exp checkpoint text-only, and a client that saw that model name
+ * must not get a confident answer built on context the server dropped.
+ * The reason is thread-local (one parser thread per client) and consumed
+ * by the request parsers' failure paths. */
+static __thread char g_content_reject[192];
+
+static bool content_block_type_is_media(const char *t) {
+    return t && (!strcmp(t, "image_url") || !strcmp(t, "image") ||
+                 !strcmp(t, "input_image") || !strcmp(t, "input_audio") ||
+                 !strcmp(t, "audio") || !strcmp(t, "video") ||
+                 !strcmp(t, "document") || !strcmp(t, "file") ||
+                 !strcmp(t, "input_file"));
+}
+
+static void content_reject_media(const char *t) {
+    snprintf(g_content_reject, sizeof g_content_reject,
+             "content block type \"%s\" is not supported: image and file input is not "
+             "implemented in this build (text only)", t ? t : "?");
+}
+
+/* Hand the recorded reason to a request parser's error buffer (once). */
+static void content_reject_take(char *err, size_t errlen) {
+    if (g_content_reject[0]) {
+        if (err && errlen && !err[0]) {
+            /* bounded copy, not snprintf("%s"): the reason buffer is wider than
+             * the parsers' error buffers and GCC flags the (intended) truncation */
+            size_t n = strlen(g_content_reject);
+            if (n >= errlen) n = errlen - 1;
+            memcpy(err, g_content_reject, n);
+            err[n] = 0;
+        }
+        g_content_reject[0] = 0;
+    }
+}
+
 static bool json_content(const char **p, char **out) {
     json_ws(p);
     if (**p == '"') return json_string(p, out);
@@ -448,6 +485,25 @@ static bool json_content(const char **p, char **out) {
                     }
                     buf_puts(&b, s);
                     free(s);
+                } else if (!strcmp(key, "type")) {
+                    json_ws(p);
+                    if (**p == '"') {
+                        char *t = NULL;
+                        if (!json_string(p, &t)) {
+                            free(key);
+                            goto fail;
+                        }
+                        if (content_block_type_is_media(t)) {
+                            content_reject_media(t);
+                            free(t);
+                            free(key);
+                            goto fail;
+                        }
+                        free(t);
+                    } else if (!json_skip_value(p)) {
+                        free(key);
+                        goto fail;
+                    }
                 } else if (!json_skip_value(p)) {
                     free(key);
                     goto fail;
@@ -2075,6 +2131,10 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         buf_puts(&b, "</tool_result>");
         free(msg->content);
         msg->content = buf_take(&b);
+    } else if (content_block_type_is_media(type)) {
+        /* Anthropic image/document blocks: refuse, never flatten. */
+        content_reject_media(type);
+        goto bad;
     } else {
         if (text) {
             buf b = {0};
@@ -3225,6 +3285,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
 bad:
     chat_msgs_free(&msgs);
     free(tool_schemas);
+    content_reject_take(err, errlen);   /* a refused media block names itself */
     if (!err[0]) snprintf(err, errlen, "invalid JSON request");   /* Inc 2b: keep a specific validation message */
     request_free(r);
     return false;
@@ -3458,6 +3519,7 @@ bad:
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
+    content_reject_take(err, errlen);   /* a refused media block names itself */
     if (!err[0]) snprintf(err, errlen, "invalid JSON request");   /* Inc 2b: keep a specific validation message */
     request_free(r);
     return false;
@@ -3556,6 +3618,7 @@ static bool parse_responses_content_array(const char **p, char **out) {
                 !strcmp(type, "summary_text") ||
                 !strcmp(type, "reasoning_text"));
             if (!is_text_block || !text) {
+                if (content_block_type_is_media(type)) content_reject_media(type);
                 free(type);
                 free(text);
                 goto fail;
@@ -4422,6 +4485,7 @@ bad:
     buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
+    content_reject_take(err, errlen);   /* a refused media block names itself */
     if (!err[0]) snprintf(err, errlen, "invalid JSON request");   /* Inc 2b: keep a specific validation message */
     request_free(r);
     return false;
@@ -4619,6 +4683,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     return true;
 bad:
     free(prompt);
+    content_reject_take(err, errlen);   /* a refused media block names itself */
     if (!err[0]) snprintf(err, errlen, "invalid JSON request");   /* Inc 2b: keep a specific validation message */
     request_free(r);
     return false;
@@ -19218,6 +19283,12 @@ static ds4_backend default_server_backend(void) {
 #define LAUNCH_MTP_GGUF         "DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
 #define LAUNCH_DSPARK_GGUF_0731 "DSpark-drafter-Q2K-Q8-0731.gguf"
 #define LAUNCH_DSPARK_GGUF      "DSpark-drafter-Q2K-Q8.gguf"
+/* Vision-Exp (2026-08-31): a third generation, opt-in until the default
+ * flips.  Its base is selected only by name (GGUF_FILE or -m); its drafter
+ * is the fork's own extraction with the 0731 recipe, and the engine refuses
+ * any cross-generation support model, so no fallback drafter is offered. */
+#define LAUNCH_BASE_GGUF_VISION   "DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf"
+#define LAUNCH_DSPARK_GGUF_VISION "DSpark-drafter-Q2K-Q8-vision-exp.gguf"
 
 static bool launch_file_ok(const char *path) {
     struct stat st;
@@ -19244,6 +19315,21 @@ static bool launch_gen_0731(const char *path) {
     return name && strstr(name, "-0731") != NULL;
 }
 
+static bool launch_gen_vision(const char *path) {
+    const char *slash = path ? strrchr(path, '/') : NULL;
+    const char *name = slash ? slash + 1 : path;
+    return name && strstr(name, "Vision-Exp") != NULL;
+}
+
+/* The base may be reached through a symlink (./ds4flash.gguf ->
+ * ~/gguf/<base>, download_model.sh's default): resolve it so the
+ * generation comes from the REAL file name and siblings are looked up
+ * beside the real file.  Malloc'd path, or NULL when the path cannot be
+ * resolved (the caller keeps what it has: a relative -m under --chdir). */
+static char *launch_realpath(const char *path) {
+    return (path && path[0]) ? realpath(path, NULL) : NULL;
+}
+
 /* Join dir/preferred, falling back to dir/fallback when the preferred file
  * is absent.  Returns the first candidate that exists, or the FALLBACK path
  * (for the caller's error message) when neither does. */
@@ -19255,6 +19341,41 @@ static char *launch_join_pref(const char *dir, const char *preferred,
     return launch_join(dir, fallback);
 }
 
+/* Sibling lookup beside the RESOLVED base first, then beside the path the
+ * user typed when that is a different directory (a symlinked base with the
+ * drafter kept beside the link).  Returns the first existing candidate,
+ * else the resolved-dir candidate for the caller's error message. */
+static char *launch_join2(const char *dir, const char *dir2, const char *name) {
+    char *cand = launch_join(dir, name);
+    if (launch_file_ok(cand) || !dir2) return cand;
+    char *alt = launch_join(dir2, name);
+    if (launch_file_ok(alt)) {
+        free(cand);
+        return alt;
+    }
+    free(alt);
+    return cand;
+}
+
+static char *launch_join_pref2(const char *dir, const char *dir2,
+                               const char *preferred, const char *fallback) {
+    char *cand = launch_join2(dir, dir2, preferred);
+    if (launch_file_ok(cand)) return cand;
+    free(cand);
+    return launch_join2(dir, dir2, fallback);
+}
+
+/* Directory part of a path ("." for a bare name, "/" for a root file). */
+static char *launch_dirname(const char *mp) {
+    const char *slash = strrchr(mp, '/');
+    if (slash && slash != mp) {
+        char *d = malloc((size_t)(slash - mp) + 1);
+        if (d) { memcpy(d, mp, (size_t)(slash - mp)); d[slash - mp] = 0; }
+        return d;
+    }
+    return strdup(slash == mp ? "/" : ".");
+}
+
 static void launch_append(char *buf, size_t cap, int *off, const char *fmt, ...) {
     if (*off < 0 || (size_t)*off >= cap) return;
     va_list ap;
@@ -19263,6 +19384,67 @@ static void launch_append(char *buf, size_t cap, int *off, const char *fmt, ...)
     va_end(ap);
     if (n > 0) *off += n;
     if ((size_t)*off > cap - 1) *off = (int)cap - 1;
+}
+
+/* The drafter / MTP auto-attach decision matrix, factored pure so the unit
+ * battery enumerates it (09-02 review ask).  launch_resolve_defaults feeds
+ * these the facts it has established (base generation, explicit flags, env
+ * strings) and performs only the file probes and attachments they name;
+ * nothing here touches the filesystem or the environment. */
+typedef struct {
+    const char *preferred;   /* drafter file name to probe first; NULL = do not probe */
+    const char *fallback;    /* second name when the preferred file is absent, or NULL */
+} launch_drafter_plan;
+
+static launch_drafter_plan launch_drafter_names(bool no_spec, bool no_dspark,
+                                                bool dspark_named, bool has_sib,
+                                                bool gen_vision, bool gen_0731,
+                                                const char *dspark_file_env)
+{
+    launch_drafter_plan p = { NULL, NULL };
+    if (no_spec || no_dspark || dspark_named || !has_sib) return p;
+    if (dspark_file_env && dspark_file_env[0]) {
+        p.preferred = dspark_file_env;            /* env names the file exactly */
+    } else if (gen_vision) {
+        p.preferred = LAUNCH_DSPARK_GGUF_VISION;  /* only our stamped extraction pairs */
+    } else if (gen_0731) {
+        /* Generation-matched drafter first; the legacy drafter beside a
+         * 0731 base is a lossless (verification-exact) fallback, and the
+         * accept guard floors genuinely broken pairings. */
+        p.preferred = LAUNCH_DSPARK_GGUF_0731;
+        p.fallback = LAUNCH_DSPARK_GGUF;
+    } else {
+        p.preferred = LAUNCH_DSPARK_GGUF;
+    }
+    return p;
+}
+
+/* A drafter is ARMED when one is on the config and neither a flag nor
+ * DS4_CONT_DSPARK=0/"" disarms it; the armed drafter decides the MTP
+ * auto-attach (v0.2.4 MTP-droppable default). */
+static bool launch_drafter_armed(bool no_spec, bool no_dspark, bool has_drafter,
+                                 const char *cont_dspark_env)
+{
+    if (no_spec || no_dspark || !has_drafter) return false;
+    if (cont_dspark_env && (!cont_dspark_env[0] || !strcmp(cont_dspark_env, "0"))) return false;
+    return true;
+}
+
+typedef enum {
+    LAUNCH_MTP_SKIP = 0,   /* --no-spec / --no-mtp / explicit --mtp / no sibling dir */
+    LAUNCH_MTP_RETIRED,    /* 0731 and Vision-Exp bases have no MTP head: never attach */
+    LAUNCH_MTP_DROPPED,    /* legacy base + armed drafter: MTP is dead weight (v0.2.4) */
+    LAUNCH_MTP_PROBE,      /* legacy base: probe MTP_FILE / LAUNCH_MTP_GGUF beside it */
+} launch_mtp_decision;
+
+static launch_mtp_decision launch_mtp_decide(bool no_spec, bool no_mtp, bool mtp_set,
+                                             bool has_sib, bool gen_0731, bool gen_vision,
+                                             bool drafter_armed, bool preset_spark)
+{
+    if (no_spec || no_mtp || mtp_set || !has_sib) return LAUNCH_MTP_SKIP;
+    if (gen_0731 || gen_vision) return LAUNCH_MTP_RETIRED;
+    if (drafter_armed && !preset_spark) return LAUNCH_MTP_DROPPED;
+    return LAUNCH_MTP_PROBE;
 }
 
 static void launch_resolve_defaults(server_config *c,
@@ -19310,26 +19492,31 @@ static void launch_resolve_defaults(server_config *c,
 
     /* Everything below keys off the generation of the base we ended up
      * with, however it was chosen (auto, env, or explicit -m). */
-    bool gen_0731 = launch_gen_0731(c->engine.model_path);
+    char *real_base = launch_realpath(c->engine.model_path);
+    const char *base_ref = real_base ? real_base : c->engine.model_path;
+    bool gen_vision = launch_gen_vision(base_ref);
+    bool gen_0731 = !gen_vision && launch_gen_0731(base_ref);
 
     /* Siblings are looked up beside the resolved base model.  A relative -m
      * combined with --chdir would be stat'd against the launch cwd while the
      * engine opens it after the chdir — skip auto-detection there. */
-    char *sib = NULL;
+    char *sib = NULL;       /* beside the resolved base */
+    char *sib_lex = NULL;   /* beside the path as typed, when different */
     if (c->chdir_path && c->engine.model_path[0] != '/') {
         no_mtp = true;
         no_dspark = true;
     }
-    {
-        const char *mp = c->engine.model_path;
-        const char *slash = strrchr(mp, '/');
-        if (slash && slash != mp) {
-            sib = malloc((size_t)(slash - mp) + 1);
-            if (sib) { memcpy(sib, mp, (size_t)(slash - mp)); sib[slash - mp] = 0; }
-        } else {
-            sib = strdup(slash == mp ? "/" : ".");
+    sib = launch_dirname(base_ref);
+    if (real_base) {
+        sib_lex = launch_dirname(c->engine.model_path);
+        if (sib_lex && sib && !strcmp(sib_lex, sib)) {
+            free(sib_lex);
+            sib_lex = NULL;
         }
     }
+    free(real_base);
+    real_base = NULL;
+    base_ref = NULL;
 
     /* Drafter first: whether a DSpark drafter is armed decides the MTP
      * auto-attach below (v0.2.4 MTP-droppable default). */
@@ -19338,21 +19525,16 @@ static void launch_resolve_defaults(server_config *c,
         const char *denv = getenv("DS4_DSPARK_MODEL");
         if (denv && denv[0]) dspark_named = true;   /* env picks drafter + its own arming */
     }
-    if (!no_spec && !no_dspark && !dspark_named && sib) {
-        const char *denvf = getenv("DSPARK_FILE");
-        char *cand;
-        if (denvf && denvf[0]) {
-            cand = launch_join(sib, denvf);
-        } else if (gen_0731) {
-            /* Generation-matched drafter first; the legacy drafter beside a
-             * 0731 base is a lossless (verification-exact) fallback, and
-             * the accept guard floors genuinely broken pairings. */
-            cand = launch_join_pref(sib, LAUNCH_DSPARK_GGUF_0731, LAUNCH_DSPARK_GGUF);
-        } else {
-            cand = launch_join(sib, LAUNCH_DSPARK_GGUF);
-        }
+    launch_drafter_plan dplan = launch_drafter_names(no_spec, no_dspark, dspark_named,
+                                                     sib != NULL, gen_vision, gen_0731,
+                                                     getenv("DSPARK_FILE"));
+    if (dplan.preferred) {
+        char *cand = dplan.fallback
+                   ? launch_join_pref2(sib, sib_lex, dplan.preferred, dplan.fallback)
+                   : launch_join2(sib, sib_lex, dplan.preferred);
         if (launch_file_ok(cand)) {
             c->engine.dspark_path = cand;
+            c->engine.dspark_auto = true;   /* a refused pairing degrades, not dies */
             auto_dspark = true;
         } else {
             if (preset_spark) {
@@ -19373,39 +19555,44 @@ static void launch_resolve_defaults(server_config *c,
      * armed drafter.  An explicit --mtp always wins, --preset spark still
      * demands the full stack, and DS4_CONT_DSPARK=0/"" (drafter disarmed)
      * restores the MTP auto-attach. */
-    bool drafter_armed = !no_spec && !no_dspark &&
-                         c->engine.dspark_path && c->engine.dspark_path[0];
-    if (drafter_armed) {
-        const char *de = getenv("DS4_CONT_DSPARK");
-        if (de && (!de[0] || !strcmp(de, "0"))) drafter_armed = false;
-    }
+    bool drafter_armed = launch_drafter_armed(no_spec, no_dspark,
+                                              c->engine.dspark_path && c->engine.dspark_path[0],
+                                              getenv("DS4_CONT_DSPARK"));
     /* 0731 retired the MTP head entirely: never auto-attach one beside a
      * 0731 base, --preset spark included (its "full stack" on 0731 is base
      * + drafter).  MTP_FILE cannot re-enable this — only an explicit --mtp
      * does (mtp_set skips this whole block, accept guard still floors it). */
     bool dropped_mtp = false, retired_mtp = false;
-    if (!no_spec && !no_mtp && !mtp_set && sib) {
-        if (gen_0731) {
-            retired_mtp = true;
-        } else if (drafter_armed && !preset_spark) {
-            dropped_mtp = true;
+    switch (launch_mtp_decide(no_spec, no_mtp, mtp_set, sib != NULL,
+                              gen_0731, gen_vision, drafter_armed, preset_spark)) {
+    case LAUNCH_MTP_SKIP:
+        break;
+    case LAUNCH_MTP_RETIRED:
+        retired_mtp = true;
+        break;
+    case LAUNCH_MTP_DROPPED:
+        dropped_mtp = true;
+        break;
+    case LAUNCH_MTP_PROBE: {
+        char *cand = launch_join2(sib, sib_lex, launch_name("MTP_FILE", LAUNCH_MTP_GGUF));
+        if (launch_file_ok(cand)) {
+            c->engine.mtp_path = cand;
+            c->engine.mtp_auto = true;
+            auto_mtp = true;
         } else {
-            char *cand = launch_join(sib, launch_name("MTP_FILE", LAUNCH_MTP_GGUF));
-            if (launch_file_ok(cand)) {
-                c->engine.mtp_path = cand;
-                auto_mtp = true;
-            } else {
-                if (preset_spark) {
-                    server_log(DS4_LOG_DEFAULT,
-                               "ds4-server: --preset spark: MTP model not found at %s "
-                               "(set MTP_FILE or pass --mtp)", cand ? cand : "?");
-                    exit(2);
-                }
-                free(cand);
+            if (preset_spark) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --preset spark: MTP model not found at %s "
+                           "(set MTP_FILE or pass --mtp)", cand ? cand : "?");
+                exit(2);
             }
+            free(cand);
         }
+        break;
+    }
     }
     free(sib);
+    free(sib_lex);
 
     if (preset_spark) {
         const char *me = getenv("DS4_CONT_MTP_MODE");
@@ -19448,7 +19635,8 @@ static void launch_resolve_defaults(server_config *c,
                           " mtp=dropped(drafter armed; --mtp overrides)");
         if (retired_mtp)
             launch_append(line, sizeof(line), &off,
-                          " mtp=retired(0731 base has no MTP head; --mtp overrides)");
+                          " mtp=retired(%s base has no MTP head; --mtp overrides)",
+                          gen_vision ? "Vision-Exp" : "0731");
         if (auto_dspark)
             launch_append(line, sizeof(line), &off, " dspark=%s", c->engine.dspark_path);
         if (armed_mode)
@@ -24913,7 +25101,7 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
                                          uint32_t tokens,
                                          uint64_t payload_bytes) {
     char sha[41];
-    sha1_bytes_hex(text, strlen(text), sha);
+    ds4_kvstore_text_sha_hex(model_id, text, strlen(text), sha);
     char name[44];
     snprintf(name, sizeof(name), "%.40s.kv", sha);
     char *path = path_join(dir, name);
@@ -25008,7 +25196,7 @@ static void test_kv_cache_lookup_rejects_wrong_model(void) {
 
     kv_cache_close(&kc);
     char sha[41];
-    sha1_bytes_hex(text, strlen(text), sha);
+    ds4_kvstore_text_sha_hex(1, text, strlen(text), sha);   /* the stub is a model-1 record */
     char name[44];
     snprintf(name, sizeof(name), "%.40s.kv", sha);
     char *path = path_join(dir, name);
@@ -28296,6 +28484,45 @@ static void test_responses_durable_references_rejected_at_parse(void) {
     TEST_ASSERT(strstr(err, "conversation") != NULL);
 }
 
+/* Vision-Exp text-only serving: media content blocks are refused with a
+ * named reason on the chat and Anthropic content parsers (the Responses
+ * converter already failed closed), never flattened to their text parts.
+ * Text-only content arrays still parse. */
+static void test_media_content_blocks_rejected(void) {
+    chat_msgs msgs = {0};
+    char err[200] = {0};
+    const char *p;
+
+    p = "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"},"
+        "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AA==\"}}]}]";
+    g_content_reject[0] = 0;
+    TEST_ASSERT(!parse_messages(&p, &msgs));
+    content_reject_take(err, sizeof(err));
+    TEST_ASSERT(strstr(err, "image_url") != NULL);
+    TEST_ASSERT(strstr(err, "not implemented") != NULL);
+    TEST_ASSERT(g_content_reject[0] == 0);          /* consumed once */
+    chat_msgs_free(&msgs);
+
+    /* Anthropic image block inside a user message. */
+    err[0] = '\0';
+    p = "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"},"
+        "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"AA==\"}}]}]";
+    TEST_ASSERT(!parse_anthropic_messages(&p, &msgs));
+    content_reject_take(err, sizeof(err));
+    TEST_ASSERT(strstr(err, "\"image\"") != NULL);
+    chat_msgs_free(&msgs);
+
+    /* Positive control: typed text blocks (type before text, and after). */
+    err[0] = '\0';
+    p = "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"a\"},"
+        "{\"text\":\"b\",\"type\":\"text\"}]}]";
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1 && msgs.v[0].content && !strcmp(msgs.v[0].content, "ab"));
+    content_reject_take(err, sizeof(err));
+    TEST_ASSERT(err[0] == '\0');
+    chat_msgs_free(&msgs);
+}
+
 /* Inc 2b: endpoint-native error envelopes (surface-matrix defect 3 FIXED).
  * OpenAI keeps the shared envelope (it is native there); Anthropic buffered
  * errors carry the documented {"type":"error",...} envelope with a
@@ -30385,7 +30612,133 @@ static void test_trim_bestfit_pick(void) {
     }
 }
 
+/* Launch-default generation detection keys off the base file NAME only:
+ * a Vision-Exp base never picks up a 0731 drafter (the engine would refuse
+ * the pairing anyway), and gating directories never leak into the verdict. */
+static void test_launch_generation_names(void) {
+    const char *vis = "/home/x/gguf/" LAUNCH_BASE_GGUF_VISION;
+    const char *old = "/home/x/gguf/" LAUNCH_BASE_GGUF_0731;
+    const char *legacy = "/home/x/gguf/" LAUNCH_BASE_GGUF;
+    TEST_ASSERT(launch_gen_vision(vis));
+    TEST_ASSERT(!launch_gen_0731(vis));
+    TEST_ASSERT(launch_gen_0731(old));
+    TEST_ASSERT(!launch_gen_vision(old));
+    TEST_ASSERT(!launch_gen_0731(legacy) && !launch_gen_vision(legacy));
+    /* Directory names carry no generation. */
+    TEST_ASSERT(!launch_gen_vision("/home/x/gguf-Vision-Exp/" LAUNCH_BASE_GGUF_0731));
+    TEST_ASSERT(!launch_gen_0731("/home/x/gguf0731/" LAUNCH_BASE_GGUF_VISION));
+    TEST_ASSERT(launch_gen_vision(LAUNCH_DSPARK_GGUF_VISION) == false); /* drafter name is not a base */
+    TEST_ASSERT(strstr(LAUNCH_DSPARK_GGUF_VISION, "vision-exp") != NULL);
+
+    /* A symlinked base (./ds4flash.gguf -> <dir>/<Vision-Exp base>): the
+     * link name says nothing, the resolved name carries the generation. */
+    {
+        char tmpl[] = "/tmp/ds4-launch-XXXXXX";
+        char *dir = mkdtemp(tmpl);
+        TEST_ASSERT(dir != NULL);
+        if (dir) {
+            char *target = launch_join(dir, LAUNCH_BASE_GGUF_VISION);
+            char *link = launch_join(dir, "ds4flash.gguf");
+            FILE *fp = target ? fopen(target, "wb") : NULL;
+            TEST_ASSERT(fp != NULL);
+            if (fp) fclose(fp);
+            TEST_ASSERT(target && link && symlink(target, link) == 0);
+            char *real = launch_realpath(link);
+            TEST_ASSERT(real != NULL);
+            TEST_ASSERT(!launch_gen_vision(link) && !launch_gen_0731(link));
+            TEST_ASSERT(real && launch_gen_vision(real) && !launch_gen_0731(real));
+            TEST_ASSERT(launch_realpath("/nonexistent/ds4flash.gguf") == NULL);
+            /* A drafter kept beside the LINK (a different directory from
+             * the resolved base) is still found: resolved dir first, then
+             * the typed dir. */
+            char *linkdir = launch_join(dir, "linkdir");
+            char *link2 = linkdir ? launch_join(linkdir, "ds4flash.gguf") : NULL;
+            char *drafter = linkdir ? launch_join(linkdir, LAUNCH_DSPARK_GGUF_VISION) : NULL;
+            TEST_ASSERT(linkdir && mkdir(linkdir, 0700) == 0);
+            TEST_ASSERT(link2 && symlink(target, link2) == 0);
+            FILE *dfp = drafter ? fopen(drafter, "wb") : NULL;
+            TEST_ASSERT(dfp != NULL);
+            if (dfp) fclose(dfp);
+            char *real2 = launch_realpath(link2);
+            char *rdir = real2 ? launch_dirname(real2) : NULL;
+            char *dir_real = launch_realpath(dir);   /* macOS: /tmp -> /private/tmp */
+            TEST_ASSERT(rdir && dir_real && !strcmp(rdir, dir_real));
+            free(dir_real);
+            char *found = launch_join2(rdir ? rdir : dir, linkdir, LAUNCH_DSPARK_GGUF_VISION);
+            TEST_ASSERT(found && launch_file_ok(found) && !strcmp(found, drafter));
+            char *missing = launch_join2(rdir ? rdir : dir, linkdir, "nope.gguf");
+            TEST_ASSERT(missing && !launch_file_ok(missing) && strstr(missing, "linkdir") == NULL);
+            free(found);
+            free(missing);
+            free(rdir);
+            free(real2);
+            if (drafter) unlink(drafter);
+            if (link2) unlink(link2);
+            if (linkdir) rmdir(linkdir);
+            free(drafter);
+            free(link2);
+            free(linkdir);
+            free(real);
+            if (link) unlink(link);
+            if (target) unlink(target);
+            rmdir(dir);
+            free(target);
+            free(link);
+        }
+    }
+}
+
+/* The drafter / MTP decision matrix (09-02 review ask): every row the
+ * launch defaults can take, enumerated without touching the filesystem. */
+static void test_launch_spec_decision_matrix(void) {
+    /* Drafter names: the generation picks the stamped extraction; env
+     * names the file; any disabling flag, an explicit drafter, or no
+     * sibling directory means no probe at all. */
+    launch_drafter_plan p;
+    p = launch_drafter_names(false, false, false, true, true, false, NULL);
+    TEST_ASSERT(p.preferred && !strcmp(p.preferred, LAUNCH_DSPARK_GGUF_VISION) && p.fallback == NULL);
+    p = launch_drafter_names(false, false, false, true, false, true, NULL);
+    TEST_ASSERT(p.preferred && !strcmp(p.preferred, LAUNCH_DSPARK_GGUF_0731));
+    TEST_ASSERT(p.fallback && !strcmp(p.fallback, LAUNCH_DSPARK_GGUF));
+    p = launch_drafter_names(false, false, false, true, false, false, NULL);
+    TEST_ASSERT(p.preferred && !strcmp(p.preferred, LAUNCH_DSPARK_GGUF) && p.fallback == NULL);
+    p = launch_drafter_names(false, false, false, true, true, false, "custom.gguf");
+    TEST_ASSERT(p.preferred && !strcmp(p.preferred, "custom.gguf") && p.fallback == NULL);
+    p = launch_drafter_names(false, false, false, true, true, false, "");   /* empty env = unset */
+    TEST_ASSERT(p.preferred && !strcmp(p.preferred, LAUNCH_DSPARK_GGUF_VISION));
+    TEST_ASSERT(launch_drafter_names(true, false, false, true, true, false, NULL).preferred == NULL);   /* --no-spec */
+    TEST_ASSERT(launch_drafter_names(false, true, false, true, true, false, NULL).preferred == NULL);   /* --no-dspark */
+    TEST_ASSERT(launch_drafter_names(false, false, true, true, true, false, NULL).preferred == NULL);   /* explicit --dspark / DS4_DSPARK_MODEL */
+    TEST_ASSERT(launch_drafter_names(false, false, false, false, true, false, NULL).preferred == NULL); /* relative -m under --chdir */
+
+    /* Arming: DS4_CONT_DSPARK=0 or "" disarms; unset or "1" keeps it. */
+    TEST_ASSERT(launch_drafter_armed(false, false, true, NULL));
+    TEST_ASSERT(launch_drafter_armed(false, false, true, "1"));
+    TEST_ASSERT(!launch_drafter_armed(false, false, true, "0"));
+    TEST_ASSERT(!launch_drafter_armed(false, false, true, ""));
+    TEST_ASSERT(!launch_drafter_armed(false, false, false, NULL));
+    TEST_ASSERT(!launch_drafter_armed(true, false, true, NULL));
+    TEST_ASSERT(!launch_drafter_armed(false, true, true, NULL));
+
+    /* MTP: (no_spec, no_mtp, mtp_set, has_sib, gen_0731, gen_vision, drafter_armed, preset_spark) */
+    TEST_ASSERT(launch_mtp_decide(false, false, false, true,  false, true,  true,  false) == LAUNCH_MTP_RETIRED); /* Vision-Exp + drafter */
+    TEST_ASSERT(launch_mtp_decide(false, false, false, true,  false, true,  false, true)  == LAUNCH_MTP_RETIRED); /* Vision-Exp, --preset spark, no drafter */
+    TEST_ASSERT(launch_mtp_decide(false, false, false, true,  true,  false, true,  false) == LAUNCH_MTP_RETIRED); /* 0731 + drafter */
+    TEST_ASSERT(launch_mtp_decide(false, false, false, true,  true,  false, false, true)  == LAUNCH_MTP_RETIRED); /* 0731 + --preset spark */
+    TEST_ASSERT(launch_mtp_decide(false, false, false, true,  false, false, true,  false) == LAUNCH_MTP_DROPPED); /* legacy + armed drafter */
+    TEST_ASSERT(launch_mtp_decide(false, false, false, true,  false, false, true,  true)  == LAUNCH_MTP_PROBE);   /* legacy + armed + --preset spark = full stack */
+    TEST_ASSERT(launch_mtp_decide(false, false, false, true,  false, false, false, false) == LAUNCH_MTP_PROBE);   /* legacy, no drafter */
+    TEST_ASSERT(launch_mtp_decide(true,  false, false, true,  false, false, false, false) == LAUNCH_MTP_SKIP);    /* --no-spec */
+    TEST_ASSERT(launch_mtp_decide(false, true,  false, true,  false, false, false, false) == LAUNCH_MTP_SKIP);    /* --no-mtp */
+    TEST_ASSERT(launch_mtp_decide(false, false, true,  true,  false, false, false, false) == LAUNCH_MTP_SKIP);    /* explicit --mtp wins */
+    TEST_ASSERT(launch_mtp_decide(false, false, true,  true,  true,  false, false, false) == LAUNCH_MTP_SKIP);    /* explicit --mtp on 0731: the pairing guard floors it */
+    TEST_ASSERT(launch_mtp_decide(false, false, false, false, false, false, false, false) == LAUNCH_MTP_SKIP);    /* no sibling dir */
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_launch_generation_names();
+    test_launch_spec_decision_matrix();
+    test_media_content_blocks_rejected();
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();

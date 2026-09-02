@@ -108,6 +108,12 @@ typedef struct {
     const char *model_path;
     const char *mtp_path;
     const char *dspark_path;   /* DSpark/dflash block-drafter GGUF (optional) */
+    /* Set by launch defaults when the support model was volunteered by a
+     * sibling lookup rather than named by the user: a checkpoint-generation
+     * refusal then degrades to serving without it instead of failing the
+     * open.  An explicit --mtp/--dspark keeps the hard failure. */
+    bool mtp_auto;
+    bool dspark_auto;
     ds4_backend backend;
     int n_threads;
     int mtp_draft_tokens;
@@ -171,6 +177,11 @@ int ds4_engine_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
+/* Checkpoint generation of the loaded base: 0 = 0731/base, 1 = Vision-Exp
+ * (a separate continued-training checkpoint sharing the Flash shape). */
+int ds4_engine_checkpoint_variant(ds4_engine *e);
+/* Pinned general.source.revision of the loaded base, or "" when absent. */
+const char *ds4_engine_source_revision(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
@@ -178,7 +189,9 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_n_hc(ds4_engine *e);
 /* Stable id for cache compatibility.  0 is the original Flash shape, so old
  * KV files with the previously-zero reserved byte remain Flash-compatible;
- * Pro and later shapes must use nonzero ids. */
+ * Pro and later shapes must use nonzero ids (1 = Pro).  2 = Flash
+ * Vision-Exp: Flash shape, different checkpoint, so its KV records never
+ * match 0731's. */
 int ds4_engine_model_id(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);

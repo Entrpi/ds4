@@ -101,6 +101,13 @@ int main(int argc, char **argv) {
         ds4_tokens target = {0};
         ds4_encode_chat_prompt(engine, NULL, prompt_text, DS4_THINK_NONE, &prompt);
         ds4_tokenize_text(engine, cont_text, &target);
+        /* DS4_SCORE_MAX_TARGET=N caps every target at N tokens so two manifests
+         * with different continuation lengths score at one common horizon. */
+        {
+            const char *cap_env = getenv("DS4_SCORE_MAX_TARGET");
+            const int cap = cap_env ? atoi(cap_env) : 0;
+            if (cap > 0 && target.len > cap) target.len = cap;
+        }
 
         if (prompt.len + target.len + 1 >= ctx_size) {
             fprintf(stderr, "%s exceeds ctx=%d\n", id, ctx_size);

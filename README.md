@@ -117,6 +117,35 @@ enabled explicitly with `--mtp`. The current MTP/speculative decoding path is
 still experimental: it is correctness-gated and currently provides at most a
 slight speedup, not a meaningful generation-speed win.
 
+### DeepSeek V4 Flash Vision-Exp (text-only, opt-in)
+
+`deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` (2026-08-31) is a separate
+continued-training checkpoint of Flash with an image encoder. This fork
+accepts its language GGUF as a **text-only** model: image input is not
+implemented (image, file and audio content blocks are refused with a 400
+rather than silently dropped; the encoder sidecar is downloaded beside the
+weights for when it is), and the 0731 checkpoint stays the auto-picked
+default. The engine reads the checkpoint variant off the GGUF metadata, takes
+the checkpoint's `rms_eps = 1e-20`, keys its disk KV cache and agent
+checkpoints separately from 0731, and refuses to pair a Vision-Exp base with
+the 0731 DSpark drafter or MTP file (and a 0731 base with the Vision-Exp
+drafter). Beside a Vision-Exp base, launch defaults auto-attach only
+`DSpark-drafter-Q2K-Q8-vision-exp.gguf`, the fork's own extraction with the
+0731 Q2K recipe.
+
+```sh
+./download_model.sh vision-q2       # Vision-Exp IQ2_XXS/Q2_K language GGUF + encoder (~88 GB)
+./download_model.sh drafter-vision  # the fork's Vision-Exp DSpark drafter (6.49 GiB; publication pending)
+./ds4-server -m ./ds4flash.gguf -c 65536
+```
+
+Pass `-m` explicitly: a bare `ds4-server` prefers the 0731 GGUF in
+`~/gguf` (or `$DS4_GGUF_DIR`) over `./ds4flash.gguf`, so on a machine that
+already serves 0731 the bare form boots 0731. Quality parity of the
+Vision-Exp text weights against the fork's 0731 baselines is pending; until
+it lands, treat Vision-Exp as experimental and keep 0731 for production
+serving.
+
 Then build:
 
 ```sh

@@ -275,6 +275,9 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits);
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]);
 void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]);
+/* Record file-name digest for a (model id, rendered text) pair. */
+void ds4_kvstore_text_sha_hex(int model_id, const void *text, size_t len,
+                              char out[41]);
 char *ds4_kvstore_path_join(const char *dir, const char *name);
 char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_le_put32(uint8_t *p, uint32_t v);

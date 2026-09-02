@@ -17,7 +17,12 @@ same as deepseek4-quantize.c (ported here to numpy).
 
 Usage:
   python dspark_extract.py --src DIR_WITH_3_SHARDS --out dspark.gguf \
-        [--validate] [--experts q4_k|q8_0]
+        [--validate] [--experts q4_k|q8_0|q2_k] [--experts-down q4_k|q8_0|q2_k] \
+        [--checkpoint-variant vision-exp --source-revision SHA --source-url URL]
+
+The ship recipe (0731 and Vision-Exp drafters alike) is `--experts q2_k
+--validate`; the three stamping flags are mandatory for a Vision-Exp
+extraction (the engine refuses an unstamped drafter beside a Vision-Exp base).
 """
 import argparse, json, struct, os, sys, gc
 import numpy as np
@@ -166,6 +171,52 @@ def quantize_q4_k(arr):
     block = np.concatenate([d16, dm16, scales, qs], axis=2)   # [nrow,nsb,144]
     return block.reshape(*arr.shape[:-1], nsb * 144)
 
+# ---------------------------------------------------------------- Q2_K (RTN, numpy)
+# ggml block_q2_K layout (84 B / 256 weights, NOTE d/dmin at the END, unlike Q4_K):
+#   uint8 scales[16]  low nibble = 4-bit sub-block scale, high nibble = 4-bit min
+#   uint8 qs[64]      2-bit quants; byte l of each 128-half packs positions
+#                     h+l | h+32+l<<2 | h+64+l<<4 | h+96+l<<6   (h in {0,128})
+#   f16 d, f16 dmin   super-block scales for the 4-bit scale/min indices
+# Dequant contract (llama.cpp dequantize_row_q2_K): y = d*sc[g]*q - dmin*m[g],
+# g = pos//16. Elements are quantized against the RECONSTRUCTED d*sc / dmin*m
+# (not the pre-quantization group scales) so encode matches decoder arithmetic.
+def quantize_q2_k(arr):
+    K = arr.shape[-1]
+    assert K % 256 == 0, K
+    rows = np.ascontiguousarray(arr).reshape(-1, K).astype(np.float32)
+    nrow, nsb = rows.shape[0], K // 256
+    x = rows.reshape(nrow, nsb, 16, 16)                # 16 groups of 16
+    mn = np.minimum(x.min(axis=3), 0.0)                # [.,.,16] <=0
+    mx = np.maximum(x.max(axis=3), 0.0)                # >=0
+    dl = (mx - mn) / 3.0                               # group scale >=0
+    ml = -mn                                           # group min  >=0
+    d = dl.max(axis=2) / 15.0                          # super scale [nrow,nsb]
+    dmin = ml.max(axis=2) / 15.0
+    d16 = d.astype(np.float16); dmin16 = dmin.astype(np.float16)
+    dr = d16.astype(np.float32); dminr = dmin16.astype(np.float32)  # as decoder sees them
+    qsc = np.clip(np.rint(dl / np.where(dr > 0, dr, 1.0)[..., None]), 0, 15).astype(np.uint8)
+    qmn = np.clip(np.rint(ml / np.where(dminr > 0, dminr, 1.0)[..., None]), 0, 15).astype(np.uint8)
+    dlr = dr[..., None] * qsc                          # reconstructed group scale
+    mlr = dminr[..., None] * qmn                       # reconstructed group min
+    dlsafe = np.where(dlr > 0, dlr, 1.0)
+    q = np.clip(np.rint((x + mlr[..., None]) / dlsafe[..., None]), 0, 3).astype(np.uint8)
+    scales = (qsc | (qmn << 4)).astype(np.uint8)       # [nrow,nsb,16]
+    qv = q.reshape(nrow, nsb, 2, 4, 32)                # [.,.,half,shift,lane]
+    qs = (qv[..., 0, :] | (qv[..., 1, :] << 2) |
+          (qv[..., 2, :] << 4) | (qv[..., 3, :] << 6)).astype(np.uint8)  # [.,.,2,32]
+    qs = qs.reshape(nrow, nsb, 64)
+    db = np.ascontiguousarray(d16).view(np.uint8).reshape(nrow, nsb, 2)
+    dmb = np.ascontiguousarray(dmin16).view(np.uint8).reshape(nrow, nsb, 2)
+    block = np.concatenate([scales, qs, db, dmb], axis=2)   # [nrow,nsb,84]
+    return block.reshape(*arr.shape[:-1], nsb * 84)
+
+def quantize_any(arr, qtype):
+    if qtype == QT.Q4_K:
+        return quantize_q4_k(arr.astype(np.float32))
+    if qtype == QT.Q2_K:
+        return quantize_q2_k(arr.astype(np.float32))
+    return gq.quantize(arr.astype(np.float32), qtype)
+
 # ---------------------------------------------------------------- gguf writer
 def add(writer, name, arr, qtype):
     arr = np.ascontiguousarray(arr)
@@ -176,10 +227,7 @@ def add(writer, name, arr, qtype):
     else:
         # pre-quantized: gguf derives the logical shape from the byte shape, so
         # pass ONLY raw_dtype (no raw_shape).
-        if qtype == QT.Q4_K:
-            q = quantize_q4_k(arr.astype(np.float32))
-        else:
-            q = gq.quantize(arr.astype(np.float32), qtype)
+        q = quantize_any(arr, qtype)
         writer.add_tensor(name, q, raw_dtype=qtype)
     print(f"  + {name:34s} {qtype.name:5s} {tuple(arr.shape)}", flush=True)
 
@@ -190,7 +238,7 @@ def add_experts(writer, name, db, layer, hf_part, qtype, n_expert=256):
     blocks = None
     for x in range(n_expert):
         e = db.fp4(f"mtp.{layer}.ffn.experts.{x}.{hf_part}")   # [out,in] f32
-        qb = quantize_q4_k(e) if qtype == QT.Q4_K else gq.quantize(e.astype(np.float32), qtype)
+        qb = quantize_any(e, qtype)
         if blocks is None:
             blocks = np.empty((n_expert,) + qb.shape, dtype=np.uint8)
         blocks[x] = qb
@@ -204,11 +252,43 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--experts", default="q4_k", choices=["q4_k", "q8_0"])
+    ap.add_argument("--experts", default="q4_k", choices=["q4_k", "q8_0", "q2_k"])
+    ap.add_argument("--experts-down", default=None, choices=["q4_k", "q8_0", "q2_k"],
+                    help="override quant for ffn_down_exps (w2) only. The BASE model's "
+                         "expert tiers are IQ2_XXS gate/up + Q2_K down; the drafter "
+                         "path dequantizes any of q4_k/q8_0/q2_k, and the ship drafters "
+                         "(0731 and vision-exp) use q2_k for gate, up and down")
     ap.add_argument("--validate", action="store_true")
     ap.add_argument("--layers", type=int, default=3)
+    ap.add_argument("--checkpoint-variant", default=None,
+                    help="stamp deepseek4.checkpoint_variant (e.g. vision-exp); "
+                         "the engine refuses a drafter whose variant differs from the base")
+    ap.add_argument("--source-revision", default=None,
+                    help="stamp general.source.revision (HF commit sha of the source checkpoint)")
+    ap.add_argument("--source-url", default=None, help="stamp general.source.url")
     args = ap.parse_args()
-    EXP = QT.Q4_K if args.experts == "q4_k" else QT.Q8_0
+    # Checkpoint identity is derived from the source, not trusted to memory:
+    # a Vision-Exp config.json carries vision_* keys, and a drafter extracted
+    # from it MUST be stamped (the engine refuses an unstamped drafter beside
+    # a Vision-Exp base, and an unstamped one beside a 0731 base would pair
+    # silently with collapsed yield).
+    cfg_path = os.path.join(args.src, "config.json")
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        src_is_vision = any(k.startswith("vision_") for k in cfg)
+        if src_is_vision and not args.checkpoint_variant:
+            args.checkpoint_variant = "vision-exp"
+            print("note: source config.json carries vision_* keys; stamping "
+                  "deepseek4.checkpoint_variant=vision-exp", file=sys.stderr)
+        if not src_is_vision and args.checkpoint_variant == "vision-exp":
+            ap.error("--checkpoint-variant vision-exp but the source config.json has no vision_* keys")
+    if args.checkpoint_variant == "vision-exp" and not args.source_revision:
+        ap.error("Vision-Exp source: --source-revision (the HF commit sha of the checkpoint) "
+                 "is required; the engine refuses a Vision-Exp drafter without it")
+    QMAP = {"q4_k": QT.Q4_K, "q8_0": QT.Q8_0, "q2_k": QT.Q2_K}
+    EXP = QMAP[args.experts]
+    EXPD = QMAP[args.experts_down] if args.experts_down else EXP
 
     db = STDB(args.src)
     # use_temp_file=True streams tensor data to a temp file instead of holding the
@@ -220,6 +300,14 @@ def main():
     w.add_uint32("deepseek4.dspark.noise_token_id", 128799)
     w.add_uint32("deepseek4.dspark.expert_count", 256)
     w.add_array("deepseek4.dspark.target_layers", [40, 41, 42])
+    # Checkpoint identity: Vision-Exp drafters carry the base's variant key and
+    # pinned revision so the engine can refuse cross-generation pairings.
+    if args.checkpoint_variant:
+        w.add_string("deepseek4.checkpoint_variant", args.checkpoint_variant)
+    if args.source_revision:
+        w.add_string("general.source.revision", args.source_revision)
+    if args.source_url:
+        w.add_string("general.source.url", args.source_url)
 
     fp8 = lambda d, n: d.fp8(n)
     fp4 = lambda d, n: d.fp4(n)
@@ -250,8 +338,8 @@ def main():
         add(w, p+"ffn_up_shexp.weight",   db.fp8(m+"ffn.shared_experts.w3.weight"), QT.Q8_0)
         add(w, p+"ffn_down_shexp.weight", db.fp8(m+"ffn.shared_experts.w2.weight"), QT.Q8_0)
         # routed experts (FP4 -> Q4_K/Q8_0), stacked [256,out,in]
-        for ds4part, hfpart in (("ffn_gate_exps","w1"),("ffn_up_exps","w3"),("ffn_down_exps","w2")):
-            add_experts(w, p+ds4part+".weight", db, L, hfpart+".weight", EXP)
+        for ds4part, hfpart, qt in (("ffn_gate_exps","w1",EXP),("ffn_up_exps","w3",EXP),("ffn_down_exps","w2",EXPD)):
+            add_experts(w, p+ds4part+".weight", db, L, hfpart+".weight", qt)
             gc.collect()
 
     # DSpark-specific heads

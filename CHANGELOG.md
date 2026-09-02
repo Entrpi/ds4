@@ -40,6 +40,65 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
     (injection point, id guard, terminator literals in plain text)
     and both live-tail lanes probed at the exact depth-gate boundary
     for byte-identity with the full render.
+- **DeepSeek-V4-Flash-Vision-Exp loads as a text-only checkpoint
+  (opt-in)** — the 2026-08-31 continued-training checkpoint's language
+  GGUF (`antirez/deepseek-v4-gguf`, the same IQ2_XXS/Q2_K asymmetric
+  recipe and the same imatrix as the 0731 ship quant) is accepted by the
+  loader: it reads `deepseek4.checkpoint_variant`,
+  `deepseek4.vision.sidecar_required` and `general.source.revision`,
+  TAKES the checkpoint's `rms_eps = 1e-20` into the runtime shape (the
+  previous loader only compared the value under an absolute 1e-6
+  tolerance, so it silently accepted 1e-20 and kept serving at 1e-6;
+  the epsilon is now taken from every checkpoint after a range check,
+  and a deviation from the shape default is announced), and prints the
+  variant on the boot line. Image input is NOT implemented: the encoder
+  sidecar is not consumed, and image/file/audio content blocks on all
+  three API surfaces are now refused with a named 400 instead of being
+  silently flattened to their text parts. The 0731 checkpoint remains
+  the auto-picked default. Boot-verified on GB10 (2026-09-02): the
+  variant banner, the named 400s on all three surfaces, both wrong-pairing
+  refusals, the auto-attached-drafter degrade, cache isolation under a
+  shared `--kv-dir`, and the 0731 golden bit-exact on the same binary
+  (`top20_max_abs=0`, cross-box).
+  - Cache identity: `ds4_engine_model_id` is 2 for Vision-Exp (0731
+    stays 0), so disk KV records, agent checkpoints and the distributed
+    hello never match across the generations; a shared `--kv-dir` also
+    stops being destructive — records of a non-zero model id are named
+    by SHA1(id, text), so the two generations no longer erase each
+    other's files on the same prompts. The API model id stays
+    `deepseek-v4-flash`; `/v1/models` shows the checkpoint in the name.
+  - Support-model gate: a Vision-Exp base refuses the 0731 DSpark
+    drafter and the MTP file, and a 0731 base refuses the Vision-Exp
+    drafter — by checkpoint variant, and a Vision-Exp support model
+    must carry a pinned source revision that matches the base's. The
+    gate runs before the tensor bind, so the refusal is named and the
+    file is closed. A support model that launch defaults volunteered
+    (sibling lookup) degrades to serving without it on refusal; an
+    explicit `--dspark`/`--mtp` still fails the boot.
+  - Launch defaults now resolve the base through `realpath`, so the
+    documented `./ds4flash.gguf -> ~/gguf/<base>` symlink install
+    detects the generation from the real file name and finds the
+    drafter beside the real file. Note for existing 0731 symlink
+    installs: the base now reads as 0731 (MTP retired, the 0731 drafter
+    beside it auto-arms) where the link name previously read as legacy.
+    Beside a Vision-Exp base only `DSpark-drafter-Q2K-Q8-vision-exp.gguf`
+    is attached (the fork's own extraction: `gguf-tools/dspark_extract.py`
+    with the 0731 Q2_K recipe; the extractor stamps the variant from the
+    source `config.json` and requires `--source-revision` for it); MTP is
+    retired for Vision-Exp as it is for 0731. New server units
+    `test_launch_generation_names` (incl. the symlink case) and the
+    media-block refusal.
+  - `download_model.sh` gains `vision-q2` / `vision-q2-q4` /
+    `vision-mxfp4` (the encoder is downloaded alongside),
+    `vision-encoder`, and `drafter-0731` / `drafter-vision` (the fork's
+    drafter repo) targets.
+  - Fixtures: upstream's `tests/test-vectors/flash-vision-exp/`
+    (OpenRouter/Novita greedy continuations; the provider returns no
+    logprobs) imported verbatim as the API-side reference.
+  - Quality parity of the Vision-Exp text weights against the fork's
+    0731 baselines is pending (frozen-suite re-base); the default does
+    not move before it lands, and the DSpark yield-quench guard keeps
+    its 0731 calibration (2.16) until re-measured on Vision-Exp.
 
 ## v0.6.5 — 2026-08-27
 

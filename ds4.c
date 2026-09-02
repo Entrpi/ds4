@@ -285,6 +285,22 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 
 #define DS4_MODEL_SHAPE_NAME          (g_ds4_shape.name)
 #define DS4_MODEL_VARIANT             (g_ds4_shape.variant)
+
+/* Checkpoint generation beyond the shape.  The Vision-Exp checkpoint
+ * (deepseek-ai/DeepSeek-V4-Flash-Vision-Exp, 2026-08-31) keeps the Flash
+ * shape but is a separate continued-training model: its GGUF carries
+ * deepseek4.checkpoint_variant="vision-exp", rms_eps=1e-20, and a pinned
+ * general.source.revision.  Support models (MTP head, DSpark drafter) are
+ * extracted per checkpoint and must match the base's variant. */
+typedef enum {
+    DS4_CKPT_BASE       = 0,   /* 0731 and earlier: no variant key */
+    DS4_CKPT_VISION_EXP = 1,
+} ds4_ckpt_variant;
+static ds4_ckpt_variant g_ds4_ckpt_variant = DS4_CKPT_BASE;
+static char g_ds4_source_revision[64];
+#define DS4_CKPT_VARIANT_KEY     "deepseek4.checkpoint_variant"
+#define DS4_SOURCE_REVISION_KEY  "general.source.revision"
+#define DS4_VISION_EXP_RMS_EPS   (1.0e-20f)
 #define DS4_N_LAYER                   (g_ds4_shape.n_layer)
 #define DS4_N_EMBD                    (g_ds4_shape.n_embd)
 #define DS4_N_VOCAB                   (g_ds4_shape.n_vocab)
@@ -3058,6 +3074,98 @@ static void config_expect_bool(const char *name, bool got, bool expected) {
     exit(1);
 }
 
+/* Relative comparator for epsilons: config_expect_f32's absolute 1e-6
+ * tolerance cannot tell 1e-20 from 1e-6. */
+static void config_expect_epsilon(const char *name, float got, float expected) {
+    /* Upstream's tolerance: relative 1e-5 with an absolute 1e-30 floor. */
+    const float tol = fabsf(expected) * 1.0e-5f;
+    if (fabsf(got - expected) <= (tol > 1.0e-30f ? tol : 1.0e-30f)) return;
+    fprintf(stderr, "ds4: expected %s=%.9g for %s, got %.9g\n",
+            name, (double)expected, DS4_MODEL_SHAPE_NAME, (double)got);
+    exit(1);
+}
+
+/* Reads the checkpoint variant + pinned source revision off a base GGUF
+ * (absent on 0731 and earlier = DS4_CKPT_BASE).  Must run after the shape
+ * is selected: a Vision-Exp base has to be Flash-shaped and has to declare
+ * the encoder-sidecar requirement the way upstream's quantizer stamps it. */
+static void ckpt_variant_read(const ds4_model *m) {
+    ds4_str v = {0}, rev = {0};
+    g_ds4_ckpt_variant = DS4_CKPT_BASE;
+    g_ds4_source_revision[0] = 0;
+    if (model_get_string(m, DS4_SOURCE_REVISION_KEY, &rev) && rev.len > 0) {
+        if (rev.len < sizeof(g_ds4_source_revision)) {
+            memcpy(g_ds4_source_revision, rev.ptr, rev.len);
+            g_ds4_source_revision[rev.len] = 0;
+        } else {
+            /* A 40-hex git sha always fits; anything longer is kept out of
+             * the cross-check rather than truncated to a false match. */
+            fprintf(stderr, "ds4: %s is %zu bytes (limit %zu); the support-model "
+                    "revision cross-check is disabled for this base\n",
+                    DS4_SOURCE_REVISION_KEY, (size_t)rev.len,
+                    sizeof(g_ds4_source_revision) - 1);
+        }
+    }
+    if (!model_get_string(m, DS4_CKPT_VARIANT_KEY, &v)) return;
+    if (ds4_streq(v, "vision-exp")) {
+        if (DS4_MODEL_VARIANT != DS4_VARIANT_FLASH) {
+            ds4_die("deepseek4.checkpoint_variant=vision-exp requires the Flash shape");
+        }
+        bool sidecar = false;
+        if (!model_get_bool(m, "deepseek4.vision.sidecar_required", &sidecar) || !sidecar) {
+            ds4_die("vision-exp checkpoint is missing deepseek4.vision.sidecar_required=true");
+        }
+        g_ds4_ckpt_variant = DS4_CKPT_VISION_EXP;
+        g_ds4_shape.name = "DeepSeek V4 Flash Vision-Exp";
+        return;
+    }
+    fprintf(stderr, "ds4: unsupported %s=%.*s\n", DS4_CKPT_VARIANT_KEY, (int)v.len, v.ptr);
+    exit(1);
+}
+
+/* Support models (MTP head, DSpark drafter) are extracted from a specific
+ * base checkpoint.  Vision-Exp support files carry the base's variant key
+ * and pinned revision; 0731-era files carry neither.  Refuse the cross
+ * pairings in both directions (upstream's rule): a wrong-generation drafter
+ * stays lossless by verification, but its accept rate collapses and the
+ * failure would otherwise be silent. */
+static bool support_model_compatible(const ds4_model *sm, const char *what, const char *path) {
+    ds4_str v = {0}, rev = {0};
+    bool has_v = model_get_string(sm, DS4_CKPT_VARIANT_KEY, &v);
+    bool is_vision = has_v && ds4_streq(v, "vision-exp");
+    if (has_v && !is_vision) {
+        fprintf(stderr, "ds4: %s %s declares unsupported %s=%.*s\n",
+                what, path, DS4_CKPT_VARIANT_KEY, (int)v.len, v.ptr);
+        return false;
+    }
+    if (g_ds4_ckpt_variant == DS4_CKPT_VISION_EXP && !is_vision) {
+        fprintf(stderr, "ds4: %s %s was extracted for the 0731/base checkpoint; "
+                "the Vision-Exp base needs its own Vision-Exp support model\n", what, path);
+        return false;
+    }
+    if (g_ds4_ckpt_variant != DS4_CKPT_VISION_EXP && is_vision) {
+        fprintf(stderr, "ds4: %s %s is a Vision-Exp support model and cannot serve "
+                "this base checkpoint\n", what, path);
+        return false;
+    }
+    if (is_vision) {
+        /* A Vision-Exp support model must carry its pinned source revision:
+         * the variant key alone cannot tell two Vision-Exp uploads apart, and
+         * an unstamped revision would silently skip the cross-check. */
+        if (!model_get_string(sm, DS4_SOURCE_REVISION_KEY, &rev) || rev.len == 0) {
+            fprintf(stderr, "ds4: %s %s carries no %s; re-extract it with --source-revision\n",
+                    what, path, DS4_SOURCE_REVISION_KEY);
+            return false;
+        }
+        if (g_ds4_source_revision[0] && !ds4_streq(rev, g_ds4_source_revision)) {
+            fprintf(stderr, "ds4: %s %s source revision %.*s does not match the base (%s)\n",
+                    what, path, (int)rev.len, rev.ptr, g_ds4_source_revision);
+            return false;
+        }
+    }
+    return true;
+}
+
 static void config_validate_fixed_shape(uint32_t n_layer) {
     config_expect_u32("block_count",                  n_layer,                 DS4_N_LAYER);
 }
@@ -3168,8 +3276,31 @@ static void config_validate_model(const ds4_model *m) {
     config_expect_f32("attention.compress_rope_freq_base", compress_rope_freq_base, DS4_COMPRESS_ROPE_FREQ_BASE);
     const float expert_weight_scale = required_f32(m, "deepseek4.expert_weights_scale");
     config_expect_f32("expert_weights_scale", expert_weight_scale, DS4_EXPERT_WEIGHT_SCALE);
+    /* Vision-Exp ships rms_eps=1e-20 under the Flash shape: the shape takes
+     * the GGUF's value (every norm kernel reads it at runtime) under a
+     * relative check; every other checkpoint keeps the exact 1e-6 pin. */
+    ckpt_variant_read(m);
+    /* The epsilon is a runtime shape field consumed by every norm kernel, so
+     * the GGUF's value is TAKEN, never merely compared: config_expect_f32's
+     * absolute 1e-6 tolerance cannot tell 1e-20 from 1e-6, so a loader that
+     * only compared silently served the Vision-Exp checkpoint at 1e-6.
+     * Vision-Exp pins 1e-20 exactly; any other checkpoint must sit in a
+     * sane range, and a deviation from the shape default is announced. */
     const float rms_eps = required_f32(m, "deepseek4.attention.layer_norm_rms_epsilon");
-    config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, DS4_RMS_EPS);
+    if (!(rms_eps > 0.0f) || !isfinite(rms_eps) || rms_eps > 1.0e-2f) {
+        fprintf(stderr, "ds4: attention.layer_norm_rms_epsilon=%.9g is out of range for %s\n",
+                (double)rms_eps, DS4_MODEL_SHAPE_NAME);
+        exit(1);
+    }
+    if (g_ds4_ckpt_variant == DS4_CKPT_VISION_EXP) {
+        config_expect_epsilon("attention.layer_norm_rms_epsilon", rms_eps, DS4_VISION_EXP_RMS_EPS);
+    } else if (fabsf(rms_eps - DS4_RMS_EPS) > fabsf(DS4_RMS_EPS) * 1.0e-3f) {
+        fprintf(stderr, "ds4: attention.layer_norm_rms_epsilon=%.9g differs from the %s default %.9g; "
+                "using the checkpoint's value (an unstamped Vision-Exp requant? its caches would "
+                "share the base checkpoint's keys -- stamp deepseek4.checkpoint_variant)\n",
+                (double)rms_eps, DS4_MODEL_SHAPE_NAME, (double)DS4_RMS_EPS);
+    }
+    g_ds4_shape.rms_eps = rms_eps;
     const float hc_eps = required_f32(m, "deepseek4.hyper_connection.epsilon");
     config_expect_f32("hyper_connection.epsilon", hc_eps, DS4_HC_EPS);
     const bool expert_weight_norm = required_bool(m, "deepseek4.expert_weights_norm");
@@ -40277,6 +40408,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
+    e->dspark_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->distributed = opt->distributed;
@@ -40325,6 +40457,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
+    if (g_ds4_ckpt_variant == DS4_CKPT_VISION_EXP && !opt->inspect_only) {
+        fprintf(stderr, "ds4: checkpoint variant: vision-exp (rms_eps=%.3g, source revision %s); "
+                "text-only serving -- image input is not implemented in this build\n",
+                (double)g_ds4_shape.rms_eps,
+                g_ds4_source_revision[0] ? g_ds4_source_revision : "unknown");
+    }
     if (opt->inspect_only) {
         *out = e;
         return 0;
@@ -40337,11 +40475,31 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
+        /* Gate BEFORE bind: the gate reads metadata only, and bind's
+         * required-tensor lookups exit with a generic "missing tensor" on
+         * a wrong-kind file, which would pre-empt the named refusal.
+         * mtp_ready is still unset here, so engine_close skips the model:
+         * close it explicitly or the fd + mapping leak. */
+        if (!support_model_compatible(&e->mtp_model, "MTP support model", opt->mtp_path)) {
+            model_close(&e->mtp_model);
+            if (opt->mtp_auto) {
+                /* Volunteered by a sibling lookup, not asked for: serve
+                 * without it rather than kill a boot the user never
+                 * configured. */
+                fprintf(stderr, "ds4: MTP support model %s was auto-attached by launch defaults; "
+                        "serving without MTP\n", opt->mtp_path);
+                goto mtp_done;
+            }
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
-        /* v0.5.1 inc4: nothing in the gguf identifies which base checkpoint
-         * this module was extracted for (see the engine fields) -- arm the
-         * accept guard so a wrong-generation pairing announces and disables
+        /* v0.5.1 inc4: 0731-era support files carry nothing that identifies
+         * which base checkpoint they were extracted for (Vision-Exp files
+         * do, and support_model_compatible reads it) -- arm the accept
+         * guard so a wrong-generation pairing announces and disables
          * itself instead of silently halving decode speed forever. */
         {
             const char *ge = getenv("DS4_MTP_ACCEPT_GUARD");
@@ -40352,6 +40510,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 e->mtp_draft_tokens,
                 e->mtp_guard_on ?
                     " [accept guard armed: a mismatched pairing disables itself]" : "");
+mtp_done:;
     }
 
     /* DSpark/dflash block-drafter: a second support model (3 MoE layers + heads)
@@ -40363,10 +40522,23 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         if (dspark_path && dspark_path[0] &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE) {
             model_open(&e->dspark_model, dspark_path, graph_backend, true);
-            dspark_weights_bind(&e->dspark_weights, &e->dspark_model);
-            e->dspark_ready = true;
-            fprintf(stderr, "ds4: DSpark drafter loaded: %s (%u layers)\n",
-                    dspark_path, (unsigned)DS4_DSPARK_N_LAYER);
+            /* Gate before bind, close on refusal (see the MTP block). */
+            if (!support_model_compatible(&e->dspark_model, "DSpark drafter", dspark_path)) {
+                model_close(&e->dspark_model);
+                if (opt->dspark_auto) {
+                    fprintf(stderr, "ds4: DSpark drafter %s was auto-attached by launch defaults; "
+                            "serving without a drafter (plain decode)\n", dspark_path);
+                } else {
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+            } else {
+                dspark_weights_bind(&e->dspark_weights, &e->dspark_model);
+                e->dspark_ready = true;
+                fprintf(stderr, "ds4: DSpark drafter loaded: %s (%u layers)\n",
+                        dspark_path, (unsigned)DS4_DSPARK_N_LAYER);
+            }
         }
     }
 
@@ -40859,6 +41031,16 @@ int ds4_engine_set_power(ds4_engine *e, int power_percent) {
     return 0;
 }
 
+int ds4_engine_checkpoint_variant(ds4_engine *e) {
+    (void)e;
+    return (int)g_ds4_ckpt_variant;
+}
+
+const char *ds4_engine_source_revision(ds4_engine *e) {
+    (void)e;
+    return g_ds4_source_revision;
+}
+
 const char *ds4_engine_model_name(ds4_engine *e) {
     (void)e;
     return DS4_MODEL_SHAPE_NAME;
@@ -40887,6 +41069,12 @@ int ds4_engine_n_hc(ds4_engine *e) {
 
 int ds4_engine_model_id(ds4_engine *e) {
     (void)e;
+    /* 2 = Flash Vision-Exp: the Flash shape (variant 0) under different
+     * weights.  On-disk KV records and agent caches are keyed by this id
+     * and carry no weight fingerprint, so the generations must not share
+     * it (a 0731 prefix restored into a Vision-Exp session would be
+     * silently wrong).  The API model id stays "deepseek-v4-flash". */
+    if (g_ds4_ckpt_variant == DS4_CKPT_VISION_EXP) return 2;
     return (int)DS4_MODEL_VARIANT;
 }
 
