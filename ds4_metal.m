@@ -378,6 +378,8 @@ static id<MTLComputePipelineState> g_dsv4_hc_producer_pre_norm_pipeline;
 static id<MTLComputePipelineState> g_dsv4_hc_expand_producer_pre_norm_pipeline;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_dsv4_hc_barrier_cache;
 static NSMutableDictionary<NSString *, NSNumber *> *g_dsv4_hc_barrier_gen;
+static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_dsv4_hc_partials_cache;
+static id<MTLComputePipelineState> g_dsv4_hc_expand_slices_pipeline;
 static id<MTLComputePipelineState> g_hc_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_output_hc_weights4_pipeline;
 static uint32_t g_test_flags;
@@ -28869,7 +28871,22 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     }
 
     const uint32_t ncpsg = 32;
-    const uint32_t nwg = 32;
+    /* Split-K work groups per head.  32 keys per group is the smallest
+     * useful unit; at short contexts 32 groups meant 4 keys each plus a
+     * 32-way reduce.  DS4_METAL_FLASH_NWG=N forces a value (0 = adaptive). */
+    static int nwg_env = -1;
+    if (nwg_env < 0) {
+        const char *e = getenv("DS4_METAL_FLASH_NWG");
+        nwg_env = e ? atoi(e) : 0;
+    }
+    uint32_t nwg = 32;
+    if (nwg_env > 0) {
+        nwg = (uint32_t)nwg_env;
+    } else {
+        nwg = n_keys <= 256u ? 8u : 32u;   /* measured: 8 at 128 keys -1 us net, 4 +9 us */
+    }
+    if (nwg > 32u) nwg = 32u;
+    if (nwg < 1u) nwg = 1u;
     const uint32_t nsg = ds4_gpu_flash_attn_vec_nsg(n_keys, nwg, ncpsg);
     const NSUInteger row_bytes = (NSUInteger)head_dim * sizeof(float);
     const NSUInteger row_bytes_f16 = (NSUInteger)head_dim * sizeof(uint16_t);
@@ -44409,6 +44426,23 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
         }
         id<MTLComputePipelineState> producer =
             g_dsv4_hc_expand_producer_pre_norm_pipeline;
+        /* Slice-parallel HC step (no spin barrier) behind
+         * DS4_METAL_HC_EXPAND_SLICES=1: measured 16.7 us vs the cluster
+         * kernel's 14.5 (its serial collapse/norm tail and launch cost more
+         * than the barrier saved), so the cluster kernel stays the default. */
+        static int use_slices = -1;
+        if (use_slices < 0) {
+            const char *e = getenv("DS4_METAL_HC_EXPAND_SLICES");
+            use_slices = e ? (atoi(e) != 0) : 0;
+        }
+        if (use_slices) {
+            if (!g_dsv4_hc_expand_slices_pipeline) {
+                g_dsv4_hc_expand_slices_pipeline =
+                    ds4_gpu_get_pipeline("kernel_dsv4_hc_expand4_mix_norm_slices_f16");
+            }
+            if (g_dsv4_hc_expand_slices_pipeline) producer = g_dsv4_hc_expand_slices_pipeline;
+            else use_slices = 0;
+        }
         id<MTLBuffer> blockbuf = ds4_gpu_tensor_buffer(block_out);
         id<MTLBuffer> addbuf = ds4_gpu_tensor_buffer(block_add);
         id<MTLBuffer> prevbuf = ds4_gpu_tensor_buffer(residual_prev);
@@ -44424,7 +44458,7 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
                     "ds4: Metal fused HC expand/producer received undersized expand buffers\n");
             return 0;
         }
-        if (!producer || producer.maxTotalThreadsPerThreadgroup < 512u) {
+        if (!producer || producer.maxTotalThreadsPerThreadgroup < (use_slices ? 256u : 512u)) {
             return 0;
         }
         if (!g_dsv4_completion_cache) return 0;
@@ -44471,6 +44505,18 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
             (uint32_t)[[g_dsv4_hc_barrier_gen objectForKey:barrier_key] unsignedIntValue] + 1u;
         [g_dsv4_hc_barrier_gen setObject:@(gen) forKey:barrier_key];
         const uint32_t barrier_target = 6u * gen;
+        id<MTLBuffer> partials = nil;
+        if (use_slices) {
+            if (!g_dsv4_hc_partials_cache) g_dsv4_hc_partials_cache = [NSMutableDictionary dictionary];
+            partials = [g_dsv4_hc_partials_cache objectForKey:barrier_key];
+            if (!partials) {
+                partials = [g_device newBufferWithLength:64u * 32u * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+                if (!partials) return 0;
+                memset([partials contents], 0, 64u * 32u * sizeof(float));
+                [g_dsv4_hc_partials_cache setObject:partials forKey:barrier_key];
+            }
+        }
         [g_transient_buffers addObject:barrier];
         ds4_gpu_hc_expand_args ex = {
             .n_embd = n_embd,
@@ -44547,9 +44593,16 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
         [enc setBuffer:prevbuf offset:ds4_gpu_tensor_offset(residual_prev) atIndex:17];
         [enc setBuffer:postbuf offset:ds4_gpu_tensor_offset(post) atIndex:18];
         [enc setBuffer:combbuf offset:ds4_gpu_tensor_offset(comb) atIndex:19];
+        if (use_slices) {
+            [enc setBuffer:partials offset:0 atIndex:20];
+            [enc setThreadgroupMemoryLength:(64u + 256u + 4u + 32u + 4u + 8u + 64u * 25u + 8u) * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(64, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+        } else {
         [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(6, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 16, 1)];
+        }
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(
