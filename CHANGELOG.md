@@ -5,6 +5,42 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## Unreleased
+
+- **`--tool-call-reminder` now covers the Anthropic surface and live
+  tool-result continuations** — closing two coverage gaps in the v0.6.5
+  feature, which despite its help text only fired on the general
+  render path for `tool`/`function`-role results:
+  - Anthropic `/v1/messages` tool results are embedded into user-role
+    content at parse time, so they never reached the reminder
+    injection on ANY path. Past the depth gate, a tool-result-bearing
+    user message now carries one reminder before its last result
+    terminator (trailing text blocks, e.g. client system reminders,
+    stay after it). Note this changes rendered bytes for deep
+    (>~96KB) Anthropic histories vs v0.6.5, so the first replay of a
+    pre-upgrade deep conversation re-prefills from the first reminder
+    point.
+  - Live tool-result continuations (Anthropic and Responses fast
+    lanes) rendered their KV tail independently of the full renderer
+    and appended tool results bare, so the deep tool loops the knob
+    was built for never showed the model the reminder — and the live
+    frontier's actual KV bytes diverged from the visible transcript
+    the bookkeeping records. The live tail is now sliced byte-exactly
+    out of a marked full render (`render_live_tool_tail_exact`), so
+    the tail carries exactly the reminders — at exactly the bytes — a
+    later full re-render produces, and warm prefix reuse and
+    continuation revalidation see one consistent byte stream.
+  - Disclosed exception: Responses continuations that send ONLY tool
+    outputs without history (the stateless-chain shape) keep the
+    legacy independent tail render and never carry the reminder — the
+    server tracks no rendered-byte frontier across such chains, so no
+    replay-consistent depth verdict exists there yet. The usage text
+    says so.
+  - New server-group units: the Anthropic user-embedded shape
+    (injection point, id guard, terminator literals in plain text)
+    and both live-tail lanes probed at the exact depth-gate boundary
+    for byte-identity with the full render.
+
 ## v0.6.5 — 2026-08-27
 
 - **`--tool-call-reminder on|off`, default on** (env

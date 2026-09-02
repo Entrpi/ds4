@@ -287,7 +287,11 @@ agent task end to end (submitted and harness-resolved, zero slips) with
 reasoning traces kept and no format deviation. Shallow conversations are
 never touched, so chat-with-tools flows that legitimately answer in
 prose after a tool result are unaffected, and the injection is
-byte-stable across turns, so warm prefix reuse is unchanged.
+byte-stable across turns, so warm prefix reuse is unchanged. All three
+API surfaces are covered, including the live tool-result continuation
+fast lanes; the one exception is a Responses continuation that sends
+only tool outputs without history, whose conversation depth is not
+renderable, so it skips the reminder.
 
 **`--reasoning-replay keep|drop`** (env `DS4_REASONING_REPLAY=drop`) —
 an optional depth lever. Most OpenAI-style agent scaffolds echo each

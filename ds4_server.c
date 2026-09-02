@@ -2562,9 +2562,15 @@ static bool chat_history_uses_tool_context(const chat_msgs *msgs,
     return false;
 }
 
-static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
-                                     const tool_schema_orders *tool_orders,
-                                     ds4_think_mode think_mode) {
+/* Core renderer.  mark_idx/mark_out are the live-tail extraction hook: when
+ * mark_idx names a message index, *mark_out reports the byte offset of out at
+ * the top of that message's loop iteration -- i.e. where that message's bytes
+ * begin in the rendered prompt.  render_live_tool_tail_exact() uses it to
+ * slice a live continuation suffix that is byte-identical to this render. */
+static char *render_chat_prompt_text_mark(const chat_msgs *msgs, const char *tool_schemas,
+                                          const tool_schema_orders *tool_orders,
+                                          ds4_think_mode think_mode,
+                                          int mark_idx, size_t *mark_out) {
     (void)tool_orders;
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
@@ -2596,11 +2602,40 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     bool pending_tool_result = false;
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
+        if (mark_out && i == mark_idx) *mark_out = out.len;
         if (role_is_system(m->role)) {
             continue;
         } else if (!strcmp(m->role, "user")) {
             buf_puts(&out, "<｜User｜>");
-            buf_puts(&out, m->content ? m->content : "");
+            const char *c = m->content ? m->content : "";
+            /* issue #18 option E, Anthropic shape: /v1/messages tool results
+             * are embedded into user content at parse time
+             * (parse_anthropic_content_block), so the tool-role injection
+             * below never sees them.  Same predicate and byte-stability
+             * rules as the tool branch: past the depth gate, a user message
+             * that carries tool result ids gets one reminder before its
+             * last result terminator (trailing text blocks stay after it).
+             * The id guard keeps ordinary user text untouched, and result
+             * bodies cannot fake the terminator (append_tool_result_text
+             * escapes it), so the last occurrence is always parser-built. */
+            const char *inject_at = NULL;
+            if (g_tool_call_reminder && tool_schemas && tool_schemas[0] &&
+                ((m->tool_call_id && m->tool_call_id[0]) ||
+                 m->tool_call_ids_len > 0)) {
+                const char *scan = c;
+                while ((scan = strstr(scan, "</tool_result>")) != NULL) {
+                    inject_at = scan;
+                    scan++;
+                }
+            }
+            if (inject_at) {
+                buf_append(&out, c, (size_t)(inject_at - c));
+                if (out.len >= g_tool_reminder_min_bytes)
+                    buf_puts(&out, DS4_TOOL_CALL_REMINDER_TEXT);
+                buf_puts(&out, inject_at);
+            } else {
+                buf_puts(&out, c);
+            }
             pending_assistant = true;
             pending_tool_result = false;
         } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
@@ -2658,6 +2693,13 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     return buf_take(&out);
 }
 
+static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
+                                     const tool_schema_orders *tool_orders,
+                                     ds4_think_mode think_mode) {
+    return render_chat_prompt_text_mark(msgs, tool_schemas, tool_orders,
+                                        think_mode, -1, NULL);
+}
+
 /* Render only the semantic tail that must be appended to the live KV for a
  * tool-result continuation.
  *
@@ -2673,7 +2715,14 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
  * This is intentionally independent from req.prompt's already-tokenized suffix:
  * suffix tokenization happens later after the cache decision, using the live
  * token prefix as the boundary.  That avoids BPE merges across the visible
- * replay/live-KV boundary. */
+ * replay/live-KV boundary.
+ *
+ * Since the tool-call reminder landed this is the FALLBACK tail lane, used
+ * only when the request has no rendered history to anchor an exact extraction
+ * to (output-only continuations, or an unanchored tail).  It renders the tail
+ * independently and therefore cannot evaluate the reminder's depth predicate,
+ * so its tails never carry the reminder; the primary lane is
+ * render_live_tool_tail_exact() below. */
 static char *render_live_tool_tail(const chat_msgs *msgs, int start,
                                    ds4_think_mode think_mode) {
     const bool think = ds4_think_mode_enabled(think_mode);
@@ -2722,6 +2771,36 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
         buf_puts(&out, think ? "<think>" : "</think>");
     }
     return buf_take(&out);
+}
+
+/* Exact live-tail extraction.
+ *
+ * The live continuation suffix must be byte-identical to what
+ * render_chat_prompt_text() produces for the same messages from the previous
+ * assistant EOS onward: those are the bytes the visible-frontier bookkeeping
+ * and every later full re-render assume went into the KV, and since the
+ * tool-call reminder they can differ from an independently rendered tail
+ * (the reminder's depth predicate is a function of the FULL rendered prefix
+ * length, which the tail render cannot see).  So render the full prompt with
+ * a mark at the tail's first message and slice at mark minus the EOS marker;
+ * the anchor assistant turn always ends with exactly that marker.  Returns
+ * NULL when the slice is not anchored as expected; callers then fall back to
+ * the legacy independent tail render (which never carries the reminder). */
+static char *render_live_tool_tail_exact(const chat_msgs *msgs, int tail_start,
+                                         const char *tool_schemas,
+                                         ds4_think_mode think_mode) {
+    static const char eos[] = "<｜end▁of▁sentence｜>";
+    const size_t eos_len = sizeof(eos) - 1;
+    size_t mark = 0;
+    char *full = render_chat_prompt_text_mark(msgs, tool_schemas, NULL,
+                                              think_mode, tail_start, &mark);
+    char *suffix = NULL;
+    if (full && mark >= eos_len &&
+        !memcmp(full + mark - eos_len, eos, eos_len)) {
+        suffix = xstrdup(full + mark - eos_len);
+    }
+    free(full);
+    return suffix;
 }
 
 static bool chat_msg_has_call_id(const chat_msg *m, const char *id) {
@@ -2814,7 +2893,8 @@ static bool responses_validate_tool_outputs(server *s, const chat_msgs *msgs,
  * it.  If another request already replaced the session, normal token/text/disk
  * prefix matching handles the request instead. */
 static void responses_prepare_live_continuation(request *r,
-                                                const chat_msgs *msgs) {
+                                                const chat_msgs *msgs,
+                                                const char *tool_schemas) {
     if (!r || r->api != API_RESPONSES || !msgs || msgs->len == 0) return;
 
     int tail_start = msgs->len;
@@ -2841,8 +2921,18 @@ static void responses_prepare_live_continuation(request *r,
     if (r->responses_live_call_ids.len == 0) return;
 
     free(r->responses_live_suffix_text);
-    r->responses_live_suffix_text =
-        render_live_tool_tail(msgs, tail_start, r->think_mode);
+    r->responses_live_suffix_text = tail_start > 0 ?
+        render_live_tool_tail_exact(msgs, tail_start, tool_schemas,
+                                    r->think_mode) : NULL;
+    if (!r->responses_live_suffix_text) {
+        /* Output-only continuation (or unanchored slice): no rendered history
+         * in this request to extract from, so the legacy independent tail is
+         * the only renderable shape.  It cannot evaluate the reminder's
+         * depth predicate (the server tracks no rendered-byte frontier
+         * across output-only chains), so these tails never carry it. */
+        r->responses_live_suffix_text =
+            render_live_tool_tail(msgs, tail_start, r->think_mode);
+    }
 }
 
 static bool anthropic_msg_is_tool_result_tail(const chat_msg *m) {
@@ -2899,7 +2989,8 @@ static bool anthropic_validate_tool_results(server *s, const chat_msgs *msgs,
  * frontier, generate_job() can skip replay matching entirely and append just
  * EOS + tool_result + next assistant prefix to the real KV. */
 static void anthropic_prepare_live_continuation(request *r,
-                                                const chat_msgs *msgs) {
+                                                const chat_msgs *msgs,
+                                                const char *tool_schemas) {
     if (!r || r->api != API_ANTHROPIC || !msgs || msgs->len == 0) return;
 
     int tail_end = msgs->len;
@@ -2918,9 +3009,24 @@ static void anthropic_prepare_live_continuation(request *r,
     }
     if (r->anthropic_live_call_ids.len == 0) return;
 
+    /* Exact extraction needs the tail anchored to a rendered assistant
+     * tool-call turn (its EOS is the slice boundary).  A well-formed
+     * continuation always has one; skip interleaved system text, which the
+     * renderer hoists to the top and never places between anchor and tail. */
+    int anchor = tail_start - 1;
+    while (anchor >= 0 && role_is_system(msgs->v[anchor].role)) anchor--;
+    const bool anchored = anchor >= 0 &&
+        !strcmp(msgs->v[anchor].role, "assistant") &&
+        msgs->v[anchor].calls.len > 0;
+
     free(r->anthropic_live_suffix_text);
-    r->anthropic_live_suffix_text =
-        render_live_tool_tail(msgs, tail_start, r->think_mode);
+    r->anthropic_live_suffix_text = anchored ?
+        render_live_tool_tail_exact(msgs, tail_start, tool_schemas,
+                                    r->think_mode) : NULL;
+    if (!r->anthropic_live_suffix_text) {
+        r->anthropic_live_suffix_text =
+            render_live_tool_tail(msgs, tail_start, r->think_mode);
+    }
 }
 
 /* The API parsers are intentionally selective JSON parsers: they keep only
@@ -3335,9 +3441,9 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     }
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    anthropic_prepare_live_continuation(r, &msgs);
-    request_acquire_cont_pin(s, r);   /* Inc 5b: pin the LIVE record */
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    anthropic_prepare_live_continuation(r, &msgs, active_tool_schemas);
+    request_acquire_cont_pin(s, r);   /* Inc 5b: pin the LIVE record */
     r->prompt_preserves_reasoning =
         !g_reasoning_replay_drop &&
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
@@ -4300,7 +4406,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     r->prompt_preserves_reasoning =
         !g_reasoning_replay_drop &&
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
-    responses_prepare_live_continuation(r, &msgs);
+    responses_prepare_live_continuation(r, &msgs, active_tool_schemas);
     request_acquire_cont_pin(s, r);   /* Inc 5b: pin the LIVE record */
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
@@ -18975,10 +19081,14 @@ static void usage(FILE *fp) {
         "      quants otherwise answer some tools-armed turns with a prose completion\n"
         "      report (measured 50%% of turns at 70-80K tokens; the reminder measured\n"
         "      0/72 slips vs 6/72 without at the same states, and fixed the failing\n"
-        "      agent task end to end). Shallow conversations are never touched, so\n"
-        "      chat-with-tools flows that answer in prose after a tool result are\n"
-        "      unaffected. Env twins: DS4_TOOL_CALL_REMINDER=0 disables,\n"
-        "      DS4_TOOL_CALL_REMINDER_MIN_BYTES retunes the depth gate.\n"
+        "      agent task end to end). Covers every surface: chat/completions,\n"
+        "      Anthropic /v1/messages (including live tool-result continuations), and\n"
+        "      Responses -- except Responses continuations that send ONLY tool\n"
+        "      outputs without history, where the depth of the conversation is not\n"
+        "      renderable and the reminder is skipped. Shallow conversations are\n"
+        "      never touched, so chat-with-tools flows that answer in prose after a\n"
+        "      tool result are unaffected. Env twins: DS4_TOOL_CALL_REMINDER=0\n"
+        "      disables, DS4_TOOL_CALL_REMINDER_MIN_BYTES retunes the depth gate.\n"
         "  --reasoning-replay MODE\n"
         "      keep (default): reasoning_content echoed by the client in tool-context\n"
         "      history renders back into <think> blocks -- the V4 reference format\n"
@@ -22014,6 +22124,247 @@ static void test_tool_call_reminder_render(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_tool_call_reminder_anthropic_user_shape(void) {
+    /* Anthropic /v1/messages tool results are user-role content with
+     * embedded <tool_result> wrappers (parse_anthropic_content_block), so
+     * they never reach the tool-role reminder branch.  Past the gate, an
+     * id-bearing user message carries ONE reminder before its LAST result
+     * terminator (trailing text blocks stay after it); ordinary user text
+     * is never touched, even when it contains a literal terminator. */
+    const bool saved_on = g_tool_call_reminder;
+    const size_t saved_gate = g_tool_reminder_min_bytes;
+    chat_msgs msgs = {0};
+    chat_msg m0 = {0};
+    m0.role = xstrdup("user");
+    m0.content = xstrdup("plain text with a literal</tool_result>marker");
+    chat_msgs_push(&msgs, m0);
+    chat_msg m1 = {0};
+    m1.role = xstrdup("assistant");
+    m1.content = xstrdup("");
+    tool_call tc = {0};
+    tc.id = xstrdup("toolu_1");
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\": \"make test\"}");
+    tool_calls_push(&m1.calls, tc);
+    chat_msgs_push(&msgs, m1);
+    chat_msg m2 = {0};
+    m2.role = xstrdup("user");
+    m2.content = xstrdup("<tool_result>ok-first</tool_result>"
+                         "<tool_result>ok-second</tool_result>"
+                         "trailing reminder-block text");
+    chat_msg_add_tool_call_id(&m2, "toolu_1");
+    chat_msgs_push(&msgs, m2);
+    const char *schemas = "## bash\ndescription";
+
+    int n;
+    const char *p;
+    char *r;
+
+    /* Past the gate: exactly one injection, before the LAST terminator of
+     * the id-bearing message only. */
+    g_tool_call_reminder = true;
+    g_tool_reminder_min_bytes = 0;
+    r = render_chat_prompt_text(&msgs, schemas, NULL, DS4_THINK_LOW);
+    n = 0;
+    for (p = r; (p = strstr(p, "[Reminder:")) != NULL; p++) n++;
+    TEST_ASSERT(n == 1);
+    TEST_ASSERT(strstr(r, "plain text with a literal</tool_result>marker") != NULL);
+    TEST_ASSERT(strstr(r, "ok-first</tool_result><tool_result>ok-second") != NULL);
+    TEST_ASSERT(strstr(r, "not accepted by this harness.]</tool_result>"
+                          "trailing reminder-block text") != NULL);
+    free(r);
+
+    /* Below the gate: untouched. */
+    g_tool_reminder_min_bytes = (size_t)-1;
+    r = render_chat_prompt_text(&msgs, schemas, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(strstr(r, "[Reminder:") == NULL);
+    free(r);
+
+    /* Knob off: untouched. */
+    g_tool_reminder_min_bytes = 0;
+    g_tool_call_reminder = false;
+    r = render_chat_prompt_text(&msgs, schemas, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(strstr(r, "[Reminder:") == NULL);
+    free(r);
+
+    /* No tools declared: untouched. */
+    g_tool_call_reminder = true;
+    r = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(strstr(r, "[Reminder:") == NULL);
+    free(r);
+
+    g_tool_call_reminder = saved_on;
+    g_tool_reminder_min_bytes = saved_gate;
+    chat_msgs_free(&msgs);
+}
+
+static void test_tool_call_reminder_live_tail_paths(void) {
+    /* The live continuation suffix must be byte-identical to the full
+     * render's tail region -- reminder verdicts included -- at the exact
+     * depth-gate boundary, for BOTH tail lanes (Responses role-tool tails
+     * and Anthropic user-embedded tails).  Output-only tails (no rendered
+     * history in the request) keep the legacy render and never carry it.
+     * The gate probe works because the full render's predicate reads
+     * out.len just before the reminder append: with gate 0, the reminder's
+     * byte offset IS the out.len the predicate read, so gate == offset
+     * still injects (>=) and gate == offset + 1 must not. */
+    const bool saved_on = g_tool_call_reminder;
+    const size_t saved_gate = g_tool_reminder_min_bytes;
+    const char *schemas = "## bash\ndescription";
+    static const char eos[] = "<｜end▁of▁sentence｜>";
+    g_tool_call_reminder = true;
+
+    /* Responses shape: [user, assistant+call, role-tool result]. */
+    {
+        chat_msgs msgs = {0};
+        chat_msg m0 = {0};
+        m0.role = xstrdup("user");
+        m0.content = xstrdup("start the run");
+        chat_msgs_push(&msgs, m0);
+        chat_msg m1 = {0};
+        m1.role = xstrdup("assistant");
+        m1.content = xstrdup("");
+        tool_call tc = {0};
+        tc.id = xstrdup("call_1");
+        tc.name = xstrdup("bash");
+        tc.arguments = xstrdup("{\"command\": \"pwd\"}");
+        tool_calls_push(&m1.calls, tc);
+        chat_msgs_push(&msgs, m1);
+        chat_msg m2 = {0};
+        m2.role = xstrdup("tool");
+        m2.tool_call_id = xstrdup("call_1");
+        m2.content = xstrdup("ok-first");
+        chat_msgs_push(&msgs, m2);
+
+        g_tool_reminder_min_bytes = 0;
+        char *full0 = render_chat_prompt_text(&msgs, schemas, NULL,
+                                              DS4_THINK_LOW);
+        const char *rem = strstr(full0, "\n\n[Reminder:");
+        TEST_ASSERT(rem != NULL);
+        const size_t pred_point = (size_t)(rem - full0);
+        free(full0);
+
+        for (int past = 0; past < 2; past++) {
+            g_tool_reminder_min_bytes = pred_point + (size_t)past;
+            char *full = render_chat_prompt_text(&msgs, schemas, NULL,
+                                                 DS4_THINK_LOW);
+            request r;
+            request_init(&r, REQ_CHAT, 128);
+            r.api = API_RESPONSES;
+            r.think_mode = DS4_THINK_LOW;
+            responses_prepare_live_continuation(&r, &msgs, schemas);
+            TEST_ASSERT(r.responses_live_suffix_text != NULL);
+            const size_t sl = strlen(r.responses_live_suffix_text);
+            const size_t fl = strlen(full);
+            TEST_ASSERT(fl > sl);
+            TEST_ASSERT(!strcmp(full + fl - sl, r.responses_live_suffix_text));
+            TEST_ASSERT(!strncmp(r.responses_live_suffix_text, eos,
+                                 sizeof(eos) - 1));
+            TEST_ASSERT((strstr(r.responses_live_suffix_text,
+                                "[Reminder:") != NULL) == (past == 0));
+            if (past == 0) {
+                TEST_ASSERT(strstr(r.responses_live_suffix_text,
+                                   "not accepted by this harness.]"
+                                   "</tool_result>") != NULL);
+            }
+            free(full);
+            request_free(&r);
+        }
+        chat_msgs_free(&msgs);
+    }
+
+    /* Anthropic shape: [user, assistant+call, user+id embedded result]. */
+    {
+        chat_msgs msgs = {0};
+        chat_msg m0 = {0};
+        m0.role = xstrdup("user");
+        m0.content = xstrdup("start the run");
+        chat_msgs_push(&msgs, m0);
+        chat_msg m1 = {0};
+        m1.role = xstrdup("assistant");
+        m1.content = xstrdup("");
+        tool_call tc = {0};
+        tc.id = xstrdup("toolu_live");
+        tc.name = xstrdup("bash");
+        tc.arguments = xstrdup("{\"command\": \"pwd\"}");
+        tool_calls_push(&m1.calls, tc);
+        chat_msgs_push(&msgs, m1);
+        chat_msg m2 = {0};
+        m2.role = xstrdup("user");
+        m2.content = xstrdup("<tool_result>done</tool_result>");
+        chat_msg_add_tool_call_id(&m2, "toolu_live");
+        chat_msgs_push(&msgs, m2);
+
+        g_tool_reminder_min_bytes = 0;
+        char *full0 = render_chat_prompt_text(&msgs, schemas, NULL,
+                                              DS4_THINK_LOW);
+        const char *rem = strstr(full0, "\n\n[Reminder:");
+        TEST_ASSERT(rem != NULL);
+        const size_t pred_point = (size_t)(rem - full0);
+        free(full0);
+
+        for (int past = 0; past < 2; past++) {
+            g_tool_reminder_min_bytes = pred_point + (size_t)past;
+            char *full = render_chat_prompt_text(&msgs, schemas, NULL,
+                                                 DS4_THINK_LOW);
+            request r;
+            request_init(&r, REQ_CHAT, 128);
+            r.api = API_ANTHROPIC;
+            r.think_mode = DS4_THINK_LOW;
+            anthropic_prepare_live_continuation(&r, &msgs, schemas);
+            TEST_ASSERT(r.anthropic_live_suffix_text != NULL);
+            const size_t sl = strlen(r.anthropic_live_suffix_text);
+            const size_t fl = strlen(full);
+            TEST_ASSERT(fl > sl);
+            TEST_ASSERT(!strcmp(full + fl - sl, r.anthropic_live_suffix_text));
+            TEST_ASSERT(!strncmp(r.anthropic_live_suffix_text, eos,
+                                 sizeof(eos) - 1));
+            TEST_ASSERT((strstr(r.anthropic_live_suffix_text,
+                                "[Reminder:") != NULL) == (past == 0));
+            if (past == 0) {
+                TEST_ASSERT(strstr(r.anthropic_live_suffix_text,
+                                   "done") != NULL);
+                TEST_ASSERT(strstr(r.anthropic_live_suffix_text,
+                                   "not accepted by this harness.]"
+                                   "</tool_result>") != NULL);
+            }
+            free(full);
+            request_free(&r);
+        }
+        chat_msgs_free(&msgs);
+    }
+
+    /* Output-only Responses continuation (tail_start == 0): the legacy
+     * independent tail, which never carries the reminder (no rendered
+     * history to evaluate the depth predicate against). */
+    {
+        chat_msgs msgs = {0};
+        chat_msg m0 = {0};
+        m0.role = xstrdup("tool");
+        m0.tool_call_id = xstrdup("call_only");
+        m0.content = xstrdup("ok-output-only");
+        chat_msgs_push(&msgs, m0);
+
+        g_tool_reminder_min_bytes = 0;
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_RESPONSES;
+        r.think_mode = DS4_THINK_LOW;
+        responses_prepare_live_continuation(&r, &msgs, schemas);
+        TEST_ASSERT(r.responses_live_suffix_text != NULL);
+        TEST_ASSERT(!strncmp(r.responses_live_suffix_text, eos,
+                             sizeof(eos) - 1));
+        TEST_ASSERT(strstr(r.responses_live_suffix_text,
+                           "ok-output-only") != NULL);
+        TEST_ASSERT(strstr(r.responses_live_suffix_text, "[Reminder:") == NULL);
+        request_free(&r);
+        chat_msgs_free(&msgs);
+    }
+
+    g_tool_call_reminder = saved_on;
+    g_tool_reminder_min_bytes = saved_gate;
+}
+
 static void test_cont_slip_resample_contract(void) {
     /* issue #18 option C: the FIRST tools-armed no-tool-call stop settle on a
      * non-streaming cont chat row returns false (nothing written, stream
@@ -23090,7 +23441,7 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
     system.content = xstrdup("You are terse.");
     chat_msgs_push(&msgs, system);
 
-    anthropic_prepare_live_continuation(&r, &msgs);
+    anthropic_prepare_live_continuation(&r, &msgs, NULL);
     TEST_ASSERT(r.anthropic_live_call_ids.len == 1);
     TEST_ASSERT(!strcmp(r.anthropic_live_call_ids.v[0], "toolu_live"));
     TEST_ASSERT(r.anthropic_live_suffix_text != NULL);
@@ -23832,7 +24183,7 @@ static void test_responses_live_tail_renders_tool_outputs_only(void) {
     tool.content = xstrdup("/tmp");
     chat_msgs_push(&msgs, tool);
 
-    responses_prepare_live_continuation(&r, &msgs);
+    responses_prepare_live_continuation(&r, &msgs, NULL);
     TEST_ASSERT(r.responses_live_call_ids.len == 1);
     TEST_ASSERT(!strcmp(r.responses_live_call_ids.v[0], "call_live"));
     TEST_ASSERT(r.responses_live_suffix_text != NULL);
@@ -30042,6 +30393,8 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_slip_dump();
     test_reasoning_replay_drop_render();
     test_tool_call_reminder_render();
+    test_tool_call_reminder_anthropic_user_shape();
+    test_tool_call_reminder_live_tail_paths();
     test_cont_slip_resample_contract();
     test_slip_requeue_and_age_exemption();
     test_api_thinking_controls_parse();
