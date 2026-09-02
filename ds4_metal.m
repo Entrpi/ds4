@@ -11271,7 +11271,7 @@ static uint64_t ds4_gpu_tp_big_gate_kick_impl(uint32_t layer, uint32_t rows,
         kick_cb = (__bridge_retained void *)g_batch_cb;
         if (!ds4_gpu_flush_commands()) {
             id<MTLCommandBuffer> drop = (__bridge_transfer id<MTLCommandBuffer>)kick_cb;
-            drop = nil;
+            (void)drop;
             return 0;
         }
     }
@@ -11279,7 +11279,10 @@ static uint64_t ds4_gpu_tp_big_gate_kick_impl(uint32_t layer, uint32_t rows,
     if (g_tp_queue_count >= DS4_GPU_TP_QUEUE) {
         pthread_mutex_unlock(&g_tp_mutex);
         fprintf(stderr, "ds4: TP gate queue overflow\n");
-        if (kick_cb) { id<MTLCommandBuffer> drop = (__bridge_transfer id<MTLCommandBuffer>)kick_cb; drop = nil; }
+        if (kick_cb) {
+            id<MTLCommandBuffer> drop = (__bridge_transfer id<MTLCommandBuffer>)kick_cb;
+            (void)drop;
+        }
         return 0;
     }
     uint32_t tail = (g_tp_queue_head + g_tp_queue_count) % DS4_GPU_TP_QUEUE;
