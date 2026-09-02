@@ -153,6 +153,16 @@ int ds4_gpu_add_tensor_tp_flag(
  * matvec when its output is that slot; otherwise ignored). */
 void ds4_gpu_tp_flag_fold_request(uint32_t layer, uint32_t gate);
 
+/* Runtime rank-speed bias for the shared-expert lane split (lanes added to
+ * rank 0's range), decided by the coordinator per token and carried to the
+ * worker in the eval command; the measured peer wait EWMA per gate kind
+ * feeds the decision. */
+void ds4_gpu_tp_set_lane_bias(int32_t bias_lanes);
+int32_t ds4_gpu_tp_lane_bias(void);
+double ds4_gpu_tp_gate_wait_ewma_us(uint32_t gate);
+double ds4_gpu_tp_gate_skew_ewma_us(uint32_t gate);
+void ds4_gpu_tp_set_peer_probe(int (*fn)(void *, uint64_t));
+
 /* Deferred kv norm task: call before ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor
  * to run only its q task now and fold the kv task into the KV staging
  * kernel of the same layer; flush runs it standalone if nothing consumed it. */

@@ -9481,8 +9481,9 @@ typedef struct {
     int32_t shared_dim;
     int32_t lane_granule;
     int32_t shift_q16;
-    int32_t pad;
+    int32_t bias_lanes;
 } ds4_gpu_shared_split_args;
+static int32_t g_tp_lane_bias;   /* per-token rank-speed bias, set by the coordinator's decision on both ranks */
 static BOOL g_parallel_split_active;
 static ds4_gpu_shared_split_args g_parallel_split_args;
 static id<MTLBuffer> g_parallel_split_ids;
@@ -9833,7 +9834,7 @@ int ds4_gpu_parallel_ffn_start_split(
         .shared_dim = (int32_t)shared_dim,
         .lane_granule = 64,
         .shift_q16 = (int32_t)shift_q16,
-        .pad = 0,
+        .bias_lanes = g_tp_lane_bias,
     };
     g_parallel_split_ids = idsbuf;
     g_parallel_split_ids_offset = ds4_gpu_tensor_offset(selected);
@@ -10237,6 +10238,8 @@ static volatile uint32_t *g_tp_gpu_flags;   /* CPU view of the flag words */
 static uint64_t g_tp_gpu_flags_off;
 static uint64_t g_tp_seq;
 static ds4_gpu_tp_exchange_fn g_tp_exchange_fn;
+static int (*g_tp_peer_probe_fn)(void *, uint64_t);
+static double g_tp_skew_ewma_us[2];   /* signed peer skew per gate kind: >0 peer early */
 static ds4_gpu_tp_batch_exchange_fn g_tp_batch_exchange_fn;
 static ds4_gpu_tp_big_exchange_fn g_tp_big_exchange_fn;
 
@@ -10466,6 +10469,8 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
          * on the decode critical path and normally tens of microseconds
          * out; yielding here measurably delays the release wake-up. */
         const double t0 = profile ? ds4_gpu_now_ms() : 0.0;
+        int peer_seen = 0;
+        double t_peer = 0.0;
         uint32_t spins = 0;
         if (req.big_bytes > 0) {
             /* Big gates always signal arrival through the batch shared
@@ -10484,6 +10489,11 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                 want = DS4_TP_BATCH_FLAG_TAG | (uint32_t)req.seq;
             while (__atomic_load_n(&g_tp_gpu_flags[slot], __ATOMIC_ACQUIRE) != want) {
                 if (g_tp_shutdown) break;
+                if (!peer_seen && g_tp_peer_probe_fn && (spins & 1023u) == 512u &&
+                    g_tp_peer_probe_fn(g_tp_exchange_ud, req.seq)) {
+                    peer_seen = 1;
+                    t_peer = ds4_gpu_now_ms();
+                }
                 if (++spins > (1u << 20)) {
                     sched_yield();
                     spins = 0;
@@ -10557,6 +10567,11 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
             g_tp_exchange_ewma_us[req.gate] =
                 g_tp_exchange_ewma_us[req.gate] == 0.0 ? ex_us :
                 0.9 * g_tp_exchange_ewma_us[req.gate] + 0.1 * ex_us;
+            /* Signed skew: how early the peer was (probe saw its partial before
+             * our flag) or how late (our wait beyond the ~12 us pickup floor). */
+            const double skew_us = peer_seen ? (t1 - t_peer) * 1000.0 : -(ex_us - 12.0);
+            g_tp_skew_ewma_us[req.gate] =
+                0.9 * g_tp_skew_ewma_us[req.gate] + 0.1 * skew_us;
         }
         /* Release the GPU even on failure so end_commands can drain. */
         if (req.rows > 0) {
@@ -10860,6 +10875,26 @@ static int ds4_gpu_tp_flag_fold_take(const ds4_gpu_tensor *out, uint64_t out_byt
     *slot_out = slot;
     *value_out = (uint32_t)(g_tp_seq + 1u);
     return 1;
+}
+
+void ds4_gpu_tp_set_lane_bias(int32_t bias_lanes) {
+    g_tp_lane_bias = bias_lanes;
+}
+
+int32_t ds4_gpu_tp_lane_bias(void) {
+    return g_tp_lane_bias;
+}
+
+double ds4_gpu_tp_gate_skew_ewma_us(uint32_t gate) {
+    return gate < 2u ? g_tp_skew_ewma_us[gate] : 0.0;
+}
+
+void ds4_gpu_tp_set_peer_probe(int (*fn)(void *, uint64_t)) {
+    g_tp_peer_probe_fn = fn;
+}
+
+double ds4_gpu_tp_gate_wait_ewma_us(uint32_t gate) {
+    return gate < 2u ? g_tp_exchange_ewma_us[gate] : 0.0;
 }
 
 int ds4_gpu_add_tensor_tp_flag(
@@ -29011,7 +29046,10 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     if (nwg_env > 0) {
         nwg = (uint32_t)nwg_env;
     } else {
-        nwg = n_keys <= 256u ? 8u : 32u;   /* measured: 8 at 128 keys -1 us net, 4 +9 us */
+        /* 32 always: 8 groups at 128 keys saved 1 us in attention but made the
+         * later concurrent FFN block ~50 us slower (unexplained, measured);
+         * DS4_METAL_FLASH_NWG overrides for experiments. */
+        nwg = 32u;
     }
     if (nwg > 32u) nwg = 32u;
     if (nwg < 1u) nwg = 1u;

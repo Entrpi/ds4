@@ -879,7 +879,7 @@ typedef struct {
     int32_t shared_dim;
     int32_t lane_granule;
     int32_t shift_q16;
-    int32_t pad;
+    int32_t bias_lanes;   /* runtime rank-speed bias, added to lanes0 */
 } ds4_metal_shared_split_args;
 
 static inline void ds4_shared_split_range(
@@ -898,7 +898,7 @@ static inline void ds4_shared_split_range(
         (int64_t)(n1 - n0) * (int64_t)sp.shift_q16 * (int64_t)sp.shared_dim;
     const int delta = (int)(delta_q16 >= 0 ? (delta_q16 >> 16)
                                           : -((-delta_q16) >> 16));
-    int lanes0 = sp.shared_dim / 2 + delta;
+    int lanes0 = sp.shared_dim / 2 + delta + sp.bias_lanes;
     lanes0 = clamp(lanes0, 0, sp.shared_dim);
     const int granule = sp.lane_granule;
     lanes0 = ((lanes0 + granule / 2) / granule) * granule;

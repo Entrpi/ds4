@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include "ds4_tp.h"
+#include "ds4_gpu.h"
 
 #if defined(__APPLE__) && defined(__has_include)
 #if __has_include(<infiniband/verbs.h>)
@@ -159,6 +160,10 @@ typedef struct {
 #endif
 
 struct ds4_tp {
+    int32_t lane_bias_out;      /* bias carried on the next eval command */
+    float   lane_bias_state;    /* controller state (lanes) */
+    float   peer_wait_us;       /* worker's FFN-gate wait EWMA, from the logits frame */
+    float   my_wait_us;         /* worker side: sent on the logits frame */
     ds4_tp_options opt;
     int rank;                   /* 0 leader, 1 worker */
     int control_fd;
@@ -1731,6 +1736,16 @@ void ds4_tp_mark_failed(ds4_tp *tp) {
  * Gate exchange.
  * --------------------------------------------------------------------- */
 
+/* Non-blocking: has the peer's partial for gate `seq` already landed?
+ * (RDMA only; drains completions like the exchange does.)  Lets the gate
+ * service measure how early the peer was while it still waits for its own
+ * GPU, the signed skew the rank-speed balancing needs. */
+int ds4_tp_gate_peer_arrived(ds4_tp *tp, uint64_t seq) {
+    if (!tp || !tp->rdma_active) return 0;
+    if (!tp_rdma_drain_cq(tp)) return 0;
+    return tp->rdma.recv_done >= seq;
+}
+
 int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
@@ -2038,7 +2053,7 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
 
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token) {
-    ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, 0 };
+    ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, (uint32_t)tp->lane_bias_out };
     return tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
 }
 
@@ -2285,6 +2300,7 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
         command->session_id = msg.session_id;
         command->seq = msg.seq;
         command->value = msg.token;
+        command->lane_bias = (int32_t)msg.reserved;
         break;
     }
     case DS4_TP_FRAME_EVAL_BATCH: {
@@ -2353,19 +2369,85 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     return 1;
 }
 
+/* The logits half frame carries one extra float: the sender's FFN-gate
+ * wait EWMA (us), which the coordinator uses for rank-speed balancing. */
 int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_LOGITS,
-                         half, count * sizeof(float));
+    ds4_tp_frame_header h = { DS4_TP_MAGIC, DS4_TP_FRAME_LOGITS,
+                              (count + 1u) * (uint32_t)sizeof(float) };
+    const float wait = tp->my_wait_us;
+    return tp_write_full(tp->control_fd, &h, sizeof(h)) &&
+           tp_write_full(tp->control_fd, half, count * sizeof(float)) &&
+           tp_write_full(tp->control_fd, &wait, sizeof(wait));
 }
 
 int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count) {
     uint32_t type = 0, bytes = 0;
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_LOGITS || bytes != count * sizeof(float)) {
+        type != DS4_TP_FRAME_LOGITS || bytes != (count + 1u) * sizeof(float)) {
         fprintf(stderr, "ds4-tp: bad logits frame (type %u bytes %u)\n", type, bytes);
         return 0;
     }
-    return tp_read_full(tp->control_fd, half, bytes);
+    if (!tp_read_full(tp->control_fd, half, count * sizeof(float))) return 0;
+    float wait = 0.0f;
+    if (!tp_read_full(tp->control_fd, &wait, sizeof(wait))) return 0;
+    tp->peer_wait_us = wait;
+    return 1;
+}
+
+float ds4_tp_peer_wait_us(const ds4_tp *tp) {
+    return tp ? tp->peer_wait_us : 0.0f;
+}
+
+/* Rank-speed balancing controller (coordinator).  d = worker wait - own
+ * wait at FFN gates (us): positive means the worker waits for us, so rank 0
+ * gives up shared lanes.  One shared half (1024 lanes) is ~27 us of
+ * streaming, so ~38 lanes/us; the default gain moves half the difference,
+ * smoothed, clamped to +-shared_dim/2 and rounded to 64 lanes.
+ * DS4_TP_LANE_BIAS=1 enables; DS4_TP_LANE_BIAS_GAIN=<lanes per us>. */
+int32_t ds4_tp_lane_bias_next(ds4_tp *tp, int32_t shared_dim) {
+    if (!tp) return 0;
+    static int disabled = -1;
+    static float gain = 19.0f;
+    if (disabled < 0) {
+        /* Opt-in (DS4_TP_LANE_BIAS=1): it makes the output depend on measured
+         * timing, and on a pair that is nearly balanced it moves only a few
+         * tens of lanes for no measurable gain. */
+        disabled = getenv("DS4_TP_LANE_BIAS") == NULL;
+        const char *g = getenv("DS4_TP_LANE_BIAS_GAIN");
+        if (g) gain = (float)atof(g);
+    }
+    if (disabled || shared_dim <= 0) {
+        tp->lane_bias_out = 0;
+        return 0;
+    }
+#if defined(__APPLE__)
+    /* Signed skew at FFN gates measured locally by the gate service:
+     * positive = the peer's partial landed before our own gate (we are the
+     * slower rank), negative = we waited for the peer. */
+    const float skew = (float)ds4_gpu_tp_gate_skew_ewma_us(1u);
+    const float w0 = skew;
+    const float w1 = 1.0f;
+#else
+    const float w0 = 0.0f, w1 = 0.0f;
+#endif
+    if (w1 > 0.0f) {
+        float target = -skew * gain;
+        const float lim = (float)shared_dim * 0.5f;
+        if (target > lim) target = lim;
+        if (target < -lim) target = -lim;
+        tp->lane_bias_state = 0.8f * tp->lane_bias_state + 0.2f * target;
+    }
+    const float q = tp->lane_bias_state / 64.0f;
+    const int32_t bias = (int32_t)(q >= 0.0f ? q + 0.5f : q - 0.5f) * 64;
+    tp->lane_bias_out = bias;
+    static int debug = -1;
+    static unsigned calls;
+    if (debug < 0) debug = getenv("DS4_TP_LANE_BIAS_DEBUG") != NULL;
+    if (debug && (calls++ % 32u) == 0u) {
+        fprintf(stderr, "ds4-tp: lane bias: skew %.1f us (peer early > 0), state %.0f, bias %d\n",
+                (double)w0, (double)tp->lane_bias_state, (int)bias);
+    }
+    return bias;
 }
 
 int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
@@ -2478,6 +2560,9 @@ static void tp_worker_session_remove(ds4_tp_worker_sessions *sessions,
 static int tp_worker_send_logits(ds4_tp *tp, ds4_session *session,
                                  float *logits, int vocab) {
     if (!logits || vocab <= 0 || (vocab & 1) != 0) return 0;
+#if defined(__APPLE__)
+    tp->my_wait_us = (float)ds4_gpu_tp_gate_wait_ewma_us(1u);
+#endif
     const uint32_t vhalf = (uint32_t)vocab / 2u;
     return ds4_session_copy_logits(session, logits, vocab) == vocab &&
            ds4_tp_send_logits_half(tp, logits + vhalf, vhalf);
@@ -2603,6 +2688,9 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
                 rc = 1;
             }
         } else if (command.type == DS4_TP_FRAME_EVAL) {
+#if defined(__APPLE__)
+            ds4_gpu_tp_set_lane_bias(command.lane_bias);
+#endif
             if (ds4_session_eval(session, command.value, err, sizeof(err)) != 0) {
                 ds4_log(stderr, DS4_LOG_ERROR, "tp worker eval: %s", err);
                 rc = 1;

@@ -24850,12 +24850,13 @@ static bool metal_graph_encode_decode_layer_phase(
             if (fused < 0) {
                 ok = false;
             } else if (fused > 0) {
+                /* Logits and select done; router_only_done stays 0 so the
+                 * single-machine parallel FFN path is not enabled. */
                 router_project_select_fused = true;
-                router_only_done = 1;
             }
         }
 #endif
-        if (ok && router_shared_done == 0 && router_only_done == 0)
+        if (ok && router_shared_done == 0 && router_only_done == 0 && !router_project_select_fused)
         ok = metal_graph_matmul_plain_tensor(metal_graph_router_logits(g), model, layer->ffn_gate_inp,
                                                      DS4_N_EMBD, DS4_N_EXPERT, metal_graph_ffn_norm(g), 1);
         if (ok && !router_project_select_fused)
@@ -64376,6 +64377,10 @@ int ds4_engine_tp_vocab_split(ds4_engine *e) {
 }
 
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
+static int ds4_engine_tp_peer_probe(void *ud, uint64_t seq) {
+    return ds4_tp_gate_peer_arrived((ds4_tp *)ud, seq);
+}
+
 static int ds4_engine_tp_exchange(void *ud, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_tp *tp = ud;
     const int ok = ds4_tp_gate_exchange(tp, layer, gate, seq);
@@ -64477,6 +64482,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         return 0;
     }
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
+    ds4_gpu_tp_set_peer_probe(ds4_engine_tp_peer_probe);
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
     /* GLM keeps its replicated output head unsplit in v0: the
      * leader computes full logits and nothing crosses the wire. */
@@ -68517,6 +68523,11 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (ds4_session_tp_leader(s)) {
         ds4_engine *e = s->engine;
+#if defined(__APPLE__)
+        /* Rank-speed balancing: the bias for this token rides in the eval
+         * command and applies identically on both ranks. */
+        ds4_gpu_tp_set_lane_bias(ds4_tp_lane_bias_next(e->tp.ctx, (int32_t)DS4_N_FF_EXP));
+#endif
         if (!ds4_tp_send_eval(e->tp.ctx, s->tp_session_id,
                               ++e->tp.eval_seq, token)) {
             snprintf(err, errlen, "tp: worker eval send failed");
