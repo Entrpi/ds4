@@ -1082,7 +1082,10 @@ int ds4_cont_last_done_stats(const ds4_batch_ctx *ctx, ds4_cont_seq_stats *out);
  * set of synthetic prompts (deterministic admission) and asserts the per-seq output
  * tokens are identical with the per-bank MTP draft path off vs on -- the clean
  * non-invasiveness/exactness proof (no server-timing / batch-composition confound).
- * Requires a ctx created with --mtp.  Returns 0 PASS, 1 token MISMATCH, 2 setup error. */
+ * Requires a draft source: an MTP head (--mtp) or an armed DSpark drafter (--dspark;
+ * a DSpark-only boot skips the MTP-chain probe and needs DS4_CONT_MTP_ACCEPT, the
+ * accept run E carrying the verdict; every accept-path run must prove it drafted).
+ * Returns 0 PASS, 1 token MISMATCH, 2 setup error. */
 int  ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen);
 
 /* Phase 2 A2a: deterministic warm-start gate.  Drives the continuous engine with

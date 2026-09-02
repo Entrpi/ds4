@@ -38997,6 +38997,9 @@ typedef struct {
     uint32_t   T;
     int      **out;
     uint32_t  *outlen;
+    ds4_batch_ctx *ctx;      /* when set, on_done accumulates the finished seq's spec stats */
+    uint64_t   spec_drafts;  /* engagement receipt: draft rows produced over the run */
+    uint64_t   spec_hits;
 } ds4_mtp_gate_ud;
 
 static int ds4_mtp_gate_admit(void *ud, ds4_cont_request *req) {
@@ -39035,6 +39038,10 @@ static void ds4_mtp_gate_on_done(void *ud, void *user, const int *tokens, int n,
     ds4_mtp_gate_ud *gu = ud; (void)finish;
     const uint32_t s = (uint32_t)(uintptr_t)user;
     if (s >= gu->N || gu->out[s]) return;
+    if (gu->ctx) {   /* engagement receipt (stats are set before this callback fires) */
+        ds4_cont_seq_stats st;
+        if (ds4_cont_last_done_stats(gu->ctx, &st)) { gu->spec_drafts += st.spec_drafts; gu->spec_hits += st.spec_hits; }
+    }
     const uint32_t m = n > 0 ? (uint32_t)n : 0u;
     gu->out[s] = xmalloc((size_t)(m ? m : 1u) * sizeof(int));
     if (m) memcpy(gu->out[s], tokens, (size_t)m * sizeof(int));
@@ -39056,10 +39063,12 @@ static int gate_forced_committed_dump(ds4_batch_ctx *ctx,
                                       const int **prompts, const uint32_t *plens,
                                       uint32_t N, uint32_t T, int tok, int from, int norollback,
                                       float **buf, uint64_t *nf, uint32_t **counts, uint32_t *nc,
-                                      int **out, uint32_t *outlen, char *rerr, size_t rerrlen) {
+                                      int **out, uint32_t *outlen, char *rerr, size_t rerrlen,
+                                      uint64_t *drafts_out) {
     for (uint32_t s = 0; s < N; s++) { out[s] = NULL; outlen[s] = 0u; }
     *buf = NULL; *counts = NULL; *nf = 0u; *nc = 0u;
-    ds4_mtp_gate_ud gud = { prompts, plens, N, 0u, T, out, outlen };
+    ds4_mtp_gate_ud gud = { prompts, plens, N, 0u, T, out, outlen, NULL, 0u, 0u };
+    gud.ctx = ctx;   /* engagement receipt for the caller */
     ctx->mtp_draft_mode = 2;
     ctx->mtp_force_draft_tok = tok;
     ctx->mtp_force_draft_from = from;
@@ -39074,6 +39083,7 @@ static int gate_forced_committed_dump(ds4_batch_ctx *ctx,
     ctx->mtp_force_draft_tok = -1;
     ctx->mtp_force_draft_from = 0;
     ctx->mtp_force_norollback = 0;
+    if (drafts_out) *drafts_out = gud.spec_drafts;
     return ok;
 }
 
@@ -39100,8 +39110,38 @@ static void gate_cc_compare(const float *a, uint64_t anf, const uint32_t *ac, ui
 
 int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
 #define GATE_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
-    if (!ctx || !ctx->mtp || !ctx->e || !ctx->e->mtp_ready) {
-        GATE_ERR("cont_mtp_gate: requires a ctx created with --mtp"); return 2; }
+    /* Draft source for run E: the MTP head (--mtp) or an ARMED DSpark drafter
+     * (--dspark + DS4_CONT_DSPARK, which the launch defaults set).  0731 and
+     * Vision-Exp retired the MTP head, so their ship pairings are DSpark-only:
+     * runs A/B/E and the forced-draft losslessness legs exercise the SAME
+     * mode-2 verify/accept/rollback machinery with the block drafter as the
+     * draft source (the DSpark batched draft path honours the forced-draft
+     * hook); the mode-1 probe (C) is MTP-chain only and is skipped there.
+     * Every accept-path run must PROVE it drafted (per-seq spec stats), so a
+     * disarmed drafter cannot pass as "lossless by luck". */
+    if (!ctx || !ctx->e) { GATE_ERR("cont_mtp_gate: no batch ctx"); return 2; }
+    const bool have_mtp = ctx->mtp && ctx->e->mtp_ready;
+    const char *dse = getenv("DS4_CONT_DSPARK");
+    const bool have_dspark = ctx->e->dspark_ready && ctx->dsl.multi_raw[0] != NULL &&
+                             dse && dse[0] && strcmp(dse, "0") != 0;
+    if (!have_mtp && !have_dspark) {
+        GATE_ERR("cont_mtp_gate: requires an MTP head (--mtp) or an armed DSpark drafter "
+                 "(--dspark with DS4_CONT_DSPARK=1)"); return 2; }
+    const bool dspark_only = !have_mtp;
+    /* S1.1: mode 2 = speculative verify+ACCEPT.  Off by default so the existing mode-1
+     * non-invasiveness gate is unchanged; set DS4_CONT_MTP_ACCEPT to add run E (mode 2)
+     * and assert its per-seq token stream is identical to the mode-0 baseline (A). */
+    const bool gate_accept = getenv("DS4_CONT_MTP_ACCEPT") != NULL;
+    if (dspark_only && !gate_accept) {
+        GATE_ERR("cont_mtp_gate: DSpark-only boot (no MTP head): set DS4_CONT_MTP_ACCEPT -- "
+                 "run E is the only leg that exercises the drafter"); return 2; }
+    {
+        const char *deg = getenv("DS4_CONT_MTP_DEPTH");
+        fprintf(stderr, "ds4: CONT_MTP_GATE draft source: %s (D=%s)\n",
+                dspark_only ? "DSpark drafter (DSpark-only boot; mode-1 probe skipped)"
+                            : (have_dspark ? "MTP head + armed DSpark drafter (E drafts via DSpark)" : "MTP head"),
+                (deg && deg[0]) ? deg : "1 (default)");
+    }
     const char *ne = getenv("DS4_CONT_MTP_GATE_N");
     const char *te = getenv("DS4_CONT_MTP_GATE_T");
     const char *le = getenv("DS4_CONT_MTP_GATE_LEN");
@@ -39121,10 +39161,6 @@ int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
     int      **out1 = xcalloc(N, sizeof(int *)); uint32_t *ol1 = xcalloc(N, sizeof(uint32_t));
     int      **outD = xcalloc(N, sizeof(int *)); uint32_t *olD = xcalloc(N, sizeof(uint32_t));
     int      **out2 = xcalloc(N, sizeof(int *)); uint32_t *ol2 = xcalloc(N, sizeof(uint32_t));
-    /* S1.1: mode 2 = speculative verify+ACCEPT.  Off by default so the existing mode-1
-     * non-invasiveness gate is unchanged; set DS4_CONT_MTP_ACCEPT to add run E (mode 2)
-     * and assert its per-seq token stream is identical to the mode-0 baseline (A). */
-    const bool gate_accept = getenv("DS4_CONT_MTP_ACCEPT") != NULL;
     for (uint32_t s = 0; s < N; s++) {
         plens[s] = L + (s & 3u);
         prompts[s] = xmalloc((size_t)plens[s] * sizeof(int));
@@ -39144,30 +39180,31 @@ int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
      * The probe is "non-invasive" iff (A vs C) divergence == (A vs B) divergence.
      * mode 0 runs FIRST so a probe never contaminates a later run's fresh prefill
      * (a cross-run artifact of the engine's uninitialized-padding sensitivity). */
-    ds4_mtp_gate_ud gA = { (const int **)prompts, plens, N, 0u, T, out0, ol0 };
+    ds4_mtp_gate_ud gA = { (const int **)prompts, plens, N, 0u, T, out0, ol0, NULL, 0u, 0u };
     ctx->mtp_draft_mode = 0;
     if (ds4_engine_continuous_generate(ctx, ds4_mtp_gate_admit, ds4_mtp_gate_on_token,
                                        ds4_mtp_gate_on_done, &gA, rerr, sizeof(rerr)) != 0) {
         GATE_ERR("cont_mtp_gate: baseline A (mode 0) run failed: %s", rerr); rc = 2;
     }
     if (rc == 0) {
-        ds4_mtp_gate_ud gB = { (const int **)prompts, plens, N, 0u, T, outD, olD };
+        ds4_mtp_gate_ud gB = { (const int **)prompts, plens, N, 0u, T, outD, olD, NULL, 0u, 0u };
         ctx->mtp_draft_mode = 0;
         if (ds4_engine_continuous_generate(ctx, ds4_mtp_gate_admit, ds4_mtp_gate_on_token,
                                            ds4_mtp_gate_on_done, &gB, rerr, sizeof(rerr)) != 0) {
             GATE_ERR("cont_mtp_gate: control B (mode 0) run failed: %s", rerr); rc = 2;
         }
     }
-    if (rc == 0) {
-        ds4_mtp_gate_ud gC = { (const int **)prompts, plens, N, 0u, T, out1, ol1 };
+    if (rc == 0 && !dspark_only) {   /* mode-1 probe = MTP-chain drafting only */
+        ds4_mtp_gate_ud gC = { (const int **)prompts, plens, N, 0u, T, out1, ol1, NULL, 0u, 0u };
         ctx->mtp_draft_mode = 1;
         if (ds4_engine_continuous_generate(ctx, ds4_mtp_gate_admit, ds4_mtp_gate_on_token,
                                            ds4_mtp_gate_on_done, &gC, rerr, sizeof(rerr)) != 0) {
             GATE_ERR("cont_mtp_gate: MTP C (mode 1) run failed: %s", rerr); rc = 2;
         }
     }
+    ds4_mtp_gate_ud gE = { (const int **)prompts, plens, N, 0u, T, out2, ol2, NULL, 0u, 0u };
+    gE.ctx = ctx;   /* engagement receipt: per-seq spec stats accumulate in on_done */
     if (rc == 0 && gate_accept) {
-        ds4_mtp_gate_ud gE = { (const int **)prompts, plens, N, 0u, T, out2, ol2 };
         ctx->mtp_draft_mode = 2;
         if (ds4_engine_continuous_generate(ctx, ds4_mtp_gate_admit, ds4_mtp_gate_on_token,
                                            ds4_mtp_gate_on_done, &gE, rerr, sizeof(rerr)) != 0) {
@@ -39198,14 +39235,19 @@ int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
 
     if (rc == 0) {
         uint32_t ctrl = GATE_CMP("ctrl A-vs-B", out0, ol0, outD, olD);  /* determinism */
-        uint32_t mism = GATE_CMP("probe A-vs-C", out0, ol0, out1, ol1); /* probe */
-        /* PASS iff the probe adds NO divergence beyond inherent nondeterminism. */
+        /* probe: PASS iff it adds NO divergence beyond inherent nondeterminism;
+         * n/a on a DSpark-only boot (no MTP chain to probe: the verdict rides run E). */
+        uint32_t mism = dspark_only ? 0u : GATE_CMP("probe A-vs-C", out0, ol0, out1, ol1);
         rc = (mism <= ctrl) ? 0 : 1;
         {
             const char *gt = getenv("DS4_CONT_MTP_GATE_TEMP");
             if (gt && atof(gt) > 0.0)
                 fprintf(stderr, "ds4: CONT_MTP_GATE seeded temp=%.2f (full vocab, per-seq seeds)\n", atof(gt));
         }
+        if (dspark_only)
+            fprintf(stderr, "ds4: CONT_MTP_GATE N=%u T=%u ctrl(A!=B)=%u/%u probe(A!=C)=n/a "
+                    "(DSpark-only boot: no MTP chain to probe; verdict = run E below)\n", N, T, ctrl, N);
+        else
         fprintf(stderr, "ds4: CONT_MTP_GATE N=%u T=%u ctrl(A!=B)=%u/%u probe(A!=C)=%u/%u -> %s%s\n",
                 N, T, ctrl, N, mism, N,
                 rc == 0 ? "PASS" : "FAIL",
@@ -39216,7 +39258,19 @@ int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
             uint32_t amis = GATE_CMP("accept A-vs-E", out0, ol0, out2, ol2);
             const char *deg = getenv("DS4_CONT_MTP_DEPTH");
             const int Dg = (deg && deg[0]) ? atoi(deg) : 1;
-            if (Dg <= 0) {
+            /* Engagement receipt: at D>=1 run E must have DRAFTED, or the accept path
+             * never ran (a disarmed drafter, or the DSpark concurrency/kv/quench
+             * auto-gates at N>1 -- multi-bank legs set DS4_DSPARK_MAX_NLIVE=0
+             * DS4_DSPARK_QUENCH=0) and a PASS would be "lossless by luck". */
+            fprintf(stderr, "ds4: CONT_MTP_GATE run E engagement: spec_drafts=%llu spec_hits=%llu over %u seqs (%s)\n",
+                    (unsigned long long)gE.spec_drafts, (unsigned long long)gE.spec_hits, N,
+                    dspark_only ? "DSpark drafter" : "MTP head / armed drafter");
+            if (Dg >= 1 && gE.spec_drafts == 0) {
+                rc = 2;
+                GATE_ERR("cont_mtp_gate: run E produced no drafts (draft source not engaged)");
+                fprintf(stderr, "ds4: CONT_MTP_GATE run E FAIL: no drafts -- the accept path never engaged "
+                        "(check DS4_CONT_DSPARK; for N>1 set DS4_DSPARK_MAX_NLIVE=0 DS4_DSPARK_QUENCH=0)\n");
+            } else if (Dg <= 0) {
                 /* D=0 (M1): the verify is a single [cur] row at width 1, so the accepted
                  * stream MUST be bit-identical to mode-0, within the inherent control band. */
                 const int arc = (amis <= ctrl) ? 0 : 1;
@@ -39257,24 +39311,31 @@ int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
                     uint32_t *fac = NULL, *fbc = NULL, *gac = NULL, *gbc = NULL;
                     uint64_t fanf = 0, fbnf = 0, ganf = 0, gbnf = 0;
                     uint32_t fanc = 0, fbnc = 0, ganc = 0, gbnc = 0;
+                    uint64_t dra = 0, drb = 0, drga = 0, drgb = 0;   /* drafts per forced run */
                     /* rollback ON */
                     int oka = gate_forced_committed_dump(ctx, (const int **)prompts, plens, N, T, 5, from, 0,
-                                                         &fa, &fanf, &fac, &fanc, oa, la, rerr, sizeof(rerr));
+                                                         &fa, &fanf, &fac, &fanc, oa, la, rerr, sizeof(rerr), &dra);
                     int okb = gate_forced_committed_dump(ctx, (const int **)prompts, plens, N, T, 6, from, 0,
-                                                         &fb, &fbnf, &fbc, &fbnc, ob, lb, rerr, sizeof(rerr));
+                                                         &fb, &fbnf, &fbc, &fbnc, ob, lb, rerr, sizeof(rerr), &drb);
                     uint32_t smis = GATE_CMP("pc-streams", oa, la, ob, lb);
                     for (uint32_t s = 0; s < N; s++) { free(oa[s]); free(ob[s]); oa[s] = ob[s] = NULL; }
                     /* SENSITIVITY: rollback OFF */
                     int okga = gate_forced_committed_dump(ctx, (const int **)prompts, plens, N, T, 5, from, 1,
-                                                          &ga, &ganf, &gac, &ganc, oa, la, rerr, sizeof(rerr));
+                                                          &ga, &ganf, &gac, &ganc, oa, la, rerr, sizeof(rerr), &drga);
                     int okgb = gate_forced_committed_dump(ctx, (const int **)prompts, plens, N, T, 6, from, 1,
-                                                          &gb, &gbnf, &gbc, &gbnc, ob, lb, rerr, sizeof(rerr));
+                                                          &gb, &gbnf, &gbc, &gbnc, ob, lb, rerr, sizeof(rerr), &drgb);
                     for (uint32_t s = 0; s < N; s++) { free(oa[s]); free(ob[s]); oa[s] = ob[s] = NULL; }
                     int fsame = 0, sfsame = 0; double mabs = 0, mrel = 0, smabs = 0, smrel = 0;
                     if (oka && okb) gate_cc_compare(fa, fanf, fac, fanc, fb, fbnf, fbc, fbnc, &fsame, &mabs, &mrel);
                     if (okga && okgb) gate_cc_compare(ga, ganf, gac, ganc, gb, gbnf, gbc, gbnc, &sfsame, &smabs, &smrel);
                     const int sens_struct = (!sfsame || smrel > PC_RTOL);   /* rollback-off must diverge */
-                    if (smis != 0) {
+                    if (dra == 0 || drb == 0 || drga == 0 || drgb == 0) {
+                        rc = 2;
+                        fprintf(stderr, "ds4: CONT_MTP_GATE prefix-causality %s FAIL: a forced-draft run produced no drafts "
+                                "(on/on/off/off = %llu/%llu/%llu/%llu; spec never engaged)\n", lbl,
+                                (unsigned long long)dra, (unsigned long long)drb,
+                                (unsigned long long)drga, (unsigned long long)drgb);
+                    } else if (smis != 0) {
                         fprintf(stderr, "ds4: CONT_MTP_GATE prefix-causality %s INCONCLUSIVE "
                                 "(%u/%u forced streams differ -> a forced token matched a genuine one)\n",
                                 lbl, smis, N);

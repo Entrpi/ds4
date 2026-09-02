@@ -20706,11 +20706,13 @@ int main(int argc, char **argv) {
 
     /* S1.1: deterministic MTP gate -- run instead of serving when DS4_CONT_MTP_GATE
      * is set.  Drives the continuous engine over fixed synthetic prompts and asserts
-     * the per-bank MTP draft path is token-identical to the plain decode.  Requires
-     * --mtp (so s.batch_ctx is MTP-enabled).  Exits with the gate's rc. */
+     * the per-bank draft path is token-identical to the plain decode.  Needs a
+     * batch ctx and a draft source: --mtp, or an armed --dspark drafter (the
+     * 0731 / Vision-Exp ship pairings; add DS4_CONT_MTP_ACCEPT there).  Exits
+     * with the gate's rc. */
     if (getenv("DS4_CONT_MTP_GATE") != NULL) {
         if (!s.batch_ctx) {
-            server_log(DS4_LOG_WARNING, "ds4-server: DS4_CONT_MTP_GATE set but no batch ctx (need --mtp); skipping");
+            server_log(DS4_LOG_WARNING, "ds4-server: DS4_CONT_MTP_GATE set but no batch ctx (need --mtp or --dspark on the continuous path); skipping");
             return 2;
         }
         char gerr[256] = {0};
