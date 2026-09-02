@@ -1833,6 +1833,33 @@ to `100` for subsequent tokens. The existing KV cache is kept. Live changes
 are currently limited to local sessions, not distributed inference or network
 tensor parallelism.
 
+## Conversation Prefixes
+
+`ds4` and `ds4-agent` can preload a conversation with `--prefix-file FILE`.
+The file contains complete `USER:` / `ASSISTANT:` pairs:
+
+```text
+USER: Write terse answers.
+This line is still part of the user turn.
+ASSISTANT: Understood.
+USER: Return code without an introduction.
+ASSISTANT: I will return only the code.
+```
+
+A marker starts a new turn only at the beginning of a line. The prefix must
+start with `USER:`, alternate roles, and end with `ASSISTANT:`. It is rendered
+with the model's chat template and prefilled before the live prompt.
+
+```sh
+./ds4 --prefix-file prefix.txt
+./ds4-agent --prefix-file prefix.txt
+```
+
+This can also overcome refusal behavior. For example, when a multi-turn prefix
+shows the assistant writing exploits as part of computer-security work, most
+models will comply with the next computer-security requests. The effect is
+studied in *Many-shot Jailbreaking*.
+
 ## Test Vectors
 
 `tests/test-vectors` contains short and long-context continuation vectors

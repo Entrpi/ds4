@@ -267,6 +267,7 @@ static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "ds4", "Start the interactive prompt.");
     opt(fp, c, "ds4 -p TEXT", "Run one prompt and exit.");
     opt(fp, c, "ds4 --prompt-file FILE", "Run a long prompt from a file and exit.");
+    opt(fp, c, "--prefix-file FILE", "Preload complete alternating USER:/ASSISTANT: turns before the live conversation.");
     fputc('\n', fp);
     if (full) {
         print_cli_diagnostics(fp, c);
@@ -312,6 +313,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Agent Options");
     opt(fp, c, "-p, --prompt TEXT", "Submit an initial prompt after startup.");
     opt(fp, c, "--prompt-file FILE", "Read the initial prompt from FILE.");
+    opt(fp, c, "--prefix-file FILE", "Preload complete alternating USER:/ASSISTANT: turns before the live task.");
     opt(fp, c, "--non-interactive", "Run without TUI. With an initial prompt: one turn; otherwise: repeated stdin prompts.");
     opt(fp, c, "--raw-prompt", "Non-interactive initial prompt only: omit agent chat/tool text.");
     opt(fp, c, "--edit-upto", "Enable anchored [upto] edits and automatic marker insertion.");
