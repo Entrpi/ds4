@@ -4955,14 +4955,6 @@ static float ds4_gpu_positive_infinity(void) {
     return v.f;
 }
 
-static int ds4_gpu_encode_cpy_f32_f32_1d(
-        id<MTLCommandBuffer> cb,
-        id<MTLBuffer>        src,
-        NSUInteger           src_off,
-        id<MTLBuffer>        dst,
-        NSUInteger           dst_off,
-        uint32_t             n);
-
 static int ds4_gpu_encode_cpy_f32_f32_3d(
         id<MTLCommandBuffer> cb,
         id<MTLBuffer>        src,
@@ -23361,6 +23353,46 @@ int ds4_gpu_store_raw_kv_batch_tensor(
     return 1;
 }
 
+typedef struct {
+    uint32_t n_total;
+    uint32_t width;
+    uint32_t ratio;
+    uint32_t pos0;
+} ds4_gpu_cpy_tile_rows_args;
+
+/* dst[t*width + e] = ape[((pos0 + t) % ratio)*width + e] for t < n_tokens,
+ * converting f16 -> f32 when ape_type == 1.  One dispatch for the whole
+ * batch (the previous per-segment copies were n_tokens/ratio encoders). */
+static int ds4_gpu_encode_cpy_ape_tile_rows(
+        id<MTLCommandBuffer> cb,
+        id<MTLBuffer>        ape,
+        NSUInteger           ape_off,
+        uint32_t             ape_type,
+        id<MTLBuffer>        dst,
+        uint32_t             width,
+        uint32_t             ratio,
+        uint32_t             pos0,
+        uint32_t             n_tokens) {
+    if (!cb || !ape || !dst || width == 0 || ratio == 0 || n_tokens == 0) return 0;
+    const uint64_t n_total64 = (uint64_t)n_tokens * width;
+    if (n_total64 > UINT32_MAX) return 0;
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
+        ape_type == 1u ? "kernel_cpy_tile_rows_f16_f32" : "kernel_cpy_tile_rows_f32_f32");
+    if (!pipeline) return 0;
+    ds4_gpu_cpy_tile_rows_args args = { (uint32_t)n_total64, width, ratio, pos0 };
+    const NSUInteger nth = 256;
+    const NSUInteger groups = ((NSUInteger)args.n_total + nth - 1u) / nth;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:ape offset:ape_off atIndex:1];
+    [enc setBuffer:dst offset:0 atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return 1;
+}
+
 static int ds4_gpu_encode_compressor_score_with_ape(
         id<MTLCommandBuffer> cb,
         id<MTLBuffer>        score_src,
@@ -23427,34 +23459,10 @@ static int ds4_gpu_encode_compressor_score_with_ape(
         return 0;
     }
 
-    const uint64_t elem_ape = ape_type == 1u ? 2u : 4u;
-    uint32_t copied_rows = 0;
-    uint32_t pos_mod = pos0 % ratio;
-    while (copied_rows < n_tokens) {
-        uint32_t seg_rows = ratio - pos_mod;
-        if (seg_rows > n_tokens - copied_rows) seg_rows = n_tokens - copied_rows;
-        const uint32_t seg_elems = seg_rows * width;
-        const NSUInteger src_off = ape_offset + (NSUInteger)pos_mod * width * elem_ape;
-        const NSUInteger dst_off = (NSUInteger)copied_rows * width * sizeof(float);
-        int ok;
-        if (ape_type == 1u) {
-            ok = ds4_gpu_encode_cpy_f16_f32_1d(cb,
-                                                 apebuf,
-                                                 src_off,
-                                                 g_compressor_store_ape_buffer,
-                                                 dst_off,
-                                                 seg_elems);
-        } else {
-            ok = ds4_gpu_encode_cpy_f32_f32_1d(cb,
-                                                 apebuf,
-                                                 src_off,
-                                                 g_compressor_store_ape_buffer,
-                                                 dst_off,
-                                                 seg_elems);
-        }
-        if (!ok) return 0;
-        copied_rows += seg_rows;
-        pos_mod = 0;
+    if (!ds4_gpu_encode_cpy_ape_tile_rows(cb, apebuf, ape_offset, ape_type,
+                                          g_compressor_store_ape_buffer,
+                                          width, ratio, pos0, n_tokens)) {
+        return 0;
     }
 
     return ds4_gpu_encode_add_f32_1d(cb,
@@ -23687,34 +23695,9 @@ int ds4_gpu_compressor_store_batch_tensor(
             return 0;
         }
 
-        int ok = 1;
-        uint32_t copied_rows = 0;
-        uint32_t pos_mod = pos0 % ratio;
-        while (ok && copied_rows < n_tokens) {
-            uint32_t seg_rows = ratio - pos_mod;
-            if (seg_rows > n_tokens - copied_rows) seg_rows = n_tokens - copied_rows;
-            const uint32_t seg_elems = seg_rows * width;
-            const NSUInteger src_off = (NSUInteger)ape_inner +
-                                       (NSUInteger)pos_mod * width * elem_ape;
-            const NSUInteger dst_off = (NSUInteger)copied_rows * width * sizeof(float);
-            if (ape_type == 1u) {
-                ok = ds4_gpu_encode_cpy_f16_f32_1d(cb,
-                                                     apebuf,
-                                                     src_off,
-                                                     g_compressor_store_ape_buffer,
-                                                     dst_off,
-                                                     seg_elems);
-            } else {
-                ok = ds4_gpu_encode_cpy_f32_f32_1d(cb,
-                                                     apebuf,
-                                                     src_off,
-                                                     g_compressor_store_ape_buffer,
-                                                     dst_off,
-                                                     seg_elems);
-            }
-            copied_rows += seg_rows;
-            pos_mod = 0;
-        }
+        int ok = ds4_gpu_encode_cpy_ape_tile_rows(cb, apebuf, (NSUInteger)ape_inner, ape_type,
+                                                  g_compressor_store_ape_buffer,
+                                                  width, ratio, pos0, n_tokens);
 
         if (ok) {
             ok = ds4_gpu_encode_add_f32_1d(cb,
@@ -26898,32 +26881,6 @@ int ds4_gpu_attention_output_low_q4_K_slice_tensor(
 
 static NSUInteger ds4_gpu_align_up_ns(NSUInteger value, NSUInteger align) {
     return (value + align - 1u) & ~(align - 1u);
-}
-
-static int ds4_gpu_encode_cpy_f32_f32_1d(
-        id<MTLCommandBuffer> cb,
-        id<MTLBuffer>        src,
-        NSUInteger           src_off,
-        id<MTLBuffer>        dst,
-        NSUInteger           dst_off,
-        uint32_t             n) {
-    if (!cb || !src || !dst || n == 0) return 0;
-
-    ds4_gpu_cpy_args args =
-        ds4_gpu_make_cpy_1d_args(n, sizeof(float), sizeof(float));
-    const NSUInteger nth = ds4_gpu_cpy_threads(n, g_cpy_f32_f32_pipeline);
-    const NSUInteger groups = ((NSUInteger)n + nth - 1u) / nth;
-
-    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    [enc setComputePipelineState:g_cpy_f32_f32_pipeline];
-    [enc setBytes:&args length:sizeof(args) atIndex:0];
-    [enc setBuffer:src offset:src_off atIndex:1];
-    [enc setBuffer:dst offset:dst_off atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
-    ds4_gpu_end_compute_encoder(cb, enc);
-
-    return 1;
 }
 
 static int ds4_gpu_encode_cpy_f32_f32_3d(

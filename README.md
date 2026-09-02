@@ -936,7 +936,7 @@ README prompt):
 |---|---|---|
 | decode, 128-token context | ~47-48 t/s | ~11 t/s |
 | decode, 2048-token context | ~48 t/s | |
-| prefill | ~100 t/s at 128 tokens, ~565 t/s at 2048 | ~10 t/s |
+| prefill | ~240 t/s at 128 tokens, ~785 t/s at 2048 | ~10 t/s |
 | startup | ~10 s per Mac (pins its shard) | |
 
 Things that cost speed on the coordinator: a remote screen-sharing session
@@ -952,7 +952,10 @@ for diagnosis (set them on both machines): `DS4_TP_DISABLE_POLL_GATES=1`
 `DS4_TP_STATIC_SHARED_SPLIT=1` (fixed shared-expert halves instead of the
 per-token GPU-decided split), `DS4_TP_DISABLE_FLAG_FOLD=1`,
 `DS4_METAL_DISABLE_KV_NORM_DEFER=1`, `DS4_METAL_DISABLE_M5_ROUTER_PROJECT_SELECT_FUSE=1`,
-`DS4_TP_DISABLE_RDMA_WARMUP=1`. `DS4_TP_GATE_PROFILE=1` prints per-gate wait
+`DS4_TP_DISABLE_RDMA_WARMUP=1`, `DS4_METAL_DISABLE_MXFP4_MM_ID_MPP=1` (simdgroup
+instead of TensorOps routed-expert prefill GEMMs), `DS4_METAL_DISABLE_QUEUE_KEEPALIVE=1`
+(no idle keepalive on the Metal command queue: the first command buffer after
+~3 s of GPU idleness then starts 600-800 ms late). `DS4_TP_GATE_PROFILE=1` prints per-gate wait
 statistics on each rank at exit; `DS4_METAL_ENCODER_TIMELINE=<file>` writes
 a per-kernel GPU timeline (`misc/tp_tools/tl_analyze.py` reads it).
 `DS4_TP_LANE_BIAS=1` enables a runtime rank-speed balancing of the shared
