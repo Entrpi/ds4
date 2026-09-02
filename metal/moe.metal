@@ -9184,6 +9184,8 @@ typedef decltype(kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, ha
 template [[host_name("kernel_mul_mm_id_iq2_xxs_f32_mpp")]] kernel mul_mm_id_mpp_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q2_K_f16_mpp")]]    kernel mul_mm_id_mpp_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_f16_mpp")]] kernel mul_mm_id_mpp_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_mxfp4_f32_mpp")]]   kernel mul_mm_id_mpp_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_mxfp4_f16_mpp")]]   kernel mul_mm_id_mpp_f16_rhs_t kernel_mul_mm_id_mpp<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_mxfp4, 2, dequantize_mxfp4, half, half4x4, half, half2x4>;
 
 typedef decltype(kernel_attn_out_low_mpp_direct_rhs<
         block_q8_0, 2, dequantize_q8_0_pairs, 64>)

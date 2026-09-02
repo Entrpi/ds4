@@ -43165,6 +43165,27 @@ int ds4_gpu_routed_moe_batch_tensor(
                     if (mpp_mask & 2) up_mm_pipeline = mpp;
                 }
             }
+            /* MXFP4 routed experts on the TensorOps pipeline (M5 nax units):
+             * same half weights x half activations with f32 accumulation as
+             * the simdgroup kernel, different accumulation order.
+             * DS4_METAL_DISABLE_MXFP4_MM_ID_MPP=1 keeps the simdgroup kernels. */
+            static int mxfp4_mpp = -1;
+            if (mxfp4_mpp < 0)
+                mxfp4_mpp = getenv("DS4_METAL_DISABLE_MXFP4_MM_ID_MPP") == NULL;
+            if (mpp_mask && mxfp4_mpp && gate_type == DS4_METAL_TENSOR_MXFP4) {
+                id<MTLComputePipelineState> mpp =
+                    ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_mxfp4_f32_mpp", false);
+                if (mpp) {
+                    if (mpp_mask & 1) gate_mm_pipeline = mpp;
+                    if (mpp_mask & 2) up_mm_pipeline = mpp;
+                }
+            }
+            if ((mpp_mask & 4) && mxfp4_mpp && request_mid_f16 &&
+                down_type == DS4_METAL_TENSOR_MXFP4) {
+                id<MTLComputePipelineState> mpp =
+                    ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_mxfp4_f16_mpp", false);
+                if (mpp) down_mm_pipeline = mpp;
+            }
             if ((mpp_mask & 4) && request_mid_f16 &&
                 (down_type == DS4_METAL_TENSOR_Q2_K || down_type == DS4_METAL_TENSOR_IQ2_XXS)) {
                 id<MTLComputePipelineState> mpp = ds4_gpu_get_mul_mm_id_pipeline(
