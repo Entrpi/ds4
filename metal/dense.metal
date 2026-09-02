@@ -197,6 +197,22 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// Four rows per threadgroup: the same per-row K walk and reduction tree
+// (bit-exact with the two-row kernel), twice the bytes in flight per
+// threadgroup.  Selected by DS4_METAL_Q8_MV_NR0=4.
+[[host_name("kernel_mul_mv_q8_0_f32_r4")]]
+kernel void kernel_mul_mv_q8_0_f32_r4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<4, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
 // K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
 // poll-gate flag published by the last-arriving threadgroup (see
@@ -339,6 +355,27 @@ kernel void kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_dsv4_mul_mv_q8_0_f32_tp_flag_impl<N_R0_Q8_0>(
+            args, flag, check, value, ctl, ntg, src0, src1, dst, shmem,
+            ctl_shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked_r4")]]
+kernel void kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked_r4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device atomic_uint & flag,
+        device atomic_uint & check,
+        constant uint & value,
+        device atomic_uint * ctl,
+        constant uint & ntg,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        threadgroup  uint * ctl_shmem [[threadgroup(1)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_dsv4_mul_mv_q8_0_f32_tp_flag_impl<4>(
             args, flag, check, value, ctl, ntg, src0, src1, dst, shmem,
             ctl_shmem, tgpig, tiisg, sgitg);
 }

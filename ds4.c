@@ -28702,6 +28702,7 @@ static bool metal_graph_encode_token_raw_swa(
             (void)ds4_gpu_tp_gate_prefetch_plan(DS4_TP_GATE_ATTN, model->map, model->size,
                                                 attn_off, attn_bytes,
                                                 moe_layer ? (shared_split_static ? 5u : 7u) : 0u);
+
             if (il + 1u < DS4_N_LAYER &&
                 weights->layer[il + 1u].attn_q_a && weights->layer[il + 1u].attn_kv &&
                 weights->layer[il + 1u].attn_compressor_kv &&

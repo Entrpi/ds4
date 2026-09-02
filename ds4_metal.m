@@ -5321,6 +5321,22 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     };
 }
 
+/* Q8_0 matvec dispatch for the plain f32 kernel family, honouring
+ * DS4_METAL_Q8_MV_NR0 (2 or 4 rows per threadgroup; the four-row kernels
+ * are bit-exact with the two-row ones).  Only for call sites that bind the
+ * dispatch's own function_name. */
+static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch_r(void) {
+    ds4_gpu_mv_dispatch d = ds4_gpu_make_q8_0_mv_dispatch();
+    static int nr0 = -1;
+    if (nr0 < 0) nr0 = (int)ds4_gpu_env_u64("DS4_METAL_Q8_MV_NR0", 2u, 2u, 4u);
+    if (nr0 == 4) {
+        d.function_name = "kernel_mul_mv_q8_0_f32_r4";
+        d.nr0 = 4;
+        d.smem = 32u * 4u * sizeof(float);
+    }
+    return d;
+}
+
 static ds4_gpu_mv_dispatch ds4_gpu_make_plain_mv_dispatch(
         uint64_t in_dim,
         int      f32_weights) {
@@ -10295,6 +10311,49 @@ int ds4_gpu_tp_gate_prefetch_plan(uint32_t gate,
 /* Encode the touch dispatches of one gate's plan into the open batch. */
 static uint64_t ds4_gpu_buffer_address(id<MTLBuffer> buffer, NSUInteger inner);
 
+/* One dispatch of kernel_touch_u8_stride_table over up to DS4_TP_PREFETCH_MAX
+ * model ranges (priority order, cut at `budget` bytes), 128 B per thread. */
+static void ds4_gpu_encode_touch_table(id<MTLComputeCommandEncoder> enc,
+                                       id<MTLComputePipelineState> touch,
+                                       const ds4_tp_prefetch_range *plan,
+                                       uint32_t n,
+                                       uint64_t budget) {
+    const uint64_t stride = 128;
+    uint64_t addr[DS4_TP_PREFETCH_MAX] = {0};
+    uint32_t lines[DS4_TP_PREFETCH_MAX] = {0};
+    id<MTLResource> views[DS4_TP_PREFETCH_MAX];
+    uint32_t count = 0;
+    uint64_t total_lines = 0;
+    for (uint32_t i = 0; i < n && budget != 0u; i++) {
+        uint64_t inner = 0;
+        uint64_t bytes = plan[i].bytes;
+        if (bytes > budget) bytes = budget;
+        budget -= bytes;
+        if (bytes == 0u) continue;
+        id<MTLBuffer> src = ds4_gpu_wrap_model_range(
+            g_tp_prefetch_map, g_tp_prefetch_map_size, plan[i].offset, bytes, &inner);
+        if (!src) continue;
+        const uint64_t range_lines = (bytes + stride - 1u) / stride;
+        if (total_lines + range_lines > (1u << 20)) break;
+        const uint64_t address = ds4_gpu_buffer_address(src, (NSUInteger)inner);
+        if (address == 0u) continue;
+        addr[count] = address;
+        lines[count] = (uint32_t)range_lines;
+        views[count] = src;
+        total_lines += range_lines;
+        count++;
+    }
+    if (count == 0u) return;
+    [enc setComputePipelineState:touch];
+    [enc useResources:views count:count usage:MTLResourceUsageRead];
+    [enc setBytes:addr length:sizeof(addr) atIndex:0];
+    [enc setBytes:lines length:sizeof(lines) atIndex:1];
+    [enc setBytes:&count length:sizeof(count) atIndex:2];
+    [enc setBuffer:g_tp_prefetch_scratch offset:0 atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((total_lines + 255u) / 256u), 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
 static int ds4_gpu_tp_encode_gate_prefetch(uint32_t gate) {
     const uint32_t n = g_tp_prefetch_count[gate];
     g_tp_prefetch_count[gate] = 0;
@@ -10326,42 +10385,8 @@ static int ds4_gpu_tp_encode_gate_prefetch(uint32_t gate) {
         : 0u;
     if (wait_us == 0.0) budget = 4u << 20;
     if (budget == 0u) return 1;
-    const uint64_t stride = 128;
-    uint64_t addr[DS4_TP_PREFETCH_MAX] = {0};
-    uint32_t lines[DS4_TP_PREFETCH_MAX] = {0};
-    id<MTLResource> views[DS4_TP_PREFETCH_MAX];
-    uint32_t count = 0;
-    uint64_t total_lines = 0;
-    for (uint32_t i = 0; i < n && budget != 0u; i++) {
-        uint64_t inner = 0;
-        uint64_t bytes = g_tp_prefetch_plan[gate][i].bytes;
-        if (bytes > budget) bytes = budget;
-        budget -= bytes;
-        if (bytes == 0u) continue;
-        id<MTLBuffer> src = ds4_gpu_wrap_model_range(
-            g_tp_prefetch_map, g_tp_prefetch_map_size,
-            g_tp_prefetch_plan[gate][i].offset, bytes, &inner);
-        if (!src) continue;
-        const uint64_t range_lines = (bytes + stride - 1u) / stride;
-        if (total_lines + range_lines > (1u << 20)) break;
-        const uint64_t address = ds4_gpu_buffer_address(src, (NSUInteger)inner);
-        if (address == 0u) continue;
-        addr[count] = address;
-        lines[count] = (uint32_t)range_lines;
-        views[count] = src;
-        total_lines += range_lines;
-        count++;
-    }
-    if (count == 0u) return 1;
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
-    [enc setComputePipelineState:touch];
-    [enc useResources:views count:count usage:MTLResourceUsageRead];
-    [enc setBytes:addr length:sizeof(addr) atIndex:0];
-    [enc setBytes:lines length:sizeof(lines) atIndex:1];
-    [enc setBytes:&count length:sizeof(count) atIndex:2];
-    [enc setBuffer:g_tp_prefetch_scratch offset:0 atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((total_lines + 255u) / 256u), 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    ds4_gpu_encode_touch_table(enc, touch, g_tp_prefetch_plan[gate], n, budget);
     ds4_gpu_end_compute_encoder(g_batch_cb, enc);
     return 1;
 }
@@ -19136,7 +19161,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             }
 
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
-            ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+            ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch_r();
             if (out_dim > 65536u) mv_dispatch.nsg = 8;
             mv_args.nr0 = mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
@@ -19414,7 +19439,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
                 &inner_offset);
         if (!wbuf) return 0;
 
-        ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch_r();
         if (out_dim > 65536u) dispatch.nsg = 8;
         ds4_gpu_q8_0_matvec_args args =
             ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
@@ -19876,7 +19901,7 @@ int ds4_gpu_matmul_q8_0_rows_scalar_tensor(
         if (!wbuf) return 0;
 
         ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
-        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch_r();
         if (out_dim > 65536u) mv_dispatch.nsg = 8;
         mv_args.nr0 = mv_dispatch.nr0;
         id<MTLComputePipelineState> pipeline =
@@ -25953,7 +25978,7 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(full_in_dim, out_dim);
         mv_args.ne00 = (int32_t)k_cnt;
         mv_args.ne10 = (int32_t)k_cnt;
-        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch_r();
         if (out_dim > 65536u) mv_dispatch.nsg = 8;
         mv_args.nr0 = mv_dispatch.nr0;
         /* TP partial producer: publish the gate's checked flag from the
@@ -25963,7 +25988,9 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
             ds4_gpu_tp_flag_fold_take(out, out_dim * sizeof(float), &fold_slot, &fold_value);
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline(
-                fold ? "kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked" : mv_dispatch.function_name,
+                fold ? (mv_dispatch.nr0 == 4 ? "kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked_r4"
+                                             : "kernel_dsv4_mul_mv_q8_0_f32_tp_flag_checked")
+                     : mv_dispatch.function_name,
                 mv_dispatch.nsg);
         if (!pipeline) return 0;
         const NSUInteger ntg =
