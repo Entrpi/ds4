@@ -396,6 +396,11 @@ Run it with the normal sampling defaults:
 ```
 
 `--mtp-model` supplies the support GGUF, while `--dspark` selects the DSpark runtime.
+Measured on a MacBook Pro M5 Max with the Q2 Flash model fully resident
+(README prose prompt, 128-token context): plain decode 46.5 t/s, DSpark
+36-44 t/s depending on the confidence threshold (30-55% of draft tokens
+accepted; every verified draft row re-streams its routed experts, about a
+third of a token's cost). Expect gains only on highly predictable text.
 The default confidence threshold is `0.6` on Metal and `0.7` on CUDA and ROCm.
 It prunes suffixes that are unlikely to repay their verification cost.
 `--dspark-confidence 0` forces fixed five-token blocks and is intended for
