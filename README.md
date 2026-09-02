@@ -888,6 +888,77 @@ token-by-token prefill that exactly matches the single-machine arithmetic).
 The split graph is deterministic, but its changed floating-point reduction
 order is not generally byte-identical to single-machine execution.
 
+### Running DeepSeek V4 Flash across two 128 GB MacBooks
+
+The same mode runs DeepSeek V4 Flash (145 GB in the MXFP4 recipe, which does
+not fit one 128 GB Mac without SSD streaming). Each Mac keeps its half of the
+routed experts resident (~77 GiB) plus the replicated dense weights; the
+per-layer exchanges are 16 KB and ride as single RDMA messages.
+
+One-time setup per boot, on **both** machines (as for GLM above):
+
+```sh
+sudo sysctl iogpu.wired_limit_mb=120000
+sudo ifconfig en1 inet 10.99.0.2/30 alias     # machine A (coordinator), its Thunderbolt member interface
+sudo ifconfig en6 inet 10.99.0.1/30 alias     # machine B (worker)
+rdma_ctl status                               # "enabled" on both
+```
+
+Both machines need the same tree, the same commit, and the model at the same
+relative path. Start the worker in a terminal that stays open (an interactive
+`ssh -tt` session is fine; a detached `nohup` worker cannot reach the
+coordinator on macOS), then the coordinator; the worker retries until the
+coordinator listens. Do not probe the coordinator's port with `nc` or `curl`
+while it waits: it accepts the probe as the worker and fails.
+
+```sh
+MODEL=gguf/DeepSeek-V4-Flash-Vision-Exp-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out.gguf
+VISION=gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf   # omit --vision for the text-only model
+
+# Machine B: worker.
+./ds4 -m "$MODEL" --vision "$VISION" --tensor-parallel --role worker \
+  --coordinator 10.99.0.2 9911 --transport rdma --rdma-device rdma_en6 --rdma-gid-index 1
+
+# Machine A: coordinator, interactive chat (use /read photo.png to send an image).
+./ds4 -m "$MODEL" --vision "$VISION" --tensor-parallel --role coordinator \
+  --listen 10.99.0.2 9911 --transport rdma --rdma-device rdma_en1 --rdma-gid-index 1 -c 8192
+```
+
+The text-only `DeepSeek-V4-Flash-0731-MXFP4Experts-...-chat-v2-mxfp4.gguf`
+file has the same layers and tensor types and runs identically. Other
+quantization recipes (IQ2, Q4_K experts) run too, but the fastest paths gate
+on MXFP4 experts with Q8 attention and shared-expert tensors.
+
+Measured on two M5 Max 128 GB MacBooks over Thunderbolt 5 (MXFP4 recipe,
+README prompt):
+
+| | two Macs, tensor parallel | one Mac, SSD streaming |
+|---|---|---|
+| decode, 128-token context | ~47-48 t/s | ~11 t/s |
+| decode, 2048-token context | ~48 t/s | |
+| prefill | ~100 t/s at 128 tokens, ~565 t/s at 2048 | ~10 t/s |
+| startup | ~10 s per Mac (pins its shard) | |
+
+Things that cost speed on the coordinator: a remote screen-sharing session
+or an animated wallpaper (the display compositor takes GPU time from the
+decode, up to 10%), and anything else using the GPU. Benchmark with the
+screen idle. The first run after swapping roles between the two Macs can fail
+at the first prefill round with `timeout waiting for bulk RDMA round`; start
+both again.
+
+The fast paths are on by default; environment variables exist to opt out
+for diagnosis (set them on both machines): `DS4_TP_DISABLE_POLL_GATES=1`
+(shared-event gates instead of the poll gates), `DS4_TP_DISABLE_GATE_PREFETCH=1`,
+`DS4_TP_STATIC_SHARED_SPLIT=1` (fixed shared-expert halves instead of the
+per-token GPU-decided split), `DS4_TP_DISABLE_FLAG_FOLD=1`,
+`DS4_METAL_DISABLE_KV_NORM_DEFER=1`, `DS4_METAL_DISABLE_M5_ROUTER_PROJECT_SELECT_FUSE=1`,
+`DS4_TP_DISABLE_RDMA_WARMUP=1`. `DS4_TP_GATE_PROFILE=1` prints per-gate wait
+statistics on each rank at exit; `DS4_METAL_ENCODER_TIMELINE=<file>` writes
+a per-kernel GPU timeline (`misc/tp_tools/tl_analyze.py` reads it).
+`DS4_TP_LANE_BIAS=1` enables a runtime rank-speed balancing of the shared
+expert (useful only when one Mac is measurably slower; it makes the output
+depend on timing).
+
 ## Tensor Parallelism across CUDA GPUs
 
 On a single CUDA server, `--cuda-tensor-parallel` splits DeepSeek V4 Flash
