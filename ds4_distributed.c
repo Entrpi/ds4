@@ -4941,6 +4941,10 @@ int ds4_dist_session_save_payload(
         if (dist_payload_write_u32(fp, (uint32_t)tokens->v[i], err, errlen) != 0)
             goto cleanup;
     }
+    /* v4 image lineage: distributed roles never hold image state (S refuses
+     * --vision on a role), so the list is always empty. */
+    if (dist_payload_write_u32(fp, 0u, err, errlen) != 0)
+        goto cleanup;
     if (dist_payload_write_bytes(fp, logits,
                                  (uint64_t)vocab * sizeof(logits[0]),
                                  err, errlen) != 0)
@@ -4993,11 +4997,14 @@ int ds4_dist_session_load_payload(
         if (dist_payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0)
             return 1;
     }
+    /* v3 (pre-lineage) and v4 share every field this reader consumes; a v4
+     * file adds the image lineage count after the tokens (must be 0 here). */
     if (h[0] != DS4_SESSION_PAYLOAD_MAGIC ||
-        h[1] != DS4_SESSION_PAYLOAD_VERSION) {
+        (h[1] != UINT32_C(3) && h[1] != DS4_SESSION_PAYLOAD_VERSION)) {
         if (errlen) snprintf(err, errlen, "unsupported DS4 KV payload version");
         return 1;
     }
+    const uint32_t dist_payload_version = h[1];
     ds4_dist_kv_layout layout = {
         .ctx = h[2],
         .prefill_cap = h[3],
@@ -5052,6 +5059,19 @@ int ds4_dist_session_load_payload(
             return 1;
         }
         tokens[i] = (int)tok;
+    }
+    if (dist_payload_version >= 4) {
+        uint32_t image_count = 0;
+        if (dist_payload_read_u32(fp, &image_count, &remaining, err, errlen) != 0 ||
+            image_count != 0) {
+            free(tokens);
+            free(logits);
+            free(n_comp);
+            free(n_index_comp);
+            if (image_count != 0 && errlen)
+                snprintf(err, errlen, "distributed KV payload carries image lineage; distributed roles do not serve image state");
+            return 1;
+        }
     }
     int empty_token_sentinel = 0;
     int *tokens_arg = layout.token_count ? tokens : &empty_token_sentinel;

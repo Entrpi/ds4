@@ -3683,7 +3683,13 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
     }
 
     char load_err[160] = {0};
-    if (ok && hdr.payload_bytes == 0) {
+    if (ok && hdr.payload_bytes == 0 &&
+        ds4_kvstore_text_has_image_marker(text, text_bytes)) {
+        /* inc 8: a stripped session is rebuilt by re-tokenizing its text;
+         * an image block has no text form. */
+        snprintf(err, err_len, "stripped session carries image blocks and cannot be rebuilt from text");
+        ok = false;
+    } else if (ok && hdr.payload_bytes == 0) {
         ds4_tokens rebuilt = {0};
         ds4_tokenize_rendered_chat(w->engine, text, &rebuilt);
         expected_tokens = (uint32_t)rebuilt.len;
@@ -3750,9 +3756,16 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     const int model_id = ds4_engine_model_id(w->engine);
 
     size_t text_len = 0;
-    char *text = ds4_kvstore_render_tokens_text(w->engine, tokens, &text_len);
+    /* inc 8: the key carries the live checkpoint's image lineage as markers
+     * (tokens == live was checked above, so the identities apply). */
+    const ds4_vision_identity *ids = NULL;
+    const size_t n_ids = ds4_session_vision_identities(w->session, &ids);
+    char render_err[160] = {0};
+    char *text = ds4_kvstore_render_tokens_text_lineage(w->engine, tokens, ids, n_ids,
+                                                        &text_len, render_err, sizeof(render_err));
     if (!text) {
-        snprintf(err, err_len, "failed to render KV text key");
+        snprintf(err, err_len, "failed to render KV text key%s%s",
+                 render_err[0] ? ": " : "", render_err);
         return false;
     }
     if (text_len > UINT32_MAX) {
@@ -4174,8 +4187,10 @@ static bool agent_worker_save_session_now(agent_worker *w, char sha_out[41],
     }
 
     size_t text_len = 0;
-    char *text = ds4_kvstore_render_tokens_text(w->engine, &w->transcript,
-                                                &text_len);
+    const ds4_vision_identity *ids = NULL;   /* inc 8: image blocks render as identity markers */
+    const size_t n_ids = ds4_session_vision_identities(w->session, &ids);
+    char *text = ds4_kvstore_render_tokens_text_lineage(w->engine, &w->transcript, ids, n_ids,
+                                                        &text_len, NULL, 0);
     if (!text) {
         snprintf(err, err_len, "failed to render session text");
         return false;
@@ -4750,8 +4765,10 @@ static bool agent_worker_show_history(agent_worker *w, int user_turns,
         return false;
     }
     size_t text_len = 0;
-    char *text = ds4_kvstore_render_tokens_text(w->engine, &w->transcript,
-                                                &text_len);
+    const ds4_vision_identity *ids = NULL;   /* inc 8: image blocks render as identity markers */
+    const size_t n_ids = ds4_session_vision_identities(w->session, &ids);
+    char *text = ds4_kvstore_render_tokens_text_lineage(w->engine, &w->transcript, ids, n_ids,
+                                                        &text_len, NULL, 0);
     if (!text) {
         snprintf(err, err_len, "failed to render session text");
         return false;

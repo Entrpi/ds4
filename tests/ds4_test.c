@@ -1838,6 +1838,233 @@ static void test_vision_prompt_group(void) {
     printf("vision-prompt: ok\n");
 }
 
+/* Track B inc 8 (cache safety): a piece source that needs no model.  Token 7
+ * renders the raw marker bytes so the escape can be pinned; everything else
+ * renders "t<id>". */
+static char *test_cache_piece(void *ud, int token, size_t *len) {
+    (void)ud;
+    char *s = malloc(24);
+    TEST_ASSERT(s != NULL);
+    if (token == 7) { memcpy(s, "\036DS4_IMAGE_\037", 12); s[12] = '\0'; *len = 12; return s; }
+    const int n = snprintf(s, 24, "t%d", token);
+    *len = (size_t)n;
+    return s;
+}
+
+static void test_vision_cache_group(void) {
+    enum { NV = 100 };   /* the stub vocabulary: ids >= NV are image rows */
+    const int S0 = NV + 0, S1 = NV + 1, S2 = NV + 2, S4 = NV + 4;
+    char err[256];
+    size_t len = 0;
+    ds4_vision_identity idA = { 1, 4, {0} }, idB = { 1, 4, {0} };
+    memset(idA.identity, 0xA1, 32);
+    memset(idB.identity, 0xB2, 32);
+    char markA[DS4_KVSTORE_IMAGE_MARKER_LEN + 1], markB[DS4_KVSTORE_IMAGE_MARKER_LEN + 1];
+    ds4_kvstore_image_marker(idA.identity, markA);
+    ds4_kvstore_image_marker(idB.identity, markB);
+    TEST_ASSERT(strlen(markA) == DS4_KVSTORE_IMAGE_MARKER_LEN && markA[0] == '\036' && markA[DS4_KVSTORE_IMAGE_MARKER_LEN - 1] == '\037');
+    TEST_ASSERT(memcmp(markA, "\036DS4_IMAGE_a1a1", 15) == 0 && memcmp(markB, "\036DS4_IMAGE_b2b2", 15) == 0);
+
+    /* (a) text streams render exactly as before (byte-identical, no lineage). */
+    {
+        const int toks[3] = { 1, 2, 3 };
+        char *t = ds4_kvstore_render_text_core(test_cache_piece, NULL, toks, 3, NV, NULL, 0, &len, err, sizeof(err));
+        TEST_ASSERT(t && len == 6 && memcmp(t, "t1t2t3", 6) == 0);
+        free(t);
+    }
+    /* (b) an image block renders as ONE identity marker: same image -> same key,
+     *     different image -> different key (and a different sha), never the empty
+     *     string the lineage-less renderer used to produce for synthetic ids. */
+    {
+        const int toks[6] = { 1, S0, S2, S4, S1, 2 };   /* [t1][START IMAGE END PAD][t2] shape-wise: any synthetic run */
+        char *ta = ds4_kvstore_render_text_core(test_cache_piece, NULL, toks, 6, NV, &idA, 1, &len, err, sizeof(err));
+        TEST_ASSERT(ta && len == 2 + DS4_KVSTORE_IMAGE_MARKER_LEN + 2);
+        TEST_ASSERT(memcmp(ta, "t1", 2) == 0 && memcmp(ta + 2, markA, DS4_KVSTORE_IMAGE_MARKER_LEN) == 0 &&
+                    memcmp(ta + 2 + DS4_KVSTORE_IMAGE_MARKER_LEN, "t2", 2) == 0);
+        size_t lenb = 0;
+        char *tb = ds4_kvstore_render_text_core(test_cache_piece, NULL, toks, 6, NV, &idB, 1, &lenb, err, sizeof(err));
+        TEST_ASSERT(tb && lenb == len && memcmp(ta, tb, len) != 0);
+        char sha_a[41], sha_b[41];
+        ds4_kvstore_sha1_bytes_hex(ta, len, sha_a);
+        ds4_kvstore_sha1_bytes_hex(tb, lenb, sha_b);
+        TEST_ASSERT(strcmp(sha_a, sha_b) != 0);
+        TEST_ASSERT(ds4_kvstore_text_has_image_marker(ta, len));
+        TEST_ASSERT(!ds4_kvstore_text_has_image_marker("t1t2t3", 6));
+        TEST_ASSERT(ds4_kvstore_text_lineage_matches(ta, len, &idA, 1));
+        TEST_ASSERT(!ds4_kvstore_text_lineage_matches(ta, len, &idB, 1));
+        TEST_ASSERT(!ds4_kvstore_text_lineage_matches(ta, len, NULL, 0));      /* an image key over a text lineage */
+        TEST_ASSERT(!ds4_kvstore_text_lineage_matches("t1t2", 4, &idA, 1));   /* a text key over an image lineage */
+        TEST_ASSERT(ds4_kvstore_text_lineage_matches("t1t2", 4, NULL, 0));
+        /* the second copy of the same block, in order */
+        ds4_vision_identity two[2] = { idA, idB };
+        two[1].token_start = 7;
+        const int toks2[11] = { 1, S0, S2, S4, S1, 2, 3, S0, S2, S4, S1 };
+        size_t len2 = 0;
+        char *t2 = ds4_kvstore_render_text_core(test_cache_piece, NULL, toks2, 11, NV, two, 2, &len2, err, sizeof(err));
+        TEST_ASSERT(t2 && len2 == 2 * DS4_KVSTORE_IMAGE_MARKER_LEN + 6);
+        TEST_ASSERT(ds4_kvstore_text_lineage_matches(t2, len2, two, 2));
+        ds4_vision_identity swapped[2] = { two[1], two[0] };
+        swapped[0].token_start = 1; swapped[1].token_start = 7;
+        TEST_ASSERT(!ds4_kvstore_text_lineage_matches(t2, len2, swapped, 2));   /* order matters */
+        free(ta); free(tb); free(t2);
+    }
+    /* (c) refusals by name: image rows without lineage; lineage over text rows;
+     *     lineage past the stream; lineage the stream never reaches. */
+    {
+        const int toks[6] = { 1, S0, S2, S4, S1, 2 };
+        TEST_ASSERT(ds4_kvstore_render_text_core(test_cache_piece, NULL, toks, 6, NV, NULL, 0, &len, err, sizeof(err)) == NULL);
+        TEST_ASSERT(strstr(err, "no lineage entry") != NULL && len == 0);
+        ds4_vision_identity bad = idA; bad.token_start = 0;             /* covers t1 */
+        TEST_ASSERT(ds4_kvstore_render_text_core(test_cache_piece, NULL, toks, 6, NV, &bad, 1, &len, err, sizeof(err)) == NULL);
+        TEST_ASSERT(strstr(err, "covers text rows") != NULL);
+        bad = idA; bad.token_count = 6;                                  /* past the end */
+        TEST_ASSERT(ds4_kvstore_render_text_core(test_cache_piece, NULL, toks, 6, NV, &bad, 1, &len, err, sizeof(err)) == NULL);
+        TEST_ASSERT(strstr(err, "exceeds") != NULL);
+        bad = idA; bad.token_start = 9;                                  /* never reached (and the rows go unkeyed) */
+        TEST_ASSERT(ds4_kvstore_render_text_core(test_cache_piece, NULL, toks, 6, NV, &bad, 1, &len, err, sizeof(err)) == NULL);
+        const int text_only[2] = { 1, 2 };
+        bad = idA; bad.token_start = 5;
+        TEST_ASSERT(ds4_kvstore_render_text_core(test_cache_piece, NULL, text_only, 2, NV, &bad, 1, &len, err, sizeof(err)) == NULL);
+        TEST_ASSERT(strstr(err, "beyond") != NULL);
+    }
+    /* (d) a marker cannot be forged from token text: 0x1E/0x1F are escaped, the
+     *     scanner ignores escape pairs, and the escaped form is still injective. */
+    {
+        const int toks[3] = { 1, 7, 2 };
+        char *t = ds4_kvstore_render_text_core(test_cache_piece, NULL, toks, 3, NV, NULL, 0, &len, err, sizeof(err));
+        TEST_ASSERT(t && len == 2 + 14 + 2);
+        TEST_ASSERT(memcmp(t + 2, "\036\036DS4_IMAGE_\036\037", 14) == 0);
+        TEST_ASSERT(!ds4_kvstore_text_has_image_marker(t, len));
+        TEST_ASSERT(ds4_kvstore_text_lineage_matches(t, len, NULL, 0));
+        size_t elen = 0;
+        char *e = ds4_kvstore_escape_text("a\036b\037c", 5, &elen);
+        TEST_ASSERT(e && elen == 7 && memcmp(e, "a\036\036b\036\037c", 7) == 0);
+        free(e);
+        free(t);
+    }
+    /* (e) a byte-LCP never splits a marker or an escape pair. */
+    {
+        char text[2 + DS4_KVSTORE_IMAGE_MARKER_LEN + 2 + 1];
+        memcpy(text, "ab", 2);
+        memcpy(text + 2, markA, DS4_KVSTORE_IMAGE_MARKER_LEN);
+        memcpy(text + 2 + DS4_KVSTORE_IMAGE_MARKER_LEN, "cd", 3);
+        const size_t tl = 2 + DS4_KVSTORE_IMAGE_MARKER_LEN + 2;
+        TEST_ASSERT(ds4_kvstore_lcp_marker_cap(text, tl, 1) == 1);
+        TEST_ASSERT(ds4_kvstore_lcp_marker_cap(text, tl, 2) == 2);
+        TEST_ASSERT(ds4_kvstore_lcp_marker_cap(text, tl, 2 + 10) == 2);                                  /* inside the marker */
+        TEST_ASSERT(ds4_kvstore_lcp_marker_cap(text, tl, 2 + DS4_KVSTORE_IMAGE_MARKER_LEN - 1) == 2);   /* one byte short */
+        TEST_ASSERT(ds4_kvstore_lcp_marker_cap(text, tl, 2 + DS4_KVSTORE_IMAGE_MARKER_LEN) == 2 + DS4_KVSTORE_IMAGE_MARKER_LEN);
+        TEST_ASSERT(ds4_kvstore_lcp_marker_cap(text, tl, tl) == tl);
+        TEST_ASSERT(ds4_kvstore_lcp_marker_cap(text, tl, tl + 5) == tl);
+        TEST_ASSERT(ds4_kvstore_lcp_marker_cap("a\036\036b", 4, 2) == 1);   /* an escape pair split */
+        TEST_ASSERT(ds4_kvstore_lcp_marker_cap("a\036\036b", 4, 3) == 3);
+    }
+    /* (f) the exact-prefix + text-suffix splice refuses a suffix that carries an
+     *     image block (before touching any tokenizer). */
+    {
+        ds4_tokens prefix = {0}, out = {0};
+        ds4_tokens_push(&prefix, 5);
+        ds4_tokens_push(&out, 9);
+        TEST_ASSERT(ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(NULL, &prefix, markA, &out) == 0);
+        TEST_ASSERT(out.len == 0);
+        ds4_tokens_free(&prefix);
+        ds4_tokens_free(&out);
+    }
+    /* (g) payload lineage (v4): round trip; a v3 payload with image rows is
+     *     refused; a v4 list must describe exactly the image rows. */
+    {
+        const int toks[11] = { 1, S0, S2, S4, S1, 2, 3, S0, S2, S4, S1 };
+        ds4_vision_identity two[2] = { idA, idB };
+        two[1].token_start = 7;
+        TEST_ASSERT(ds4_session_payload_lineage_bytes(2) == 4 + 2 * DS4_SESSION_PAYLOAD_LINEAGE_ENTRY_BYTES);
+        FILE *fp = tmpfile();
+        TEST_ASSERT(fp != NULL);
+        TEST_ASSERT(ds4_session_payload_write_lineage(fp, two, 2, err, sizeof(err)) == 0);
+        TEST_ASSERT((uint64_t)ftell(fp) == ds4_session_payload_lineage_bytes(2));
+        rewind(fp);
+        uint64_t remaining = ds4_session_payload_lineage_bytes(2);
+        ds4_vision_lineage got = {0};
+        TEST_ASSERT(ds4_session_payload_read_lineage(fp, 4, &remaining, toks, 11, NV, &got, err, sizeof(err)) == 0);
+        TEST_ASSERT(got.n == 2 && remaining == 0);
+        TEST_ASSERT(got.v[0].token_start == 1 && got.v[0].token_count == 4 && memcmp(got.v[0].identity, idA.identity, 32) == 0);
+        TEST_ASSERT(got.v[1].token_start == 7 && got.v[1].token_count == 4 && memcmp(got.v[1].identity, idB.identity, 32) == 0);
+        ds4_vision_lineage_clear(&got);
+        /* the same bytes against a stream where the second block is text: refused */
+        rewind(fp);
+        remaining = ds4_session_payload_lineage_bytes(2);
+        const int toks_text_tail[11] = { 1, S0, S2, S4, S1, 2, 3, 4, 5, 6, 8 };
+        const int pure_text[7] = { 1, 2, 3, 4, 5, 6, 8 };   /* no image rows at all */
+        TEST_ASSERT(ds4_session_payload_read_lineage(fp, 4, &remaining, toks_text_tail, 11, NV, &got, err, sizeof(err)) != 0);
+        TEST_ASSERT(strstr(err, "describe") != NULL && got.n == 0);
+        /* v3 semantics: nothing is read; image rows in the stream are refused by name */
+        rewind(fp);
+        remaining = 99;
+        TEST_ASSERT(ds4_session_payload_read_lineage(fp, 3, &remaining, toks, 11, NV, &got, err, sizeof(err)) != 0);
+        TEST_ASSERT(strstr(err, "predates") != NULL && remaining == 99);
+        TEST_ASSERT(ds4_session_payload_read_lineage(fp, 3, &remaining, pure_text, 7, NV, &got, err, sizeof(err)) == 0);
+        TEST_ASSERT(got.n == 0 && remaining == 99);
+        fclose(fp);
+        /* an empty v4 list over a stream with image rows: refused (does not cover) */
+        fp = tmpfile();
+        TEST_ASSERT(fp != NULL);
+        TEST_ASSERT(ds4_session_payload_write_lineage(fp, NULL, 0, err, sizeof(err)) == 0);
+        rewind(fp);
+        remaining = 4;
+        TEST_ASSERT(ds4_session_payload_read_lineage(fp, 4, &remaining, toks, 11, NV, &got, err, sizeof(err)) != 0);
+        TEST_ASSERT(strstr(err, "cover") != NULL);
+        rewind(fp);
+        remaining = 4;
+        TEST_ASSERT(ds4_session_payload_read_lineage(fp, 4, &remaining, pure_text, 7, NV, &got, err, sizeof(err)) == 0 && got.n == 0);
+        /* a truncated list */
+        rewind(fp);
+        remaining = 2;
+        TEST_ASSERT(ds4_session_payload_read_lineage(fp, 4, &remaining, pure_text, 7, NV, &got, err, sizeof(err)) != 0);
+        fclose(fp);
+        ds4_vision_lineage_clear(&got);
+    }
+    /* (h) reference spans: data-less spans are fine inside the held prefix and
+     *     refused (by block) where the sync would have to prefill them. */
+    {
+        ds4_vision_span ref[2] = {0};
+        ref[0].token_start = 1;  ref[0].embedding.token_count = 4;  ref[0].embedding.data = NULL;
+        ref[1].token_start = 20; ref[1].embedding.token_count = 4;  ref[1].embedding.data = (float *)1;
+        TEST_ASSERT(ds4_vision_spans_require_data(ref, 2, 5, err, sizeof(err)) == 1);    /* block 0 ends at 5 == resume */
+        TEST_ASSERT(ds4_vision_spans_require_data(ref, 2, 30, err, sizeof(err)) == 1);
+        TEST_ASSERT(ds4_vision_spans_require_data(ref, 2, 4, err, sizeof(err)) == 0);    /* one row short */
+        TEST_ASSERT(strstr(err, "block 0 @1") != NULL && strstr(err, "re-encode") != NULL);
+        TEST_ASSERT(ds4_vision_spans_require_data(ref, 2, 0, err, sizeof(err)) == 0);
+        ref[1].embedding.data = NULL;
+        TEST_ASSERT(ds4_vision_spans_require_data(ref, 2, 24, err, sizeof(err)) == 1);
+        TEST_ASSERT(ds4_vision_spans_require_data(ref, 2, 23, err, sizeof(err)) == 0 && strstr(err, "block 1 @20") != NULL);
+        TEST_ASSERT(ds4_vision_spans_require_data(NULL, 0, 0, err, sizeof(err)) == 1);
+    }
+    /* (i) the capped token walk passes through a block only where the incoming
+     *     spans reproduce it. */
+    {
+        ds4_vision_lineage l = {0};
+        ds4_vision_span same = {0}; same.token_start = 10; same.embedding.token_count = 20; same.embedding.data = (float *)1;
+        memset(same.embedding.identity, 0xAA, 32);
+        TEST_ASSERT(ds4_vision_lineage_store(&l, &same, 1) == 1);
+        TEST_ASSERT(ds4_vision_lineage_prefix_cap_matching(&l, 40, &same, 1) == 40);
+        TEST_ASSERT(ds4_vision_lineage_prefix_cap_matching(&l, 40, NULL, 0) == 10);
+        ds4_vision_span other = same; memset(other.embedding.identity, 0xBB, 32);
+        TEST_ASSERT(ds4_vision_lineage_prefix_cap_matching(&l, 40, &other, 1) == 10);
+        ds4_vision_span moved = same; moved.token_start = 11;
+        TEST_ASSERT(ds4_vision_lineage_prefix_cap_matching(&l, 40, &moved, 1) == 10);
+        ds4_vision_span shorter = same; shorter.embedding.token_count = 19;
+        TEST_ASSERT(ds4_vision_lineage_prefix_cap_matching(&l, 40, &shorter, 1) == 10);
+        TEST_ASSERT(ds4_vision_lineage_prefix_cap_matching(&l, 5, NULL, 0) == 5);       /* the walk ends before it */
+        TEST_ASSERT(ds4_vision_lineage_prefix_cap_matching(&l, 10, NULL, 0) == 10);
+        ds4_vision_span ref = same; ref.embedding.data = NULL;                         /* a reference span reproduces it too */
+        TEST_ASSERT(ds4_vision_lineage_prefix_cap_matching(&l, 40, &ref, 1) == 40);
+        TEST_ASSERT(ds4_vision_identities_prefix_cap(l.v, l.n, 40) == 10);
+        TEST_ASSERT(ds4_vision_identities_prefix_cap(l.v, l.n, 3) == 3);
+        TEST_ASSERT(ds4_vision_identities_prefix_cap(NULL, 0, 40) == 40);
+        ds4_vision_lineage_clear(&l);
+    }
+    printf("vision-cache: ok\n");
+}
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -1862,6 +2089,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
 #endif
     {"--vision-prompt", "vision-prompt", "Track B inc 3: image-block token stream + session identity units", test_vision_prompt_group},
+    {"--vision-cache", "vision-cache", "Track B inc 8: identity markers in cache keys, payload lineage, reference spans", test_vision_cache_group},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

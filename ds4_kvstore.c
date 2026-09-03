@@ -695,18 +695,196 @@ void ds4_kvstore_close(ds4_kvstore *kc) {
     memset(kc, 0, sizeof(*kc));
 }
 
-char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
-                                     const ds4_tokens *tokens,
-                                     size_t *out_len) {
+/* ---- Track B inc 8: image markers in the rendered key text. ------------ */
+
+static const char kv_hex_digits[] = "0123456789abcdef";
+
+void ds4_kvstore_image_marker(const uint8_t identity[32], char out[DS4_KVSTORE_IMAGE_MARKER_LEN + 1]) {
+    memcpy(out, DS4_KVSTORE_IMAGE_MARKER_PREFIX, DS4_KVSTORE_IMAGE_MARKER_PREFIX_LEN);
+    char *p = out + DS4_KVSTORE_IMAGE_MARKER_PREFIX_LEN;
+    for (int i = 0; i < 32; i++) {
+        *p++ = kv_hex_digits[identity[i] >> 4];
+        *p++ = kv_hex_digits[identity[i] & 0xF];
+    }
+    *p++ = '\037';
+    *p = '\0';
+}
+
+static void kv_buf_append_escaped(kv_buf *b, const char *p, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] == '\036' || p[i] == '\037') kv_buf_putc(b, '\036');
+        kv_buf_putc(b, p[i]);
+    }
+}
+
+char *ds4_kvstore_escape_text(const char *in, size_t len, size_t *out_len) {
     kv_buf b = {0};
-    for (int i = 0; i < tokens->len; i++) {
+    if (in) kv_buf_append_escaped(&b, in, len);
+    if (out_len) *out_len = b.len;
+    return kv_buf_take(&b);
+}
+
+static bool kv_is_synthetic(int token, int n_vocab) {
+    return token < 0 || token >= n_vocab;
+}
+
+char *ds4_kvstore_render_text_core(ds4_kvstore_piece_fn piece, void *ud,
+                                   const int *tokens, int n_tokens, int n_vocab,
+                                   const ds4_vision_identity *ids, size_t n_ids,
+                                   size_t *out_len, char *err, size_t errlen) {
+    if (out_len) *out_len = 0;
+    if (!piece || (n_tokens > 0 && !tokens) || (n_ids != 0 && !ids)) {
+        if (err && errlen) snprintf(err, errlen, "invalid render request");
+        return NULL;
+    }
+    kv_buf b = {0};
+    size_t k = 0;
+    int i = 0;
+    while (i < n_tokens) {
+        if (k < n_ids && (uint64_t)i == ids[k].token_start) {
+            const uint64_t end = (uint64_t)i + ids[k].token_count;
+            if (ids[k].token_count == 0 || end > (uint64_t)n_tokens) {
+                if (err && errlen) snprintf(err, errlen, "image lineage entry %zu exceeds the token stream", k);
+                free(kv_buf_take(&b));
+                return NULL;
+            }
+            for (uint64_t t = (uint64_t)i; t < end; t++) {
+                if (!kv_is_synthetic(tokens[t], n_vocab)) {
+                    if (err && errlen) snprintf(err, errlen, "image lineage entry %zu covers text rows", k);
+                    free(kv_buf_take(&b));
+                    return NULL;
+                }
+            }
+            char marker[DS4_KVSTORE_IMAGE_MARKER_LEN + 1];
+            ds4_kvstore_image_marker(ids[k].identity, marker);
+            kv_buf_append(&b, marker, DS4_KVSTORE_IMAGE_MARKER_LEN);
+            i = (int)end;
+            k++;
+            continue;
+        }
+        if (kv_is_synthetic(tokens[i], n_vocab)) {
+            if (err && errlen) snprintf(err, errlen, "image row @%d has no lineage entry (no identity to key it by)", i);
+            free(kv_buf_take(&b));
+            return NULL;
+        }
         size_t len = 0;
-        char *piece = ds4_token_text(engine, tokens->v[i], &len);
-        kv_buf_append(&b, piece, len);
-        free(piece);
+        char *p = piece(ud, tokens[i], &len);
+        if (p) kv_buf_append_escaped(&b, p, len);
+        free(p);
+        i++;
+    }
+    if (k < n_ids) {
+        if (err && errlen) snprintf(err, errlen, "image lineage entry %zu starts beyond the token stream", k);
+        free(kv_buf_take(&b));
+        return NULL;
     }
     if (out_len) *out_len = b.len;
     return kv_buf_take(&b);
+}
+
+static char *kv_engine_piece(void *ud, int token, size_t *len) {
+    return ds4_token_text((ds4_engine *)ud, token, len);
+}
+
+char *ds4_kvstore_render_tokens_text_lineage(ds4_engine *engine,
+                                             const ds4_tokens *tokens,
+                                             const ds4_vision_identity *ids, size_t n_ids,
+                                             size_t *out_len, char *err, size_t errlen) {
+    if (!engine || !tokens) {
+        if (err && errlen) snprintf(err, errlen, "invalid render request");
+        if (out_len) *out_len = 0;
+        return NULL;
+    }
+    return ds4_kvstore_render_text_core(kv_engine_piece, engine, tokens->v, tokens->len,
+                                        ds4_engine_vocab_size(engine), ids, n_ids,
+                                        out_len, err, errlen);
+}
+
+char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
+                                     const ds4_tokens *tokens,
+                                     size_t *out_len) {
+    return ds4_kvstore_render_tokens_text_lineage(engine, tokens, NULL, 0, out_len, NULL, 0);
+}
+
+/* Scan for the next marker start at or after *pos, skipping escape pairs.
+ * Returns true with *pos at the marker's 0x1E; false when none remains. */
+static bool kv_next_marker(const char *text, size_t len, size_t *pos) {
+    size_t i = *pos;
+    while (i < len) {
+        if (text[i] == '\036') {
+            if (i + 1 < len && (text[i + 1] == '\036' || text[i + 1] == '\037')) { i += 2; continue; }
+            if (i + DS4_KVSTORE_IMAGE_MARKER_PREFIX_LEN <= len &&
+                memcmp(text + i, DS4_KVSTORE_IMAGE_MARKER_PREFIX, DS4_KVSTORE_IMAGE_MARKER_PREFIX_LEN) == 0) {
+                *pos = i;
+                return true;
+            }
+        }
+        i++;
+    }
+    *pos = len;
+    return false;
+}
+
+static int kv_hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+/* Parse the complete marker at pos into identity; false when it is truncated
+ * or malformed. */
+static bool kv_marker_identity(const char *text, size_t len, size_t pos, uint8_t identity[32]) {
+    if (pos + DS4_KVSTORE_IMAGE_MARKER_LEN > len) return false;
+    const char *h = text + pos + DS4_KVSTORE_IMAGE_MARKER_PREFIX_LEN;
+    for (int i = 0; i < 32; i++) {
+        const int hi = kv_hex_nibble(h[2 * i]), lo = kv_hex_nibble(h[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        identity[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return h[DS4_KVSTORE_IMAGE_MARKER_HEX_LEN] == '\037';
+}
+
+bool ds4_kvstore_text_has_image_marker(const char *text, size_t len) {
+    size_t pos = 0;
+    return text && kv_next_marker(text, len, &pos);
+}
+
+bool ds4_kvstore_text_lineage_matches(const char *text, size_t len,
+                                      const ds4_vision_identity *ids, size_t n_ids) {
+    if (!text) return n_ids == 0;
+    if (n_ids != 0 && !ids) return false;
+    size_t pos = 0, k = 0;
+    while (kv_next_marker(text, len, &pos)) {
+        uint8_t identity[32];
+        if (!kv_marker_identity(text, len, pos, identity)) return false;   /* truncated / malformed */
+        if (k >= n_ids || memcmp(identity, ids[k].identity, sizeof(identity)) != 0) return false;
+        k++;
+        pos += DS4_KVSTORE_IMAGE_MARKER_LEN;
+    }
+    return k == n_ids;
+}
+
+size_t ds4_kvstore_lcp_marker_cap(const char *text, size_t text_len, size_t lcp) {
+    if (!text) return 0;
+    if (lcp > text_len) lcp = text_len;
+    size_t i = 0;
+    while (i < lcp) {
+        if (text[i] == '\036') {
+            if (i + 1 < text_len && (text[i + 1] == '\036' || text[i + 1] == '\037')) {
+                if (i + 2 > lcp) return i;          /* an escape pair split by the LCP */
+                i += 2;
+                continue;
+            }
+            if (i + DS4_KVSTORE_IMAGE_MARKER_PREFIX_LEN <= text_len &&
+                memcmp(text + i, DS4_KVSTORE_IMAGE_MARKER_PREFIX, DS4_KVSTORE_IMAGE_MARKER_PREFIX_LEN) == 0) {
+                if (i + DS4_KVSTORE_IMAGE_MARKER_LEN > lcp) return i;   /* a marker split by the LCP */
+                i += DS4_KVSTORE_IMAGE_MARKER_LEN;
+                continue;
+            }
+        }
+        i++;
+    }
+    return lcp;
 }
 
 bool ds4_kvstore_byte_prefix_match(const char *text, size_t text_len,
@@ -727,11 +905,16 @@ static void tokens_append(ds4_tokens *dst, const ds4_tokens *src) {
     for (int i = 0; i < src->len; i++) ds4_tokens_push(dst, src->v[i]);
 }
 
-void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+int ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         ds4_engine *engine,
         const ds4_tokens *exact_prefix,
         const char *suffix_text,
         ds4_tokens *out) {
+    out->len = 0;
+    /* inc 8: an image block in the text suffix would be re-tokenized as the
+     * marker's bytes -- refuse, the caller needs the block's span. */
+    if (suffix_text && ds4_kvstore_text_has_image_marker(suffix_text, strlen(suffix_text)))
+        return 0;
     ds4_tokens_copy(out, exact_prefix);
 
     ds4_tokens suffix = {0};
@@ -740,6 +923,7 @@ void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
     ds4_tokenize_rendered_chat(engine, suffix_text ? suffix_text : "", &suffix);
     tokens_append(out, &suffix);
     ds4_tokens_free(&suffix);
+    return 1;
 }
 
 int ds4_kvstore_store_len(const ds4_kvstore *kc, int tokens) {
@@ -1034,11 +1218,40 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     size_t text_len = 0;
     char *text = NULL;
     const bool text_override = cache_text_override && cache_text_override[0];
+    /* inc 8: the record's key carries the checkpoint's image lineage (one
+     * marker per block, minted from the identity).  A bank payload (staged_in)
+     * has no lineage yet -- its tokens must be text-only or the render
+     * refuses by name.  A caller-supplied visible-text key must reproduce the
+     * same marker sequence, or the record would be served under a text key. */
+    const ds4_vision_identity *ids = NULL;
+    const size_t n_ids = staged_in ? 0 : ds4_session_vision_identities(session, &ids);
     if (text_override) {
         text = kv_xstrdup(cache_text_override);
         text_len = strlen(text);
+        if (!ds4_kvstore_text_lineage_matches(text, text_len, ids, n_ids)) {
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache skipped tokens=%d reason=%s because the %s key does not carry the checkpoint's image lineage (%zu image%s)",
+                    kv_log_name(kc), store_tokens.len, reason,
+                    cache_text_key ? cache_text_key : "visible-transcript",
+                    n_ids, n_ids == 1 ? "" : "s");
+            if (err && err_len) snprintf(err, err_len, "visible-text key does not carry the image lineage");
+            free(text);
+            ds4_tokens_free(&store_tokens);
+            return false;
+        }
     } else {
-        text = ds4_kvstore_render_tokens_text(engine, &store_tokens, &text_len);
+        char render_err[160] = {0};
+        text = ds4_kvstore_render_tokens_text_lineage(engine, &store_tokens, ids, n_ids,
+                                                      &text_len, render_err, sizeof(render_err));
+        if (!text) {
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache skipped tokens=%d reason=%s because the key cannot be rendered: %s",
+                    kv_log_name(kc), store_tokens.len, reason,
+                    render_err[0] ? render_err : "unknown error");
+            if (err && err_len) snprintf(err, err_len, "%s", render_err[0] ? render_err : "key render failed");
+            ds4_tokens_free(&store_tokens);
+            return false;
+        }
     }
     if (text_len > UINT32_MAX) {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -1329,6 +1542,9 @@ int ds4_kvstore_find_text_lcp(ds4_kvstore *kc, const char *prompt_text,
             char *buf = kv_xmalloc(want);
             const size_t got = fread(buf, 1, want, fp);
             while (lcp < got && buf[lcp] == prompt_text[lcp]) lcp++;
+            /* inc 8: never salvage half an image marker (the identity is
+             * the marker; a partial match of it is no match). */
+            lcp = ds4_kvstore_lcp_marker_cap(buf, got, lcp);
             free(buf);
         }
         fclose(fp);
@@ -1389,7 +1605,7 @@ static int kv_restore_bank_entry(ds4_kvstore *kc,
             } else {
                 cached_text[text_bytes] = '\0';
                 char text_sha[41];
-                ds4_kvstore_sha1_bytes_hex(cached_text, text_bytes, text_sha);
+                kv_text_sha(e.model_id, cached_text, text_bytes, text_sha);   /* the salted record name */
                 if (strcmp(text_sha, e.sha)) {
                     header_ok = false;
                     fail_reason = "cached text hash mismatch";
@@ -1536,7 +1752,11 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
             } else {
                 cached_text[text_bytes] = '\0';
                 char text_sha[41];
-                ds4_kvstore_sha1_bytes_hex(cached_text, text_bytes, text_sha);
+                /* The record NAME is the model-id-salted digest (kv_text_sha);
+                 * checking it with the plain SHA1 failed every load for a
+                 * non-zero model id (Pro, Vision-Exp) -- caught by the inc 8
+                 * V5 leg's text control. */
+                kv_text_sha(model_id, cached_text, text_bytes, text_sha);
                 if (strcmp(text_sha, e.sha)) {
                     header_ok = false;
                     fail_reason = "cached text hash mismatch";
@@ -1556,16 +1776,26 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
         if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
             loaded = (int)hdr.tokens;
-            if (effective_prompt) {
+            if (effective_prompt &&
                 /* The cache lookup was by bytes, but the graph state is still
                  * the exact token history stored in the payload.  Build the
                  * prompt from that exact history and tokenize only the text
                  * suffix after the byte prefix. */
-                ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+                !ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
                     engine, loaded_tokens, prompt_text + text_bytes,
-                    effective_prompt);
-            }
-            if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {
+                    effective_prompt))
+            {
+                /* inc 8: the suffix carries an image block that no text
+                 * re-tokenization can rebuild; the caller must sync with spans. */
+                loaded = 0;
+                ds4_session_invalidate(session);
+                kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                        "%s: kv cache hit refused%s%s: the text after the record carries an image block (needs spans) %s",
+                        kv_log_name(kc),
+                        responses_protocol ? " " : "",
+                        responses_protocol ? "RESPPROTO" : "",
+                        path);
+            } else if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {
                 hooks->load(hooks->ud, fp, hooks->load_wanted);
             }
         } else {

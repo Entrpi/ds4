@@ -21607,7 +21607,14 @@ static bool metal_graph_scatter_visual_rows(ds4_gpu_graph *g, const token_vec *p
         const uint64_t lo = b > pos0 ? b : pos0;
         const uint64_t hi = e < (uint64_t)pos0 + n_tokens ? e : (uint64_t)pos0 + n_tokens;
         if (lo >= hi) continue;
-        if (!span->embedding.data) { ok = false; break; }
+        if (!span->embedding.data) {
+            /* inc 8: a reference span reached the prefill window (the sync-level
+             * ds4_vision_spans_require_data check should have refused first). */
+            fprintf(stderr, "ds4: image prefill: block @%u has no embedding (reference span inside the prefill window)\n",
+                    span->token_start);
+            ok = false;
+            break;
+        }
         const uint32_t rows = (uint32_t)(hi - lo);
         if (rows > stage_rows) {
             free(stage);
@@ -24058,7 +24065,9 @@ int ds4_vision_spans_validate(const ds4_tokens *prompt, const ds4_vision_span *i
     for (size_t i = 0; i < image_count; i++) {
         const ds4_vision_span *span = &images[i];
         const uint64_t end = (uint64_t)span->token_start + span->embedding.token_count;
-        if (!span->embedding.data || span->embedding.token_count == 0 ||
+        /* inc 8: NULL data = reference span (the block is already held); the
+         * sync decides whether it may stay data-less (ds4_vision_spans_require_data). */
+        if (span->embedding.token_count == 0 ||
             span->token_start < previous_end || end > (uint64_t)prompt->len) {
             if (err && errlen) snprintf(err, errlen, "invalid or overlapping image token span");
             return 0;
@@ -24140,6 +24149,50 @@ bool ds4_vision_lineage_rewind(ds4_vision_lineage *l, int pos) {
     }
     l->n = keep;   /* identities are in token order */
     return true;
+}
+
+int ds4_vision_identities_prefix_cap(const ds4_vision_identity *v, size_t n, int len) {
+    for (size_t i = 0; v && i < n; i++)
+        if (len > 0 && (uint64_t)len > v[i].token_start) len = (int)v[i].token_start;
+    return len;
+}
+
+int ds4_vision_lineage_prefix_cap_matching(const ds4_vision_lineage *l, int len,
+                                           const ds4_vision_span *images, size_t image_count) {
+    if (!l) return len;
+    for (size_t i = 0; i < l->n; i++) {
+        const ds4_vision_identity *old = &l->v[i];
+        if (len <= 0 || (uint64_t)len <= old->token_start) break;   /* the walk ends before it */
+        bool reproduced = false;
+        for (size_t k = 0; images && k < image_count; k++) {
+            const ds4_vision_span *cur = &images[k];
+            if (cur->token_start == old->token_start &&
+                cur->embedding.token_count == old->token_count &&
+                memcmp(cur->embedding.identity, old->identity, sizeof(old->identity)) == 0) {
+                reproduced = true;
+                break;
+            }
+        }
+        if (!reproduced) return (int)old->token_start;
+    }
+    return len;
+}
+
+int ds4_vision_spans_require_data(const ds4_vision_span *images, size_t image_count,
+                                  uint32_t resume_pos, char *err, size_t errlen) {
+    for (size_t i = 0; images && i < image_count; i++) {
+        const ds4_vision_span *span = &images[i];
+        if (span->embedding.data) continue;
+        const uint64_t end = (uint64_t)span->token_start + span->embedding.token_count;
+        if (end > resume_pos) {
+            if (err && errlen)
+                snprintf(err, errlen,
+                         "image block %zu @%u (%u rows) has no embedding: the cached state that held it is gone, re-encode the image",
+                         i, span->token_start, span->embedding.token_count);
+            return 0;
+        }
+    }
+    return 1;
 }
 
 int ds4_chat_append_multimodal_message(ds4_engine *e, ds4_tokens *tokens, const char *role,
@@ -32718,12 +32771,95 @@ static int ds4_session_eval_speculative_batch_first3(
 }
 #endif
 
+/* ---- Track B inc 8: the payload's ordered image lineage (v4). ----------- */
+
+uint64_t ds4_session_payload_lineage_bytes(size_t image_count) {
+    return sizeof(uint32_t) + (uint64_t)image_count * DS4_SESSION_PAYLOAD_LINEAGE_ENTRY_BYTES;
+}
+
+int ds4_session_payload_write_lineage(FILE *fp, const ds4_vision_identity *v, size_t n,
+                                      char *err, size_t errlen) {
+    if (!fp || (n != 0 && !v) || n > UINT32_MAX) {
+        payload_set_err(err, errlen, "invalid image lineage for session payload");
+        return 1;
+    }
+    if (payload_write_u32(fp, (uint32_t)n, err, errlen) != 0) return 1;
+    for (size_t i = 0; i < n; i++) {
+        if (payload_write_u32(fp, v[i].token_start, err, errlen) != 0 ||
+            payload_write_u32(fp, v[i].token_count, err, errlen) != 0 ||
+            payload_write_bytes(fp, v[i].identity, sizeof(v[i].identity), err, errlen) != 0)
+            return 1;
+    }
+    return 0;
+}
+
+int ds4_session_payload_read_lineage(FILE *fp, uint32_t payload_version, uint64_t *remaining,
+                                     const int *tokens, uint32_t n_tokens, uint32_t n_vocab,
+                                     ds4_vision_lineage *out, char *err, size_t errlen) {
+    if (!fp || !out || (n_tokens != 0 && !tokens)) {
+        payload_set_err(err, errlen, "invalid image lineage read");
+        return 1;
+    }
+    uint32_t synthetic = 0;
+    for (uint32_t i = 0; i < n_tokens; i++)
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= n_vocab) synthetic++;
+    if (payload_version < 4) {
+        if (synthetic != 0) {
+            payload_set_err(err, errlen, "KV payload predates image lineage (v3) but carries image rows");
+            return 1;
+        }
+        ds4_vision_lineage_clear(out);
+        return 0;
+    }
+    uint32_t count = 0;
+    if (payload_read_u32(fp, &count, remaining, err, errlen) != 0) return 1;
+    if (count > n_tokens) {
+        payload_set_err(err, errlen, "KV payload image lineage is longer than its token stream");
+        return 1;
+    }
+    ds4_vision_identity *v = count ? calloc(count, sizeof(v[0])) : NULL;
+    if (count && !v) {
+        payload_set_err(err, errlen, "out of memory reading image lineage");
+        return 1;
+    }
+    uint64_t previous_end = 0, covered = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (payload_read_u32(fp, &v[i].token_start, remaining, err, errlen) != 0 ||
+            payload_read_u32(fp, &v[i].token_count, remaining, err, errlen) != 0 ||
+            payload_read_bytes(fp, v[i].identity, sizeof(v[i].identity), remaining, err, errlen) != 0) {
+            free(v);
+            return 1;
+        }
+        const uint64_t end = (uint64_t)v[i].token_start + v[i].token_count;
+        bool ok = v[i].token_count != 0 && v[i].token_start >= previous_end && end <= n_tokens;
+        for (uint64_t t = v[i].token_start; ok && t < end; t++)
+            if (tokens[t] >= 0 && (uint32_t)tokens[t] < n_vocab) ok = false;   /* a text row inside a block */
+        if (!ok) {
+            free(v);
+            payload_set_err(err, errlen, "KV payload image lineage does not describe its image rows");
+            return 1;
+        }
+        covered += v[i].token_count;
+        previous_end = end;
+    }
+    if (covered != synthetic) {
+        free(v);
+        payload_set_err(err, errlen, "KV payload image lineage does not cover its image rows");
+        return 1;
+    }
+    ds4_vision_lineage_clear(out);
+    out->v = v;
+    out->n = count;
+    return 0;
+}
+
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
     if (s->distributed) return 0;
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
+        bytes += ds4_session_payload_lineage_bytes(s->lineage.n);   /* v4 image lineage */
         bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
         bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
         bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
@@ -32738,6 +32874,7 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
     const ds4_gpu_graph *g = &s->graph;
     uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
+    bytes += ds4_session_payload_lineage_bytes(s->lineage.n);   /* v4 image lineage */
     bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
     bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
     bytes += (uint64_t)DS4_N_LAYER * sizeof(uint32_t);
@@ -32863,6 +33000,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         for (int i = 0; i < s->checkpoint.len; i++) {
             if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
         }
+        if (ds4_session_payload_write_lineage(fp, s->lineage.v, s->lineage.n, err, errlen) != 0) return 1;   /* v4 */
         if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             if (payload_write_u32(fp, s->cpu_cache.layer[il].n_comp, err, errlen) != 0) return 1;
@@ -32946,6 +33084,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     for (int i = 0; i < s->checkpoint.len; i++) {
         if (payload_write_u32(fp, (uint32_t)s->checkpoint.v[i], err, errlen) != 0) return 1;
     }
+    if (ds4_session_payload_write_lineage(fp, s->lineage.v, s->lineage.n, err, errlen) != 0) return 1;   /* v4 */
     if (payload_write_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float), err, errlen) != 0) return 1;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (payload_write_u32(fp, g->layer_n_comp[il], err, errlen) != 0) return 1;
@@ -33044,40 +33183,53 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         }
 
         token_vec new_checkpoint = {0};
+        ds4_vision_lineage lin = {0};   /* v4 image lineage (empty for older files) */
         for (uint32_t i = 0; i < saved_tokens; i++) {
             uint32_t tok = 0;
             if (payload_read_u32(fp, &tok, &remaining, err, errlen) != 0) {
-                token_vec_free(&new_checkpoint);
+                token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
                 return 1;
             }
             token_vec_push(&new_checkpoint, (int)tok);
         }
+        if (ds4_session_payload_read_lineage(fp, payload_version, &remaining, new_checkpoint.v,
+                                             saved_tokens, (uint32_t)DS4_N_VOCAB, &lin, err, errlen) != 0) {
+            token_vec_free(&new_checkpoint);
+            return 1;
+        }
+        if (lin.n != 0) {
+            /* CPU sessions refuse image prefill; an image-conditioned checkpoint
+             * cannot be extended here either. */
+            token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
+            payload_set_err(err, errlen, "KV checkpoint is image-conditioned; the CPU backend refuses image state");
+            return 1;
+        }
         if (payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float),
                                &remaining, err, errlen) != 0)
         {
-            token_vec_free(&new_checkpoint);
+            token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
             return 1;
         }
         uint32_t n_comp[DS4_MAX_LAYER];
         uint32_t n_index_comp[DS4_MAX_LAYER];
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             if (payload_read_u32(fp, &n_comp[il], &remaining, err, errlen) != 0) {
-                token_vec_free(&new_checkpoint);
+                token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
                 return 1;
             }
             if (n_comp[il] > saved_comp_cap || n_comp[il] > cpu_comp_cap) {
-                token_vec_free(&new_checkpoint);
+                token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
                 payload_set_err(err, errlen, "KV checkpoint has invalid compressed row count");
                 return 1;
             }
         }
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             if (payload_read_u32(fp, &n_index_comp[il], &remaining, err, errlen) != 0) {
-                token_vec_free(&new_checkpoint);
+                token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
                 return 1;
             }
             if (n_index_comp[il] > saved_comp_cap || n_index_comp[il] > cpu_comp_cap) {
-                token_vec_free(&new_checkpoint);
+                token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
                 payload_set_err(err, errlen, "KV checkpoint has invalid indexer row count");
                 return 1;
             }
@@ -33085,13 +33237,13 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         uint32_t row_flags = 0;
         if (payload_version >= 3 &&
             payload_read_u32(fp, &row_flags, &remaining, err, errlen) != 0) {
-            token_vec_free(&new_checkpoint);
+            token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
             return 1;
         }
         if (row_flags != 0) {
             /* Packed rows are mirror codes+scales; expanding them needs the
              * graph backend's dequant kernels. */
-            token_vec_free(&new_checkpoint);
+            token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
             payload_set_err(err, errlen, "packed session payload requires the graph backend");
             return 1;
         }
@@ -33108,7 +33260,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                                    err,
                                    errlen) != 0)
             {
-                token_vec_free(&new_checkpoint);
+                token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
                 return 1;
             }
             layer->n_raw = saved_raw_live;
@@ -33125,7 +33277,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                 payload_read_bytes(fp, layer->attn_state_kv, layer_attn_state_bytes(ratio), &remaining, err, errlen) != 0 ||
                 payload_read_bytes(fp, layer->attn_state_score, layer_attn_state_bytes(ratio), &remaining, err, errlen) != 0)
             {
-                token_vec_free(&new_checkpoint);
+                token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
                 return 1;
             }
             if (ratio == 4) {
@@ -33138,7 +33290,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                     payload_read_bytes(fp, layer->index_state_kv, layer_index_state_bytes(ratio), &remaining, err, errlen) != 0 ||
                     payload_read_bytes(fp, layer->index_state_score, layer_index_state_bytes(ratio), &remaining, err, errlen) != 0)
                 {
-                    token_vec_free(&new_checkpoint);
+                    token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
                     return 1;
                 }
             }
@@ -33151,17 +33303,19 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
                 payload_read_bytes(fp, &mtp_ewma, sizeof(mtp_ewma), &remaining, err, errlen) != 0 ||
                 payload_read_u32(fp, &mtp_samples, &remaining, err, errlen) != 0)
             {
-                token_vec_free(&new_checkpoint);
+                token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
                 return 1;
             }
         }
         if (remaining != 0) {
-            token_vec_free(&new_checkpoint);
+            token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
             payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
             return 1;
         }
         token_vec_free(&s->checkpoint);
         s->checkpoint = new_checkpoint;
+        ds4_vision_lineage_clear(&s->lineage);
+        s->lineage = lin;   /* moved */
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
         s->mtp_accept_gate_skip = mtp_gate_skip;
@@ -33214,40 +33368,53 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     }
 
     token_vec new_checkpoint = {0};
+    ds4_vision_lineage lin = {0};   /* v4 image lineage (empty for older files) */
     for (uint32_t i = 0; i < saved_tokens; i++) {
         uint32_t tok = 0;
         if (payload_read_u32(fp, &tok, &remaining, err, errlen) != 0) {
-            token_vec_free(&new_checkpoint);
+            token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
             return 1;
         }
         token_vec_push(&new_checkpoint, (int)tok);
     }
+    if (ds4_session_payload_read_lineage(fp, payload_version, &remaining, new_checkpoint.v,
+                                         saved_tokens, (uint32_t)DS4_N_VOCAB, &lin, err, errlen) != 0) {
+        token_vec_free(&new_checkpoint);
+        return 1;
+    }
+    if (lin.n != 0 && !(s->engine && s->engine->vision_ready)) {
+        /* The rows are there but no encoder is bound: a later sync could never
+         * reproduce or extend this state, and its lineage would be unverifiable. */
+        token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
+        payload_set_err(err, errlen, "KV checkpoint is image-conditioned but no vision encoder is loaded (--vision)");
+        return 1;
+    }
     if (payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float),
                            &remaining, err, errlen) != 0)
     {
-        token_vec_free(&new_checkpoint);
+        token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
         return 1;
     }
     uint32_t n_comp[DS4_MAX_LAYER];
     uint32_t n_index_comp[DS4_MAX_LAYER];
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (payload_read_u32(fp, &n_comp[il], &remaining, err, errlen) != 0) {
-            token_vec_free(&new_checkpoint);
+            token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
             return 1;
         }
         if (n_comp[il] > saved_comp_cap || n_comp[il] > g->layer_comp_cap[il]) {
-            token_vec_free(&new_checkpoint);
+            token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
             payload_set_err(err, errlen, "KV checkpoint has invalid compressed row count");
             return 1;
         }
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (payload_read_u32(fp, &n_index_comp[il], &remaining, err, errlen) != 0) {
-            token_vec_free(&new_checkpoint);
+            token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
             return 1;
         }
         if (n_index_comp[il] > saved_comp_cap || n_index_comp[il] > g->layer_comp_cap[il]) {
-            token_vec_free(&new_checkpoint);
+            token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
             payload_set_err(err, errlen, "KV checkpoint has invalid indexer row count");
             return 1;
         }
@@ -33261,23 +33428,23 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     uint32_t row_flags = 0;
     if (payload_version >= 3 &&
         payload_read_u32(fp, &row_flags, &remaining, err, errlen) != 0) {
-        token_vec_free(&new_checkpoint);
+        token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
         return 1;
     }
     if (row_flags & ~(DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED |
                       DS4_SESSION_PAYLOAD_ROWS_FP4_PACKED)) {
-        token_vec_free(&new_checkpoint);
+        token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
         payload_set_err(err, errlen, "KV checkpoint has unsupported row-format flags");
         return 1;
     }
     if ((row_flags & DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED) && DS4_GPU_ATTN_COMP_CACHE_F16) {
-        token_vec_free(&new_checkpoint);
+        token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
         payload_set_err(err, errlen, "packed session payload requires a packed or F32 comp cache");
         return 1;
     }
 
     if (ds4_gpu_synchronize() == 0) {
-        token_vec_free(&new_checkpoint);
+        token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
         payload_set_err(err, errlen, "failed to synchronize accelerator before KV restore");
         return 1;
     }
@@ -33297,7 +33464,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     rc = session_payload_read_region(g, &reg, row_flags, fp, buf, &remaining, err, errlen);
     free(buf);
     if (rc != 0) {
-        token_vec_free(&new_checkpoint);
+        token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
         return 1;
     }
     uint32_t mtp_gate_skip = 0;
@@ -33308,23 +33475,25 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
             payload_read_bytes(fp, &mtp_ewma, sizeof(mtp_ewma), &remaining, err, errlen) != 0 ||
             payload_read_u32(fp, &mtp_samples, &remaining, err, errlen) != 0)
         {
-            token_vec_free(&new_checkpoint);
+            token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
             return 1;
         }
     }
     if (remaining != 0) {
-        token_vec_free(&new_checkpoint);
+        token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
         payload_set_err(err, errlen, "KV checkpoint has trailing payload bytes");
         return 1;
     }
     if (ds4_gpu_synchronize() == 0) {
-        token_vec_free(&new_checkpoint);
+        token_vec_free(&new_checkpoint); ds4_vision_lineage_clear(&lin);
         payload_set_err(err, errlen, "failed to synchronize accelerator after KV restore");
         return 1;
     }
 
     token_vec_free(&s->checkpoint);
     s->checkpoint = new_checkpoint;
+    ds4_vision_lineage_clear(&s->lineage);
+    s->lineage = lin;   /* moved: the restored checkpoint's image identity */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->layer_n_comp[il] = n_comp[il];
         g->layer_n_index_comp[il] = n_index_comp[il];
@@ -33975,6 +34144,7 @@ uint64_t ds4_cont_bank_payload_bytes(ds4_batch_ctx *ctx, uint32_t bank) {
     ds4_gpu_graph *wg = ds4_cont_bank_walk_graph(ctx);
     uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
     bytes += (uint64_t)ctx->bank_hist_len[bank] * sizeof(uint32_t);
+    bytes += ds4_session_payload_lineage_bytes(0);   /* v4: empty image lineage */
     bytes += (uint64_t)DS4_N_VOCAB * sizeof(float);
     bytes += 2ull * DS4_N_LAYER * sizeof(uint32_t);
     bytes += sizeof(uint32_t);   /* v3 row-format flags */
@@ -34020,6 +34190,14 @@ int ds4_cont_bank_save_payload(ds4_batch_ctx *ctx, uint32_t bank,
     ds4_gpu_graph *g = &ctx->g;
     const int *tokens = ctx->bank_hist + (uint64_t)bank * ctx->seq_cap;
     const uint32_t n_tokens = ctx->bank_hist_len[bank];
+    /* inc 8: banks carry no image lineage yet (inc 6); a bank that somehow
+     * holds image rows must not be persisted under a text key. */
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= (uint32_t)DS4_N_VOCAB) {
+            payload_set_err(err, errlen, "bank holds image rows without lineage; the batched lane does not persist image state yet");
+            return 1;
+        }
+    }
     if (ds4_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "failed to synchronize accelerator before bank snapshot");
         return 1;
@@ -34046,6 +34224,7 @@ int ds4_cont_bank_save_payload(ds4_batch_ctx *ctx, uint32_t bank,
     for (uint32_t i = 0; i < n_tokens; i++) {
         if (payload_write_u32(fp, (uint32_t)tokens[i], err, errlen) != 0) return 1;
     }
+    if (ds4_session_payload_write_lineage(fp, NULL, 0, err, errlen) != 0) return 1;   /* v4: empty list */
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
     /* Logits block: zeros (see the section comment). */
     memset(buf, 0, DS4_SESSION_IO_CHUNK);
@@ -34149,6 +34328,18 @@ int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
         uint32_t tok = 0;
         if (payload_read_u32(fp, &tok, &remaining, err, errlen) != 0) return 1;
         hist[i] = (int)tok;
+    }
+    {   /* v4 image lineage: read + validate, then refuse anything non-empty by
+         * name -- the batched lane has no per-bank lineage yet (inc 6). */
+        ds4_vision_lineage lin = {0};
+        if (ds4_session_payload_read_lineage(fp, payload_version, &remaining, hist, saved_tokens,
+                                             (uint32_t)DS4_N_VOCAB, &lin, err, errlen) != 0) return 1;
+        const size_t n_images = lin.n;
+        ds4_vision_lineage_clear(&lin);
+        if (n_images != 0) {
+            payload_set_err(err, errlen, "bank payload carries image lineage; the batched lane does not serve image state yet");
+            return 1;
+        }
     }
     uint32_t n_comp[DS4_MAX_LAYER];
     uint32_t n_index_comp[DS4_MAX_LAYER];
@@ -42938,6 +43129,16 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         return 1;
 #endif
     }
+    if (s && s->sync_image_count != 0) {
+        /* inc 8 reference spans: every data-less span must lie inside the part
+         * of the prompt the checkpoint already holds (the sync will only
+         * prefill from resume on). */
+        const uint32_t resume = (s->checkpoint_valid && prompt && prompt->len >= s->checkpoint.len &&
+                                 ds4_tokens_starts_with(prompt, &s->checkpoint))
+                                    ? (uint32_t)s->checkpoint.len : 0u;
+        if (!ds4_vision_spans_require_data(s->sync_images, s->sync_image_count, resume, err, errlen))
+            return 1;
+    }
     const int rc = ds4_session_sync_body(s, prompt, err, errlen);
     if (rc == 0) {
         if (!ds4_vision_lineage_store(&s->lineage, s->sync_images, s->sync_image_count)) {
@@ -43076,7 +43277,13 @@ static int ds4_session_sync_body(ds4_session *s, const ds4_tokens *prompt, char 
         s->mtp_draft_valid = false;
         const int suffix = prompt->len - s->checkpoint.len;
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
-        if (suffix > 0 && (uint32_t)suffix >= resume_min) {
+        /* inc 8: a suffix carrying image rows always takes the chunked path --
+         * the one-token extension below gathers by id and would clamp a
+         * synthetic id to row 0 (the visual scatter lives in the chunk path). */
+        bool visual_suffix = false;
+        for (int i = s->checkpoint.len; i < prompt->len && !visual_suffix; i++)
+            visual_suffix = prompt->v[i] < 0 || (uint32_t)prompt->v[i] >= (uint32_t)DS4_N_VOCAB;
+        if (suffix > 0 && ((uint32_t)suffix >= resume_min || visual_suffix)) {
             ds4_sync_progress progress = {
                 .session = s,
                 .prompt = prompt,
@@ -43254,6 +43461,17 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     /* Track B inc 3 (A7): a token walk cannot see which image sat behind a run
      * of synthetic ids, so it stops at the first recorded image block. */
     return ds4_vision_lineage_prefix_cap(&s->lineage, i);
+}
+
+int ds4_session_common_prefix_multimodal(ds4_session *s, const ds4_tokens *prompt,
+                                         const ds4_vision_span *images, size_t image_count) {
+    if (!s || !prompt || !s->checkpoint_valid) return 0;
+    int n = s->checkpoint.len < prompt->len ? s->checkpoint.len : prompt->len;
+    int i = 0;
+    while (i < n && s->checkpoint.v[i] == prompt->v[i]) i++;
+    /* inc 8: the walk passes through a recorded block only where the incoming
+     * spans reproduce it (same start, count and identity). */
+    return ds4_vision_lineage_prefix_cap_matching(&s->lineage, i, images, image_count);
 }
 
 const float *ds4_session_logits(const ds4_session *s) { return s ? s->logits : NULL; }

@@ -257,7 +257,11 @@ int ds4_vision_prompt_append_rows(ds4_tokens *tokens, ds4_vision_span *span,
                                   const uint16_t *const sentinel_bf16[5],
                                   char *error, size_t error_cap);
 /* Every span must cover exactly one complete DeepSeek image block of the
- * prompt, in token order, without overlap. */
+ * prompt, in token order, without overlap.  A span whose embedding.data is
+ * NULL is a REFERENCE span (inc 8): it names an image block the session
+ * already holds (restored from a payload, or synced earlier) by start, count
+ * and identity; a sync accepts it only where it never has to prefill the
+ * block (ds4_vision_spans_require_data). */
 int ds4_vision_spans_validate(const ds4_tokens *prompt, const ds4_vision_span *images,
                               size_t image_count, char *err, size_t errlen);
 /* The image lineage of a checkpoint (identities in token order) and the A7
@@ -279,6 +283,19 @@ int  ds4_vision_lineage_prefix_cap(const ds4_vision_lineage *l, int len);
 /* Truncate the lineage to blocks that end at or before pos.  Returns false when
  * pos lands INSIDE a block: the caller must invalidate the whole checkpoint. */
 bool ds4_vision_lineage_rewind(ds4_vision_lineage *l, int pos);
+/* inc 8: the capped walk, relaxed -- the walk passes THROUGH a recorded block
+ * when `images` carries that same block (start, count, identity); it stops at
+ * the start of the first recorded block `images` does not reproduce. */
+int  ds4_vision_lineage_prefix_cap_matching(const ds4_vision_lineage *l, int len,
+                                            const ds4_vision_span *images, size_t image_count);
+/* inc 8 reference spans: every span with NULL embedding data must end at or
+ * before resume_pos (the first token a sync will prefill).  Returns 0 and names
+ * the block in err when one would have to be prefilled from nothing. */
+int  ds4_vision_spans_require_data(const ds4_vision_span *images, size_t image_count,
+                                   uint32_t resume_pos, char *err, size_t errlen);
+/* Cap len at the first recorded block it enters (identity-list form, for
+ * callers that hold a payload's list rather than a session). */
+int  ds4_vision_identities_prefix_cap(const ds4_vision_identity *v, size_t n, int len);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
@@ -1301,13 +1318,17 @@ int ds4_session_sync_multimodal(ds4_session *s, const ds4_tokens *prompt,
  * inside the checkpoint). */
 bool ds4_session_vision_state_matches(const ds4_session *s, const ds4_vision_span *images,
                                       size_t image_count);
-/* True while the session holds, or is syncing, image-conditioned state.  Such
- * state must never be written to a text-keyed cache (kvstore, bank payloads,
- * agent cache) until the record format carries the identity list (inc 8). */
+/* True while the session holds, or is syncing, image-conditioned state.  Since
+ * inc 8 such state persists only under a key that carries its identity list
+ * (kvstore markers, payload v4 lineage); a text key can never select it. */
 bool ds4_session_has_vision_state(const ds4_session *s);
 /* The ordered identity list of the live checkpoint (count returned; *out may be
  * NULL when the count is 0). */
 size_t ds4_session_vision_identities(const ds4_session *s, const ds4_vision_identity **out);
+/* ds4_session_common_prefix with the incoming prompt's spans: the walk passes
+ * through a recorded image block only where `images` reproduces it. */
+int ds4_session_common_prefix_multimodal(ds4_session *s, const ds4_tokens *prompt,
+                                         const ds4_vision_span *images, size_t image_count);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
@@ -1406,7 +1427,7 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(3)
+#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(4)
 #define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
 /* v3: one u32 of row-format flags follows the per-layer row-count arrays.
  * Packed-primary writers serialize the mirror codes+scales verbatim
@@ -1414,6 +1435,24 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
  * re-encoding).  v2 payloads (F32 rows) remain readable forever. */
 #define DS4_SESSION_PAYLOAD_ROWS_FP8_PACKED (UINT32_C(1) << 0)
 #define DS4_SESSION_PAYLOAD_ROWS_FP4_PACKED (UINT32_C(1) << 1)
+/* v4 (Track B inc 8, cache safety): the ORDERED image lineage of the
+ * checkpoint follows the token ids -- u32 count, then per image u32
+ * token_start, u32 token_count, 32 identity bytes.  The list must cover
+ * exactly the synthetic image rows of the token stream.  A v<4 payload whose
+ * tokens carry synthetic ids is refused by name (it predates image lineage);
+ * v2/v3 text payloads remain readable forever.  Bank payloads use the same
+ * wire but the batched lane refuses a non-empty list until it serves image
+ * state (inc 6). */
+#define DS4_SESSION_PAYLOAD_LINEAGE_ENTRY_BYTES 40u
+uint64_t ds4_session_payload_lineage_bytes(size_t image_count);
+int ds4_session_payload_write_lineage(FILE *fp, const ds4_vision_identity *v, size_t n,
+                                      char *err, size_t errlen);
+/* Reads the list for payload_version >= 4 (nothing is read for older
+ * versions), validates it against the token stream, and hands it to *out
+ * (replacing its contents).  Pure over the stream: the unit battery pins it. */
+int ds4_session_payload_read_lineage(FILE *fp, uint32_t payload_version, uint64_t *remaining,
+                                     const int *tokens, uint32_t n_tokens, uint32_t n_vocab,
+                                     ds4_vision_lineage *out, char *err, size_t errlen);
 #define DS4_SESSION_LAYER_PAYLOAD_MAGIC UINT32_C(0x4c565344) /* "DSVL" */
 #define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(1)
 #define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u

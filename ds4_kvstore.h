@@ -132,13 +132,52 @@ void ds4_kvstore_close(ds4_kvstore *kc);
 void ds4_kvstore_clear(ds4_kvstore *kc);
 void ds4_kvstore_entry_free(ds4_kvstore_entry *e);
 
+/* Track B inc 8 (cache safety): the rendered text that keys every record.
+ * An image block renders as ONE marker minted from the block's cache
+ * identity, "\036DS4_IMAGE_<64 lowercase hex>\037", so two prompts that
+ * differ only in the image get different byte keys and a text prompt can
+ * never byte-prefix an image record.  0x1E/0x1F inside token text are
+ * escaped (0x1E -> 0x1E 0x1E, 0x1F -> 0x1E 0x1F) so a marker cannot be
+ * forged from user text; anything that derives a key from request text (the
+ * server's prompt render, inc 7) must apply the same escape
+ * (ds4_kvstore_escape_text).  A token stream that carries image rows the
+ * identity list does not describe cannot be rendered: NULL, err says why. */
+#define DS4_KVSTORE_IMAGE_MARKER_PREFIX "\036DS4_IMAGE_"
+#define DS4_KVSTORE_IMAGE_MARKER_PREFIX_LEN 11u
+#define DS4_KVSTORE_IMAGE_MARKER_HEX_LEN 64u
+#define DS4_KVSTORE_IMAGE_MARKER_LEN (DS4_KVSTORE_IMAGE_MARKER_PREFIX_LEN + DS4_KVSTORE_IMAGE_MARKER_HEX_LEN + 1u)
+typedef char *(*ds4_kvstore_piece_fn)(void *ud, int token, size_t *len);
+/* The renderer over an arbitrary piece source (pure; the unit battery drives
+ * it without a model).  ids must be in token order. */
+char *ds4_kvstore_render_text_core(ds4_kvstore_piece_fn piece, void *ud,
+                                   const int *tokens, int n_tokens, int n_vocab,
+                                   const ds4_vision_identity *ids, size_t n_ids,
+                                   size_t *out_len, char *err, size_t errlen);
+char *ds4_kvstore_render_tokens_text_lineage(ds4_engine *engine,
+                                             const ds4_tokens *tokens,
+                                             const ds4_vision_identity *ids, size_t n_ids,
+                                             size_t *out_len, char *err, size_t errlen);
+/* The lineage-less form: identical bytes for text streams; NULL when the
+ * stream carries image rows (no identity to mint a marker from). */
 char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
                                      const ds4_tokens *tokens,
                                      size_t *out_len);
+void ds4_kvstore_image_marker(const uint8_t identity[32], char out[DS4_KVSTORE_IMAGE_MARKER_LEN + 1]);
+char *ds4_kvstore_escape_text(const char *in, size_t len, size_t *out_len);
+bool ds4_kvstore_text_has_image_marker(const char *text, size_t len);
+/* True when the markers in text are exactly ids[0..n) in order (a text with
+ * no marker matches an empty list). */
+bool ds4_kvstore_text_lineage_matches(const char *text, size_t len,
+                                      const ds4_vision_identity *ids, size_t n_ids);
+/* Cut a byte-LCP back so it never splits a marker (or an escape pair). */
+size_t ds4_kvstore_lcp_marker_cap(const char *text, size_t text_len, size_t lcp);
 bool ds4_kvstore_byte_prefix_match(const char *text, size_t text_len,
                                    const char *prefix, size_t prefix_len);
 void ds4_kvstore_tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n);
-void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+/* Returns 1; returns 0 with `out` left EMPTY when the suffix text carries an
+ * image marker: an image block cannot be re-tokenized from text, the caller
+ * needs its span. */
+int ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         ds4_engine *engine,
         const ds4_tokens *exact_prefix,
         const char *suffix_text,

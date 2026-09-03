@@ -10933,8 +10933,13 @@ static void kv_cache_close(kv_disk_cache *kc) {
     ds4_kvstore_close(kc);
 }
 
-static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
-    return ds4_kvstore_render_tokens_text(engine, tokens, out_len);
+/* The live session's key text: image blocks render as identity markers
+ * (inc 8), so a token stream with image rows the session does not describe
+ * cannot be keyed -- NULL, and every caller treats that as "no shortcut". */
+static char *render_tokens_text(server *s, const ds4_tokens *tokens, size_t *out_len) {
+    const ds4_vision_identity *ids = NULL;
+    const size_t n_ids = ds4_session_vision_identities(s->session, &ids);
+    return ds4_kvstore_render_tokens_text_lineage(s->engine, tokens, ids, n_ids, out_len, NULL, 0);
 }
 
 /* P1: longest common byte prefix -- ranks warm records against a request that
@@ -10957,14 +10962,16 @@ static void tokens_copy_prefix(ds4_tokens *dst, const ds4_tokens *src, int n) {
 }
 
 
-static void build_prompt_from_exact_prefix_and_text_suffix(
+/* false (out empty) when the suffix carries an image block: no text
+ * re-tokenization can rebuild it, the caller falls back to a full sync. */
+static bool build_prompt_from_exact_prefix_and_text_suffix(
         ds4_engine *engine,
         const ds4_tokens *exact_prefix,
         const char *suffix_text,
         ds4_tokens *out)
 {
-    ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
-        engine, exact_prefix, suffix_text, out);
+    return ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
+        engine, exact_prefix, suffix_text, out) != 0;
 }
 
 static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
@@ -11239,7 +11246,8 @@ static int live_text_prefix_prompt(server *s, const request *req,
     if (!live_tokens || live_tokens->len <= 0) return 0;
 
     size_t live_text_len = 0;
-    char *live_text = render_tokens_text(s->engine, live_tokens, &live_text_len);
+    char *live_text = render_tokens_text(s, live_tokens, &live_text_len);
+    if (!live_text) return 0;   /* inc 8: unkeyable live state */
     const size_t prompt_text_len = strlen(req->prompt_text);
     if (!byte_prefix_match(req->prompt_text, prompt_text_len,
                            live_text, live_text_len))
@@ -11252,11 +11260,11 @@ static int live_text_prefix_prompt(server *s, const request *req,
      * keep its sampled tokenization and tokenize only the request bytes that
      * come after it.  Reusing req->prompt's token suffix would be wrong: full
      * prompt BPE may have merged across this byte boundary. */
-    build_prompt_from_exact_prefix_and_text_suffix(
+    const bool spliced = build_prompt_from_exact_prefix_and_text_suffix(
         s->engine, live_tokens, req->prompt_text + live_text_len,
         effective_prompt);
     free(live_text);
-    return live_tokens->len;
+    return spliced ? live_tokens->len : 0;
 }
 
 /* Tool-output-only Responses continuation.
@@ -11282,9 +11290,9 @@ static int responses_live_continuation_prompt(server *s, const request *req,
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->responses_live_suffix_text,
-        effective_prompt);
+    if (!build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, live_tokens, req->responses_live_suffix_text,
+            effective_prompt)) return 0;
     if (matched_ids) *matched_ids = req->responses_live_call_ids.len;
     ds4_metric_add(&ds4_metrics_get()->creg_resolved, 1);
     return live_tokens->len;
@@ -11312,9 +11320,9 @@ static int anthropic_live_continuation_prompt(server *s, const request *req,
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->anthropic_live_suffix_text,
-        effective_prompt);
+    if (!build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, live_tokens, req->anthropic_live_suffix_text,
+            effective_prompt)) return 0;
     if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
     ds4_metric_add(&ds4_metrics_get()->creg_resolved, 1);
     return live_tokens->len;
@@ -11356,9 +11364,9 @@ static int responses_live_visible_prefix_prompt(server *s, const request *req,
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len,
-        effective_prompt);
+    if (!build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, live_tokens, req->prompt_text + visible_len,
+            effective_prompt)) return 0;
     return live_tokens->len;
 }
 
@@ -11398,9 +11406,9 @@ static int thinking_live_visible_prefix_prompt(server *s, const request *req,
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
 
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, live_tokens, req->prompt_text + visible_len,
-        effective_prompt);
+    if (!build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, live_tokens, req->prompt_text + visible_len,
+            effective_prompt)) return 0;
     return live_tokens->len;
 }
 
@@ -12149,7 +12157,11 @@ static bool append_rendered_suffix_to_live_session(server *s, const char *suffix
     }
 
     ds4_tokens target = {0};
-    build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
+    if (!build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target)) {
+        if (err && errlen) snprintf(err, errlen, "rendered suffix carries an image block; it cannot be spliced from text");
+        ds4_tokens_free(&target);
+        return false;
+    }
     const int before = ds4_session_pos(s->session);
     bool ok = ds4_session_sync(s->session, &target, err, errlen) == 0;
     if (ok && tokens_appended) {
@@ -12535,7 +12547,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
     if (common == live_len && canonical.len == live_len) goto done;
 
     size_t live_text_len = 0;
-    char *live_text = render_tokens_text(s->engine, ds4_session_tokens(s->session), &live_text_len);
+    char *live_text = render_tokens_text(s, ds4_session_tokens(s->session), &live_text_len);
     if (live_text_len == rendered.len &&
         (live_text_len == 0 || memcmp(live_text, rendered.ptr, live_text_len) == 0))
     {
@@ -15315,12 +15327,17 @@ static void warm_rec_invalidate(server *s, int bank) {
 }
 
 /* Append the committed generation (tokens[0..n-2]) to b as detokenized text. */
-static void cont_append_committed_text(server *s, buf *b, const int *tokens, int n) {
+/* false when the committed tokens carry image rows: a bank has no image
+ * lineage yet (inc 6), so its text can key nothing (inc 8). */
+static bool cont_append_committed_text(server *s, buf *b, const int *tokens, int n) {
+    const int n_vocab = ds4_engine_vocab_size(s->engine);
     for (int k = 0; k < n - 1; k++) {
+        if (tokens[k] < 0 || tokens[k] >= n_vocab) return false;
         size_t pl = 0;
         char *piece = ds4_token_text(s->engine, tokens[k], &pl);
         if (piece) { buf_append(b, piece, pl); free(piece); }
     }
+    return true;
 }
 
 /* Retire job j's bank at on_done: rebuild the record a follow-up request
@@ -15368,8 +15385,8 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
             ds4_batch_ctx_bank_committed(s->batch_ctx, bank, &btoks) : 0;
         if (bl > 0 && btoks && j->req.prompt_text && j->req.prompt_text[0]) {
             buf tb = {0};
-            cont_append_committed_text(s, &tb, btoks, bl);
-            if (tb.len &&
+            const bool keyable = cont_append_committed_text(s, &tb, btoks, bl);
+            if (keyable && tb.len &&
                 byte_prefix_match(j->req.prompt_text, strlen(j->req.prompt_text),
                                   tb.ptr, tb.len)) {
                 warm_rec_invalidate(s, bank);
@@ -15398,7 +15415,13 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
         j->req.prompt_preserves_reasoning)
     {
         buf_puts(&tb, j->req.prompt_text);
-        cont_append_committed_text(s, &tb, tokens, n);
+        if (!cont_append_committed_text(s, &tb, tokens, n)) {
+            buf_free(&tb);
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: bank=%d retires without a warm record: committed history carries image rows without lineage",
+                       bank);
+            return;
+        }
     } else if (!finish) {
         /* v0.5.4 (378855/41): an ABORTED thinking row (dead client, budget)
          * retired without a record, so an identical retry re-paid the whole
@@ -15420,8 +15443,8 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
     } else {
         if (j->req.kind != REQ_CHAT || j->req.has_tools) return;
         buf gen = {0};
-        cont_append_committed_text(s, &gen, tokens, n);
-        const char *close = gen.ptr ? strstr(gen.ptr, "</think>") : NULL;
+        const bool gen_keyable = cont_append_committed_text(s, &gen, tokens, n);
+        const char *close = gen_keyable && gen.ptr ? strstr(gen.ptr, "</think>") : NULL;
         char *visible = close ? build_toolless_thinking_visible_text(
                                     &j->req, close + strlen("</think>"))
                               : NULL;
@@ -15710,10 +15733,9 @@ full_commit:
         const int hl = ds4_batch_ctx_bank_committed(s->batch_ctx, best, &htok);
         if (hl > 0 && htok) {
             ds4_tokens exact = { (int *)htok, hl, hl };
-            build_prompt_from_exact_prefix_and_text_suffix(s->engine, &exact,
-                                                           ptext + best_len,
-                                                           &j->warm_prompt);
-            if (j->warm_prompt.len > hl &&
+            const bool spliced = build_prompt_from_exact_prefix_and_text_suffix(
+                s->engine, &exact, ptext + best_len, &j->warm_prompt);
+            if (spliced && j->warm_prompt.len > hl &&
                 j->warm_prompt.len <= ds4_batch_ctx_seq_cap(s->batch_ctx)) {
                 /* A2b: prefer serving the match as a FORK into a different free
                  * bank -- the trunk record survives, so siblings sharing the
@@ -16003,10 +16025,9 @@ static bool cont_bank_continuation_admit(server *s, cont_sched *cs, job *j,
     }
     if (!why) {
         ds4_tokens exact = { (int *)htok, frontier, frontier };
-        build_prompt_from_exact_prefix_and_text_suffix(s->engine, &exact,
-                                                       suffix,
-                                                       &j->warm_prompt);
-        if (j->warm_prompt.len <= frontier ||
+        const bool spliced = build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, &exact, suffix, &j->warm_prompt);
+        if (!spliced || j->warm_prompt.len <= frontier ||
             j->warm_prompt.len > ds4_batch_ctx_seq_cap(s->batch_ctx)) {
             ds4_tokens_free(&j->warm_prompt);
             memset(&j->warm_prompt, 0, sizeof(j->warm_prompt));

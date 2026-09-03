@@ -7,6 +7,40 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased
 
+- **Track B inc 8 (cache safety): image-conditioned state persists only
+  under its identity.**  Every cache key and record now carries the ordered
+  image lineage of the state it names.  The kvstore text renderer emits one
+  marker per image block, `\036DS4_IMAGE_<64 hex>\037`, minted from the
+  block's cache identity (SHA-256 of image, sidecar and preprocess version),
+  and escapes 0x1E/0x1F in token text so a marker cannot be forged; two
+  prompts that differ only in the image get different byte keys, a text
+  prompt never byte-prefixes an image record, and a byte-LCP salvage never
+  splits a marker.  Session and bank payloads move to v4: the identity list
+  follows the token ids (v2/v3 text payloads stay readable; a v3 payload
+  carrying image rows is refused by name; a v4 list must cover exactly the
+  image rows).  A restored checkpoint recovers its lineage, so a later sync
+  may pass REFERENCE spans (identity only, no embedding) for blocks the
+  cache already holds; a reference span that would have to be prefilled is
+  refused by block.  Refusals sit in the lowest primitives: a bank payload
+  never persists image rows and never restores a non-empty lineage (the
+  batched lane gets its own lineage in inc 6), the exact-prefix + text-suffix
+  splice refuses a suffix carrying a marker, visible-text keys must
+  reproduce the checkpoint's marker sequence, a warm bank record is never
+  built over image rows, a stripped agent session with image blocks cannot
+  be rebuilt from text, distributed roles refuse image lineage, and a
+  checkpoint extension whose suffix carries image rows always takes the
+  chunked prefill path (the one-token path gathers by id).  New public API:
+  `ds4_kvstore_render_tokens_text_lineage`, `ds4_kvstore_render_text_core`,
+  `ds4_kvstore_image_marker`, `ds4_kvstore_escape_text`,
+  `ds4_kvstore_text_has_image_marker`, `ds4_kvstore_text_lineage_matches`,
+  `ds4_kvstore_lcp_marker_cap`, `ds4_session_payload_{write,read}_lineage`,
+  `ds4_session_payload_lineage_bytes`, `ds4_vision_spans_require_data`,
+  `ds4_vision_lineage_prefix_cap_matching`, `ds4_session_common_prefix_multimodal`;
+  `ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix` now returns
+  0 on refusal.  Units: `./ds4_test --vision-cache`; on-box probe
+  `tests/vision_cache_probe` (store / load-with-reference-spans / identity
+  swap).  Still owed to inc 7: the server's request-side key derivation
+  must apply the same marker escape.
 - **Track B inc 3 (serial lane): images reach the model.** A user turn may
   carry DeepSeek image blocks on the CUDA serial lane: the encoder's natural
   grid is laid out at the prompt position (alignment padding, the N-order
