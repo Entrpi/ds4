@@ -16616,17 +16616,23 @@ static bool metal_graph_visual_attention(ds4_gpu_graph *g, const ds4_model *mode
                                          ds4_gpu_tensor *raw_kv, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
                                          ds4_gpu_tensor *comp_kv, uint32_t n_comp, ds4_gpu_tensor *comp_mask,
                                          uint32_t ratio) {
-    if (n_comp != 0 && (metal_graph_attn_comp_cache_is_f16() || g->layer_comp_cache_fp8[il] != NULL)) {
-        fprintf(stderr, "ds4: visual attention needs the F32 compressed-KV primary (boot with DS4_CUDA_FP8_KV=0); layer %u refused\n", il);
+    if (n_comp != 0 && metal_graph_attn_comp_cache_is_f16()) {
+        fprintf(stderr, "ds4: visual attention has no F16 compressed-KV read; layer %u refused\n", il);
         return false;
     }
+    /* inc 3c: the packed FP8 compressed-KV mirror (the v0.2.4 default) is read
+     * by the pack kernel; the F32 primary is used when the mirror is absent
+     * (DS4_CUDA_FP8_KV=0), so the identity leg and the shipping config share
+     * one code path. */
     return ds4_gpu_attention_visual_mixed_batch_heads_tensor(g->batch_heads, model->map, model->size,
                                                              layer->attn_sinks->abs_offset, g->batch_q,
                                                              raw_kv, n_comp ? comp_kv : NULL, 0u,
                                                              comp_mask, comp_mask != NULL ? 1u : 0u,
                                                              (const int32_t *)visual_tokens, (uint32_t)DS4_N_VOCAB,
                                                              n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
-                                                             g->raw_window, ratio, DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+                                                             g->raw_window, ratio, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                                             n_comp ? g->layer_comp_cache_fp8[il] : NULL,
+                                                             n_comp ? g->layer_comp_scale[il] : NULL) != 0;
 }
 
 static bool metal_graph_encode_layer_attention_batch(
@@ -22009,6 +22015,8 @@ static bool metal_graph_prefill_chunked_range(
                 fprintf(stderr, "ds4: malformed or oversized DeepSeek image token block at token %u\n", pos0);
                 return false;
             }
+            if (vchunk != chunk)
+                fprintf(stderr, "ds4: image block kept whole: chunk @%u %u -> %u tokens\n", pos0, chunk, vchunk);
             chunk = vchunk;
         }
         const uint32_t chunk_end = pos0 + chunk;

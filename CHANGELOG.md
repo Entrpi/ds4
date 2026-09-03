@@ -7,6 +7,36 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased
 
+- **Track B inc 3 (serial lane): images reach the model.** A user turn may
+  carry DeepSeek image blocks on the CUDA serial lane: the encoder's natural
+  grid is laid out at the prompt position (alignment padding, the N-order
+  permutation, the four sentinel rows from the sidecar) as synthetic ids
+  above the vocabulary, the block rows replace the token embeddings after
+  the device gather, image rows route through the sidecar's per-layer
+  visual bias in every layer, and image rows attend bidirectionally inside
+  their block while text stays causal and windowed (upstream's kernels,
+  ported verbatim onto the fork's stream/scratch/cuBLAS idioms; one visual
+  decision per prefill chunk, any unhandled shape refuses by name).  An
+  image block never splits across a prefill chunk.  The packed FP8
+  compressed-KV primary is read directly (no `DS4_CUDA_FP8_KV=0` needed).
+  Session checkpoints carry the ORDERED image identity list
+  (`ds4_vision_lineage`): reuse requires the same span and identity, a token
+  walk stops at the first image block, a rewind into a block invalidates.
+  New public API: `ds4_prompt_append_vision`, `ds4_chat_append_multimodal_message`,
+  `ds4_session_sync_multimodal`, `ds4_session_vision_state_matches`,
+  `ds4_session_has_vision_state`, `ds4_session_logits`.  Not yet wired:
+  the CLI `/read`, the agent tool, and the server surfaces (still 400),
+  the batched bank path, disk KV / bank payloads for image-conditioned
+  state (refused by name).  Metal and CPU refuse image prefill by name; a
+  DSpark bank whose frontier token is an image id takes no draft.
+  Validation against upstream 110afdd with one probe source built in both
+  trees (`tests/vision_serial_probe.c`): prompt ids, spans and scattered
+  block rows identical on 8/8 fixtures; greedy continuations diverge only
+  at top-2 near-ties within the fork's own text-path drift band (logit gap
+  <= 0.34, text-only controls included); two-image prompts and a block
+  straddling the chunk cap identical to end-of-sequence; the 24-item
+  needle-in-image battery (`tests/gen_vision_needle.py`, scored by
+  `tests/vision_needle_score.py`) 24/24 on both.
 - **DSpark drafter: `markov_w2` may be stored Q8_0; the extractor now
   emits it that way by default.** The Markov head reads the whole
   `[rank x vocab]` table four times per draft block. With the table in

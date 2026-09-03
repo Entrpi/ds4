@@ -3810,6 +3810,7 @@ extern "C" int ds4_cuda_fp8_kv_enabled(void);
 extern "C" int ds4_cuda_fp8_kv_debug_enabled(void);
 extern "C" int ds4_cuda_fp4_index_enabled(void);  /* P2 Inc3 */
 extern "C" unsigned long long ds4_cuda_fp8_kv_read_path_blocks(void);
+extern "C" unsigned long long ds4_cuda_fp8_visual_pack_blocks(void);
 extern "C" unsigned long long ds4_cuda_fp8_kv_indexed_read_path_blocks(void);
 extern "C" unsigned long long ds4_cuda_fp4_index_read_path_blocks(void);  /* P2 Inc3 */
 
@@ -4037,6 +4038,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (ds4_cuda_fp8_kv_enabled() && ds4_cuda_fp8_kv_debug_enabled()) {
         const unsigned long long dense   = ds4_cuda_fp8_kv_read_path_blocks();
         const unsigned long long indexed = ds4_cuda_fp8_kv_indexed_read_path_blocks();
+        const unsigned long long vpack = ds4_cuda_fp8_visual_pack_blocks();
+        fprintf(stderr, "ds4: DS4_CUDA_FP8_KV visual pack blocks: %llu\n", vpack);
         fprintf(stderr, "ds4: DS4_CUDA_FP8_KV path stats -- dense decode blocks: %llu, indexed decode blocks: %llu\n",
                 dense, indexed);
     }
@@ -8746,6 +8749,10 @@ __device__ static unsigned long long g_fp8_kv_read_path_blocks = 0ull;
  * indexer-layer count grows linearly with context, the dense one does
  * not, and conflating them masks regressions in either branch. */
 __device__ static unsigned long long g_fp8_kv_indexed_read_path_blocks = 0ull;
+/* Track B inc 3c tripwire: blocks of the VISUAL mixed-attention pack that read
+ * the packed FP8 compressed KV (one atomic per block; proves the image path
+ * consumed the packed primary rather than an F32 fallback). */
+__device__ static unsigned long long g_fp8_visual_pack_blocks = 0ull;
 /* P2 Inc3: read-tripwire for the packed FP4 indexer mirror.  One atomic per
  * scorer LAUNCH (block 0 only): at deep ctx the scan runs >100K blocks per
  * layer per step, and a per-block atomic serialized every one of them on
@@ -19398,6 +19405,12 @@ extern "C" unsigned long long ds4_cuda_fp8_kv_indexed_read_path_blocks(void) {
     return v;
 }
 
+extern "C" unsigned long long ds4_cuda_fp8_visual_pack_blocks(void) {
+    unsigned long long v = 0;
+    if (cudaMemcpyFromSymbol(&v, g_fp8_visual_pack_blocks, sizeof(v), 0, cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
+    return v;
+}
+
 /* P2 Inc3 tripwire getter: blocks of indexer_score_one_direct that read the
  * packed FP4 mirror (evidence the fp4 read path actually executed). */
 extern "C" unsigned long long ds4_cuda_fp4_index_read_path_blocks(void) {
@@ -26915,7 +26928,17 @@ __global__ static void attention_visual_pack_mixed_kv_kernel(
         uint32_t     raw_cap,
         uint32_t     raw_start,
         uint32_t     n_comp,
-        uint32_t     head_dim) {
+        uint32_t     head_dim,
+        /* inc 3c: the fork's packed FP8 compressed-KV mirror (bare row index,
+         * same base as comp_kv); decoded once into the F32 scratch the score
+         * and value GEMMs consume, exactly as attention_prefill_pack_mixed_kv. */
+        const unsigned char * __restrict__ comp_fp8,
+        const float         * __restrict__ comp_scale) {
+    const bool use_fp8 = (comp_fp8 != NULL) && (comp_scale != NULL);
+    if (use_fp8 && n_comp != 0u && threadIdx.x == 0) {
+        atomicAdd(&g_fp8_kv_read_path_blocks, 1ull);
+        atomicAdd(&g_fp8_visual_pack_blocks, 1ull);
+    }
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     const uint64_t count = (uint64_t)(n_raw + n_comp) * head_dim;
     if (gid >= count) return;
@@ -26924,6 +26947,8 @@ __global__ static void attention_visual_pack_mixed_kv_kernel(
     if (row < n_raw) {
         const uint32_t physical = (raw_start + row) % raw_cap;
         dst[gid] = raw_kv[(uint64_t)physical * head_dim + d];
+    } else if (use_fp8) {
+        dst[gid] = fp8_kv_read(comp_fp8, comp_scale, row - n_raw, d);
     } else {
         dst[gid] = comp_kv[(uint64_t)(row - n_raw) * head_dim + d];
     }
@@ -27024,17 +27049,19 @@ extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
         uint32_t comp_kv_f16, const ds4_gpu_tensor *comp_mask, uint32_t use_comp_mask,
         const int32_t *tokens, uint32_t vocab_size, uint32_t n_tokens, uint32_t pos0,
         uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp, uint32_t window,
-        uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim,
+        const ds4_gpu_tensor *comp_fp8, const ds4_gpu_tensor *comp_scale) {
+    const bool fp8 = comp_fp8 != NULL && comp_scale != NULL;
     if (!heads || !model_map || !q || !raw_kv || !tokens || vocab_size == 0 ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
-        (n_comp != 0 && (!comp_kv || ratio == 0)) ||
+        (n_comp != 0 && ((!comp_kv && !fp8) || ratio == 0)) ||
         (use_comp_mask && !comp_mask) || comp_kv_f16 || !g_cublas_ready || !g_cublas ||
         sinks_offset > model_size ||
         (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        (n_comp && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
+        (n_comp && comp_kv && !fp8 && comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float)) ||
         (use_comp_mask && comp_mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) ||
         pos0 > UINT32_MAX - n_tokens || n_raw > pos0 + n_tokens) {
         return 0;
@@ -27081,8 +27108,10 @@ extern "C" int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
     if (!cuda_ok(cudaStreamSynchronize(stream), "visual attention bounds sync")) return 0;
     attention_visual_pack_mixed_kv_kernel<<<(unsigned)((kv_count + 255u) / 256u), 256u, 0, stream>>>(
             kv, (const float *)raw_kv->ptr,
-            n_comp ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
-            n_raw, raw_cap, raw_start, n_comp, head_dim);
+            (n_comp && comp_kv) ? (const float *)comp_kv->ptr : (const float *)raw_kv->ptr,
+            n_raw, raw_cap, raw_start, n_comp, head_dim,
+            (n_comp && fp8) ? (const unsigned char *)comp_fp8->ptr : NULL,
+            (n_comp && fp8) ? (const float *)comp_scale->ptr : NULL);
     if (!cuda_ok(cudaGetLastError(), "visual attention KV pack launch")) return 0;
     cudaStream_t prev_stream = NULL;
     if (!cublas_ok(cublasGetStream(g_cublas, &prev_stream), "visual attention cublas get stream")) return 0;
