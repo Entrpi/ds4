@@ -40,34 +40,47 @@ int main(int argc, char **argv) {
     for (int ai = 5; ai + 2 < argc; ai += 3) {
     const char *image_path = argv[ai], *text_before = argv[ai + 1], *text_after = argv[ai + 2];
     const bool text_only = !strcmp(image_path, "-");   /* control: the same turn without an image */
-    ds4_vision_embedding emb; memset(&emb, 0, sizeof(emb));
+    /* "a.png+b.png" = several images in one turn (text parts: before, "", ..., after) */
+    enum { MAXIMG = 4 };
+    char *paths[MAXIMG]; int n_img = 0;
+    char *pathbuf = strdup(image_path);
+    if (!text_only) { for (char *tok = strtok(pathbuf, "+"); tok && n_img < MAXIMG; tok = strtok(NULL, "+")) paths[n_img++] = tok; }
+    ds4_vision_embedding emb[MAXIMG]; memset(emb, 0, sizeof(emb));
     char err[512] = {0};
     char fp[65] = "-";
     uint32_t grid_w = 0, grid_h = 0, natural_rows = 0;
-    if (!text_only) {
-        if (!ds4_engine_vision_encode_file(e, image_path, &emb, err, sizeof(err))) { fprintf(stderr, "probe: %s: encode failed: %s\n", image_path, err); failed++; continue; }
-        hex(emb.fingerprint, 32, fp);
-        grid_w = emb.grid_width; grid_h = emb.grid_height; natural_rows = emb.token_count;
+    bool enc_ok = true;
+    for (int k = 0; k < n_img; k++) {
+        if (!ds4_engine_vision_encode_file(e, paths[k], &emb[k], err, sizeof(err))) { fprintf(stderr, "probe: %s: encode failed: %s\n", paths[k], err); enc_ok = false; break; }
+        if (k == 0) { hex(emb[0].fingerprint, 32, fp); grid_w = emb[0].grid_width; grid_h = emb[0].grid_height; natural_rows = emb[0].token_count; }
     }
+    if (!enc_ok) { for (int k = 0; k < n_img; k++) ds4_vision_embedding_free(&emb[k]); free(pathbuf); failed++; continue; }
 
     ds4_tokens toks; memset(&toks, 0, sizeof(toks));
     ds4_chat_begin(e, &toks);
-    const char *parts[2] = { text_before, text_after };
-    ds4_vision_span span; memset(&span, 0, sizeof(span));
+    const char *parts[MAXIMG + 1] = { text_before, "", "", "", "" };
+    parts[n_img] = text_after;
+    ds4_vision_span spans[MAXIMG]; memset(spans, 0, sizeof(spans));
     if (text_only) {
         char *joined = malloc(strlen(text_before) + strlen(text_after) + 1);
         strcpy(joined, text_before); strcat(joined, text_after);
         ds4_chat_append_message(e, &toks, "user", joined);
         free(joined);
-    } else if (!ds4_chat_append_multimodal_message(e, &toks, "user", parts, &emb, 1, &span, err, sizeof(err))) {
-        fprintf(stderr, "probe: multimodal append failed: %s\n", err); ds4_vision_embedding_free(&emb); ds4_tokens_free(&toks); failed++; continue;
+    } else if (!ds4_chat_append_multimodal_message(e, &toks, "user", parts, emb, (size_t)n_img, spans, err, sizeof(err))) {
+        fprintf(stderr, "probe: multimodal append failed: %s\n", err);
+        for (int k = 0; k < n_img; k++) ds4_vision_embedding_free(&emb[k]);
+        ds4_tokens_free(&toks); free(pathbuf); failed++; continue;
     }
     ds4_chat_append_assistant_prefix(e, &toks, DS4_THINK_NONE);
     const int prompt_len = toks.len;
     char block_hex[17] = "-";
-    if (!text_only)
-        snprintf(block_hex, sizeof(block_hex), "%016llx",
-                 (unsigned long long)fnv1a64(span.embedding.data, (size_t)span.embedding.token_count * 4096u * sizeof(float)));
+    if (!text_only) {
+        uint64_t hsum = 0;
+        for (int k = 0; k < n_img; k++)
+            hsum ^= fnv1a64(spans[k].embedding.data, (size_t)spans[k].embedding.token_count * 4096u * sizeof(float)) + (uint64_t)k * 0x9E3779B97F4A7C15ULL;
+        snprintf(block_hex, sizeof(block_hex), "%016llx", (unsigned long long)hsum);
+    }
+    ds4_vision_span span = spans[0];   /* the first span is reported; all are passed to the sync */
 
     ds4_session *s = NULL;
     if (ds4_session_create(&s, e, ctx) != 0 || !s) { fprintf(stderr, "probe: session create failed\n"); failed++; continue; }
@@ -81,7 +94,7 @@ int main(int argc, char **argv) {
     int produced = 0;
     for (int i = 0; i < n_gen; i++) {
         const int rc = text_only ? ds4_session_sync(s, &toks, err, sizeof(err))
-                                 : ds4_session_sync_multimodal(s, &toks, &span, 1, err, sizeof(err));
+                                 : ds4_session_sync_multimodal(s, &toks, spans, (size_t)n_img, err, sizeof(err));
         if (rc != 0) {
             fprintf(stderr, "probe: sync failed at step %d: %s\n", i, err);
             break;
@@ -119,17 +132,29 @@ int main(int argc, char **argv) {
 #endif
         gen[produced++] = t;
         ds4_tokens_push(&toks, t);
+        if (t == 1) break;   /* <|end_of_sentence|>: stop, everything after it is noise */
     }
     printf("{\"image\":\"%s\",\"fingerprint\":\"%s\",\"grid\":[%u,%u],\"natural_rows\":%u,", image_path, fp, grid_h, grid_w, natural_rows);
 #ifdef DS4_VISION_PREPROCESS_VERSION
     { char idh[65]; hex(span.embedding.identity, 32, idh); printf("\"identity\":\"%s\",", idh); }
 #endif
-    printf("\"span\":{\"token_start\":%u,\"token_count\":%u},\"block_fnv1a64\":\"%s\",\"prompt_len\":%d,\"prompt_ids\":[",
-           span.token_start, span.embedding.token_count, block_hex, prompt_len);
+    printf("\"n_images\":%d,\"span\":{\"token_start\":%u,\"token_count\":%u},\"block_fnv1a64\":\"%s\",\"prompt_len\":%d,\"prompt_ids\":[",
+           n_img, span.token_start, span.embedding.token_count, block_hex, prompt_len);
     for (int i = 0; i < prompt_len; i++) printf("%s%d", i ? "," : "", toks.v[i]);
     printf("],\"generated\":[");
     for (int i = 0; i < produced; i++) printf("%s%d", i ? "," : "", gen[i]);
-    printf("],\"top3\":[");
+    printf("],\"text\":\"");
+    for (int i = 0; i < produced; i++) {
+        size_t tl = 0; char *tt = ds4_token_text(e, gen[i], &tl);
+        for (size_t k = 0; tt && k < tl; k++) {
+            const unsigned char ch = (unsigned char)tt[k];
+            if (ch == '"' || ch == '\\') printf("\\%c", ch);
+            else if (ch < 0x20) printf("\\u%04x", ch);
+            else putchar(ch);
+        }
+        free(tt);
+    }
+    printf("\",\"top3\":[");
     for (int i = 0; i < produced; i++) printf("%s[%d,%d,%d]", i ? "," : "", top4[4 * i], top4[4 * i + 1], top4[4 * i + 2]);
     printf("]");
 #ifdef DS4_VISION_PREPROCESS_VERSION
@@ -145,9 +170,10 @@ int main(int argc, char **argv) {
     printf(",\"produced\":%d,\"requested\":%d}\n", produced, n_gen);
     free(gen); free(top4);
     ds4_session_free(s);
-    if (!text_only) ds4_vision_embedding_free(&span.embedding);
+    for (int k = 0; k < n_img; k++) ds4_vision_embedding_free(&spans[k].embedding);
+    free(pathbuf);
     ds4_tokens_free(&toks);
-    if (produced != n_gen) failed++;
+    if (produced != n_gen && (produced == 0 || gen[produced - 1] != 1)) failed++;
     fflush(stdout);
     }
     ds4_engine_close(e);
