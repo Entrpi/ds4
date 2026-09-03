@@ -37,6 +37,12 @@
 #include <unistd.h>
 
 #include "ds4.h"
+/* Track B inc 3: the CUDA device half of the image prefill (embedding scatter,
+ * mixed attention, visual router) is compiled in with the encoder; without it
+ * every image-bearing sync is refused by name in ds4_session_sync. */
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_NO_VISION_ENCODER)
+#define DS4_VISION_PREFILL_DEVICE 1
+#endif
 #include "ds4_distributed.h"
 
 #ifndef DS4_NO_GPU
@@ -9598,6 +9604,16 @@ typedef struct {
     const ds4_vision_span *prefill_vision_spans;
     size_t prefill_vision_span_count;
     bool prefill_has_visual;
+    /* The host token window of the chunk in flight (set by the layer-major
+     * prefill); the attention/router dispatch reads synthetic ids from it. */
+    const int *prefill_host_tokens;
+    uint32_t prefill_host_pos0;
+    uint32_t prefill_host_count;
+    /* The bound encoder sidecar (visual router biases live there), published
+     * for the duration of an image-bearing sync. */
+    const void *vision_map;
+    uint64_t vision_size;
+    const ds4_deepseek4_vision_weights *vision_weights;
 
     /* Batched prefill tensors.  Prefill is layer-major: a chunk of prompt
      * tokens moves through layer 0, then layer 1, and so on, updating the same
@@ -16082,6 +16098,15 @@ static bool metal_graph_upload_prompt_embeddings_hc(
          * bit-identical, so degrade instead of failing the step. */
     }
 
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        if (prompt->v[pos0 + t] >= (int)DS4_N_VOCAB) {
+            /* Track B inc 3 (A6): synthetic image ids have no table row; the
+             * device gather + scatter is the only seeding path. */
+            fprintf(stderr, "ds4: image prefill needs the device embedding gather (host builder refused a synthetic id at %u)\n",
+                    pos0 + t);
+            return false;
+        }
+    }
     return metal_graph_upload_prompt_embeddings_hc_cpu(out_hc,
                                                        model,
                                                        weights,
@@ -16580,6 +16605,30 @@ static void metal_graph_log_zero_prefix_attn_engage(uint32_t n_tokens) {
             n_tokens);
 }
 
+static const int *metal_graph_visual_tokens_for_batch(const ds4_gpu_graph *g, uint32_t pos0, uint32_t n_tokens);   /* Track B inc 3 */
+
+/* Track B inc 3 (A5): the one visual attention call every consumer above
+ * routes to.  Compressed keys must be the F32 primary (upstream's kernel refuses
+ * packed KV); boot with DS4_CUDA_FP8_KV=0 for image prompts in this build. */
+static bool metal_graph_visual_attention(ds4_gpu_graph *g, const ds4_model *model,
+                                         const ds4_layer_weights *layer, uint32_t il,
+                                         uint32_t pos0, uint32_t n_tokens, const int *visual_tokens,
+                                         ds4_gpu_tensor *raw_kv, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+                                         ds4_gpu_tensor *comp_kv, uint32_t n_comp, ds4_gpu_tensor *comp_mask,
+                                         uint32_t ratio) {
+    if (n_comp != 0 && (metal_graph_attn_comp_cache_is_f16() || g->layer_comp_cache_fp8[il] != NULL)) {
+        fprintf(stderr, "ds4: visual attention needs the F32 compressed-KV primary (boot with DS4_CUDA_FP8_KV=0); layer %u refused\n", il);
+        return false;
+    }
+    return ds4_gpu_attention_visual_mixed_batch_heads_tensor(g->batch_heads, model->map, model->size,
+                                                             layer->attn_sinks->abs_offset, g->batch_q,
+                                                             raw_kv, n_comp ? comp_kv : NULL, 0u,
+                                                             comp_mask, comp_mask != NULL ? 1u : 0u,
+                                                             (const int32_t *)visual_tokens, (uint32_t)DS4_N_VOCAB,
+                                                             n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+                                                             g->raw_window, ratio, DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
+}
+
 static bool metal_graph_encode_layer_attention_batch(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -16631,6 +16680,15 @@ static bool metal_graph_encode_layer_attention_batch(
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
     const bool zero_prefix = pos0 == 0;
+    /* Track B inc 3 (A5): ONE visual decision per chunk, taken here before any
+     * attention consumer.  A chunk with image rows attends through the mixed
+     * kernel at every shape below; a shape without a visual branch fails by
+     * name instead of falling through to a causal/windowed kernel. */
+    const int *visual_tokens = metal_graph_visual_tokens_for_batch(g, pos0, n_tokens);
+    if (visual_tokens && seq_positions != NULL) {
+        fprintf(stderr, "ds4: visual attention is serial-lane only in this build (multi-seq chunk refused, il=%u)\n", il);
+        return false;
+    }
     /* B0 (ragged prefill): the batched attention ring-fit guard is per-seq in
      * multi-seq mode -- each seq lands in its own bank (offset seq_id*raw_cap),
      * so the packed n_tokens (Σ seq lens) may exceed raw_cap as long as the
@@ -17132,6 +17190,14 @@ static bool metal_graph_encode_layer_attention_batch(
     bool batch_attention_done = false;
 
     if (ok && raw_batch_attention) {
+        if (visual_tokens) {
+            /* raw keys = the chunk's own rows: the ring when they fit, else the
+             * contiguous fresh rows (raw_cap = n_tokens makes the pack an identity) */
+            const bool ring = n_tokens <= g->raw_cap;
+            ok = metal_graph_visual_attention(g, model, layer, il, pos0, n_tokens, visual_tokens,
+                                              ring ? g->layer_raw_cache[il] : g->batch_kv, n_tokens,
+                                              ring ? g->raw_cap : n_tokens, 0u, NULL, 0u, NULL, 0u);
+        } else
         /* v0.5 inc-14a: the zero-prefix chunk rides the same ring-based
          * dispatcher as every later chunk -- the store above already put
          * the whole chunk at ring slots [0, n_tokens) -- so wide first
@@ -17213,7 +17279,12 @@ static bool metal_graph_encode_layer_attention_batch(
         }
         if (ok) {
             const uint32_t sp_core = ds4_gpu_stage_prof_begin(DS4_SPROF_ATTNCORE);
-            ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(g->batch_heads,
+            if (visual_tokens) {
+            ok = metal_graph_visual_attention(g, model, layer, il, pos0, n_tokens, visual_tokens,
+                                              g->layer_raw_cache[il], n_raw, g->raw_cap, raw_start,
+                                              NULL, 0u, NULL, 0u);
+} else {
+ok = ds4_gpu_attention_decode_raw_batch_heads_tensor(g->batch_heads,
                                                                    model->map,
                                                                    model->size,
                                                                    layer->attn_sinks->abs_offset,
@@ -17237,6 +17308,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                    g->batch_capture_step ? ds4_gpu_decode_scalars_device_ptr() : NULL,
                                                                    UINT32_MAX,
                                                                    seq_positions ? (tt_single_run ? (uint32_t)g->ms_positions[0] : UINT32_MAX) : pos0) != 0;
+}
             ds4_gpu_stage_prof_end(sp_core);
         }
         if (ok) batch_attention_done = true;
@@ -19074,7 +19146,14 @@ static bool metal_graph_encode_layer_attention_batch(
                      * pre-Step-4 behavior.  C1 capture steps pass the
                      * substrates so the captured node reads the live window
                      * + count at replay time. */
-                    ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(g->batch_heads,
+                    if (visual_tokens) {
+                    ok = (!use_indexed_comp || ds4_gpu_dsv4_topk_mask_tensor(g->comp_mask, g->comp_selected, n_comp, n_tokens, DS4_N_INDEXER_TOP_K) != 0) &&
+                         metal_graph_visual_attention(g, model, layer, il, pos0, n_tokens, visual_tokens,
+                                                      g->layer_raw_cache[il], n_raw, g->raw_cap, raw_start,
+                                                      g->layer_attn_comp_cache[il], n_comp,
+                                                      (use_comp_mask || use_indexed_comp) ? g->comp_mask : NULL, ratio);
+} else {
+ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(g->batch_heads,
                                                                               model->map,
                                                                               model->size,
                                                                               layer->attn_sinks->abs_offset,
@@ -19111,6 +19190,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               /* FB1: admission-chunk fast path */
                                                                               g->batch_admit_fast ? 1u : 0u,
                                                                               seq_positions ? (tt_single_run ? (uint32_t)g->ms_positions[0] : UINT32_MAX) : pos0) != 0;
+}
                     if (ok && index_stage_profile) {
                         ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                         il,
@@ -19120,7 +19200,13 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                         &index_stage_t0);
                     }
                 } else {
-                    ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(g->batch_heads,
+                    if (visual_tokens) {
+                    ok = metal_graph_visual_attention(g, model, layer, il, pos0, n_tokens, visual_tokens,
+                                                      g->layer_raw_cache[il], n_raw, g->raw_cap, raw_start,
+                                                      g->layer_attn_comp_cache[il], n_comp,
+                                                      (use_comp_mask || use_indexed_comp) ? g->comp_mask : NULL, ratio);
+} else {
+ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(g->batch_heads,
                                                                              model->map,
                                                                              model->size,
                                                                              layer->attn_sinks->abs_offset,
@@ -19152,6 +19238,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                              g->batch_capture_step ? ds4_gpu_decode_scalars_device_ptr() : NULL,
                                                                              g->batch_capture_step ? il : UINT32_MAX,
                                                                              seq_positions ? (tt_single_run ? (uint32_t)g->ms_positions[0] : UINT32_MAX) : pos0) != 0;
+}
                 }
             }
             ds4_gpu_stage_prof_end(sp_core);
@@ -19290,7 +19377,13 @@ static bool metal_graph_encode_layer_attention_batch(
                 }
             }
             if (ok) {
-                ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(g->batch_heads,
+                if (visual_tokens) {
+                ok = ds4_gpu_dsv4_topk_mask_tensor(g->comp_mask, g->comp_selected, n_comp, n_tokens, DS4_N_INDEXER_TOP_K) != 0 &&
+                     metal_graph_visual_attention(g, model, layer, il, pos0, n_tokens, visual_tokens,
+                                                  g->layer_raw_cache[il], n_tokens, g->raw_cap, 0u,
+                                                  g->layer_attn_comp_cache[il], n_comp, g->comp_mask, ratio);
+} else {
+ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(g->batch_heads,
                                                                           model->map,
                                                                           model->size,
                                                                           layer->attn_sinks->abs_offset,
@@ -19319,6 +19412,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                           /*positions=*/NULL, /*seq_id=*/NULL,
                                                                           /* FB1: single-seq, fast path n/a */ 0u,
                                                                           pos0) != 0;
+}
                 if (ok && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                     il,
@@ -19331,7 +19425,12 @@ static bool metal_graph_encode_layer_attention_batch(
             if (ok) batch_attention_done = true;
         }
         if (ok && zero_prefix && !topk_prefill_needed && n_comp != 0) {
-            ok = ds4_gpu_attention_prefill_static_mixed_heads_tensor(g->batch_heads,
+            if (visual_tokens) {
+            ok = metal_graph_visual_attention(g, model, layer, il, pos0, n_tokens, visual_tokens,
+                                              g->batch_kv, n_tokens, n_tokens, 0u,
+                                              g->layer_attn_comp_cache[il], n_comp, NULL, ratio);
+} else {
+ok = ds4_gpu_attention_prefill_static_mixed_heads_tensor(g->batch_heads,
                                                                        model->map,
                                                                        model->size,
                                                                        layer->attn_sinks->abs_offset,
@@ -19350,10 +19449,16 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                         * them in lockstep on the batched path). */
                                                                        g->layer_comp_cache_fp8[il],
                                                                        g->layer_comp_scale[il]) != 0;
+}
             if (ok) batch_attention_done = true;
         }
     }
 
+    if (ok && visual_tokens && !raw_batch_attention && !batch_attention_done) {
+        fprintf(stderr, "ds4: visual attention: unhandled chunk shape (il=%u pos0=%u n=%u ratio=%u) -- refusing rather than falling through\n",
+                il, pos0, n_tokens, ratio);
+        ok = false;
+    }
     if (ok && !raw_batch_attention && !batch_attention_done) {
         uint32_t raw_prefix_tokens = 0;
         /* B0: zero_prefix-only raw-prefix fallback -- the ragged driver uses
@@ -19850,7 +19955,15 @@ static bool metal_graph_encode_layer_ffn_batch(
      * below); any precondition miss falls through to the exact original
      * two-call chain. */
     bool router_fused_batch = false;
-    if (ok && layer->ffn_gate_inp->type == DS4_TENSOR_F16) {
+    /* Track B inc 3 (A2): a chunk with image rows takes the unfused visual
+     * router; the fused entry has no modality variant.  A1: image rows in EVERY
+     * layer route over sprob + bias_vl, text rows keep the ordinary rule. */
+    const int *visual_router_tokens = metal_graph_visual_tokens_for_batch(g, pos0, n_tokens);
+    if (visual_router_tokens && (!g->vision_map || !g->vision_weights)) {
+        fprintf(stderr, "ds4: image prefill: visual router needs the bound sidecar (layer %u)\n", il);
+        ok = false;
+    }
+    if (ok && !visual_router_tokens && layer->ffn_gate_inp->type == DS4_TENSOR_F16) {
         router_fused_batch = ds4_gpu_router_fused_batch_tensor(
                 g->batch_router_logits,
                 g->batch_router_selected,
@@ -19959,7 +20072,28 @@ static bool metal_graph_encode_layer_ffn_batch(
         }
     }
 
-    if (ok && !router_fused_batch) ok = ds4_gpu_router_select_batch_tensor(g->batch_router_selected,
+    if (ok && !router_fused_batch && visual_router_tokens) {
+        ok = ds4_gpu_router_select_batch_visual_tensor(g->batch_router_selected,
+                                                       g->batch_router_weights,
+                                                       g->batch_router_probs,
+                                                       model->map,
+                                                       model->size,
+                                                       layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
+                                                       layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
+                                                       layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
+                                                       layer->ffn_exp_probs_b != NULL,
+                                                       layer->ffn_gate_tid2eid != NULL,
+                                                       g->vision_map,
+                                                       g->vision_size,
+                                                       g->vision_weights->visual_router_bias[il],
+                                                       g->batch_router_logits,
+                                                       g->prefill_tokens,
+                                                       (uint32_t)DS4_N_VOCAB,
+                                                       DS4_N_EXPERT,
+                                                       DS4_N_EXPERT_USED,
+                                                       DS4_EXPERT_WEIGHT_SCALE,
+                                                       n_tokens) != 0;
+    } else if (ok && !router_fused_batch) ok = ds4_gpu_router_select_batch_tensor(g->batch_router_selected,
                                                       g->batch_router_weights,
                                                       g->batch_router_probs,
                                                       model->map,
@@ -21422,6 +21556,65 @@ static void metal_graph_report_prefill_display_progress(
                      (int)(start + (uint32_t)done), total);
 }
 
+/* ===================== Track B inc 3 (device half): visual rows in a prefill chunk =====================
+ * The chunk's host token window, published so the attention/router dispatch can
+ * see synthetic ids without a device readback. */
+static const int *metal_graph_visual_tokens_for_batch(const ds4_gpu_graph *g, uint32_t pos0, uint32_t n_tokens) {
+    if (!g || !g->prefill_has_visual || !g->prefill_host_tokens || pos0 < g->prefill_host_pos0) return NULL;
+    const uint32_t off = pos0 - g->prefill_host_pos0;
+    if (off > g->prefill_host_count || n_tokens > g->prefill_host_count - off) return NULL;
+    const int *tokens = g->prefill_host_tokens + off;
+    for (uint32_t i = 0; i < n_tokens; i++)
+        if (tokens[i] >= (int)DS4_N_VOCAB) return tokens;
+    return NULL;
+}
+
+/* A6: after the device gather (which clamps synthetic ids to row 0) overwrite
+ * every image row of the chunk with its span row, replicated across the
+ * DS4_N_HC lanes exactly as the host HC layout.  Every synthetic id in the
+ * window must be covered by a published span, or the chunk is refused. */
+static bool metal_graph_scatter_visual_rows(ds4_gpu_graph *g, const token_vec *prompt,
+                                            uint32_t pos0, uint32_t n_tokens) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    uint32_t synthetic = 0, covered = 0;
+    for (uint32_t t = 0; t < n_tokens; t++)
+        if (prompt->v[pos0 + t] >= (int)DS4_N_VOCAB) synthetic++;
+    if (synthetic == 0) return true;
+    float *stage = NULL;
+    uint32_t stage_rows = 0;
+    bool ok = true;
+    for (size_t i = 0; ok && i < g->prefill_vision_span_count; i++) {
+        const ds4_vision_span *span = &g->prefill_vision_spans[i];
+        const uint64_t b = span->token_start, e = b + span->embedding.token_count;
+        const uint64_t lo = b > pos0 ? b : pos0;
+        const uint64_t hi = e < (uint64_t)pos0 + n_tokens ? e : (uint64_t)pos0 + n_tokens;
+        if (lo >= hi) continue;
+        if (!span->embedding.data) { ok = false; break; }
+        const uint32_t rows = (uint32_t)(hi - lo);
+        if (rows > stage_rows) {
+            free(stage);
+            stage = xmalloc((size_t)rows * hc_dim * sizeof(float));
+            stage_rows = rows;
+        }
+        for (uint32_t r = 0; r < rows; r++) {
+            const float *src = span->embedding.data + (lo - b + r) * DS4_N_EMBD;
+            for (uint32_t h = 0; h < DS4_N_HC; h++)
+                memcpy(stage + (uint64_t)r * hc_dim + (uint64_t)h * DS4_N_EMBD, src,
+                       (size_t)DS4_N_EMBD * sizeof(float));
+        }
+        ok = ds4_gpu_tensor_write(g->batch_cur_hc, (lo - pos0) * hc_dim * sizeof(float),
+                                  stage, (uint64_t)rows * hc_dim * sizeof(float)) != 0;
+        covered += rows;
+    }
+    free(stage);
+    if (ok && covered != synthetic) {
+        fprintf(stderr, "ds4: image prefill: %u synthetic rows in chunk @%u but %u covered by spans\n",
+                synthetic, pos0, covered);
+        ok = false;
+    }
+    return ok;
+}
+
 static bool metal_graph_prefill_layer_major(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -21443,6 +21636,10 @@ static bool metal_graph_prefill_layer_major(
 
     bool ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (!ok) return false;
+    g->prefill_host_tokens = prompt->v;   /* Track B inc 3: the chunk's host window */
+    g->prefill_host_pos0 = 0;
+    g->prefill_host_count = (uint32_t)prompt->len;
+    const bool visual_chunk = metal_graph_visual_tokens_for_batch(g, start, n_tokens) != NULL;
 
     if (!metal_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) return false;
 
@@ -21471,6 +21668,7 @@ static bool metal_graph_prefill_layer_major(
                                                      prompt,
                                                      start,
                                                      n_tokens);
+        if (ok && visual_chunk) ok = metal_graph_scatter_visual_rows(g, prompt, start, n_tokens);   /* Track B inc 3 (A6) */
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
             ok = metal_graph_encode_layer_batch(g,
@@ -21548,6 +21746,7 @@ static bool metal_graph_prefill_layer_major(
                                                  prompt,
                                                  start,
                                                  n_tokens);
+        if (ok && visual_chunk) ok = metal_graph_scatter_visual_rows(g, prompt, start, n_tokens);   /* Track B inc 3 (A6) */
     const double t_embed_encoded = (profile || throttle) ? now_sec() : 0.0;
     const double t_embed_done = (profile || throttle) ? now_sec() : 0.0;
     if (profile) {
@@ -21787,7 +21986,19 @@ static bool metal_graph_prefill_chunked_range(
                 if (to_boundary < local_cap) local_cap = to_boundary;
             }
         }
-        const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
+        uint32_t chunk = remaining < local_cap ? remaining : local_cap;
+        if (g->prefill_has_visual) {
+            /* Track B inc 3: an image block never splits across a chunk; a block
+             * starting at a resume boundary takes the full cap (upstream's rule,
+             * named as the chunk-boundary case of the identity gate). */
+            if (start != 0 && prompt->v[pos0] >= (int)DS4_N_VOCAB) local_cap = chunk_cap;
+            uint32_t vchunk = 0;
+            if (!ds4_deepseek4_prefill_chunk(prompt->v, end, DS4_N_VOCAB, pos0, local_cap, &vchunk) || vchunk == 0) {
+                fprintf(stderr, "ds4: malformed or oversized DeepSeek image token block at token %u\n", pos0);
+                return false;
+            }
+            chunk = vchunk;
+        }
         const uint32_t chunk_end = pos0 + chunk;
         float *chunk_logits = (progress || chunk_end == end) ? logits : NULL;
         bool ok = metal_graph_prefill_layer_major(g,
@@ -39080,6 +39291,10 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                         /* D4.5g: spec-off window -> no drafts this step (re-entry pays a
                          * 1-step ramp: the first spec step packs 0 drafts and re-seeds). */
                         if (ad_active && b == ad_b && !ad_eff_spec) { dg_adwin++; continue; }
+                        /* Track B inc 3 (A4): a synthetic image id has no embedding row
+                         * and no Markov row; a bank whose frontier token is one takes
+                         * no draft this step (counted with the no-seed banks). */
+                        if (cur[b] < 0 || (uint32_t)cur[b] >= (uint32_t)DS4_N_VOCAB) { dg_noseed++; continue; }
                         dg_drafted++;
                         Pbank[nl]   = (int32_t)posv[b];
                         bonusv[nl]  = cur[b];
@@ -42734,12 +42949,18 @@ int ds4_session_sync_multimodal(ds4_session *s, const ds4_tokens *prompt,
     s->graph.prefill_vision_spans = images;
     s->graph.prefill_vision_span_count = image_count;
     s->graph.prefill_has_visual = image_count != 0;
+    s->graph.vision_map = image_count != 0 ? s->engine->vision_model.map : NULL;
+    s->graph.vision_size = image_count != 0 ? s->engine->vision_model.size : 0;
+    s->graph.vision_weights = image_count != 0 ? &s->engine->vision_weights : NULL;
 #endif
     const int rc = ds4_session_sync(s, prompt, err, errlen);
 #ifndef DS4_NO_GPU
     s->graph.prefill_vision_spans = NULL;
     s->graph.prefill_vision_span_count = 0;
     s->graph.prefill_has_visual = false;
+    s->graph.vision_map = NULL;
+    s->graph.vision_size = 0;
+    s->graph.vision_weights = NULL;
 #endif
     s->sync_images = NULL;
     s->sync_image_count = 0;

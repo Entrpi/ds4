@@ -2027,6 +2027,26 @@ int ds4_gpu_router_select_tensor(
         bool                    hash_mode,
         const ds4_gpu_tensor *logits);
 
+/* Track B inc 3 (A5): mixed attention for a chunk with image rows: text rows
+ * stay causal + windowed, image rows see their whole block bidirectionally;
+ * raw keys via [lo,hi] bounds per row, compressed keys by position, the indexer
+ * top-k as an additive mask, sinks in the denominator.  comp_kv must be F32. */
+int ds4_gpu_attention_visual_mixed_batch_heads_tensor(
+        ds4_gpu_tensor *heads, const void *model_map, uint64_t model_size, uint64_t sinks_offset,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *raw_kv, const ds4_gpu_tensor *comp_kv,
+        uint32_t comp_kv_f16, const ds4_gpu_tensor *comp_mask, uint32_t use_comp_mask,
+        const int32_t *tokens, uint32_t vocab_size, uint32_t n_tokens, uint32_t pos0,
+        uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp, uint32_t window,
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim);
+/* Track B inc 3: the visual router (synthetic image rows take top-6 over
+ * sprob + the sidecar's per-layer visual bias in every layer). */
+int ds4_gpu_router_select_batch_visual_tensor(
+        ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs,
+        const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset,
+        uint32_t hash_rows, bool has_bias, bool hash_mode,
+        const void *vision_map, uint64_t vision_size, uint64_t visual_bias_offset,
+        const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t vocab_size,
+        uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens);
 int ds4_gpu_router_select_batch_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,

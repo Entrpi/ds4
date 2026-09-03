@@ -1,0 +1,236 @@
+{
+  "font_used": "/System/Library/Fonts/Supplemental/Arial.ttf",
+  "seed": 20260903,
+  "items": [
+    {
+      "id": "bar_01",
+      "image": "bar_01.png",
+      "category": "bar",
+      "question": "What is the value of the Design bar?",
+      "answer": "40",
+      "answer_aliases": [],
+      "notes": "A 4-bar chart with printed values; query targets Design."
+    },
+    {
+      "id": "bar_02",
+      "image": "bar_02.png",
+      "category": "bar",
+      "question": "What is the value of the East bar?",
+      "answer": "29",
+      "answer_aliases": [],
+      "notes": "A 6-bar chart with printed values; query targets East."
+    },
+    {
+      "id": "bar_03",
+      "image": "bar_03.png",
+      "category": "bar",
+      "question": "What is the value of the Amber bar?",
+      "answer": "30",
+      "answer_aliases": [],
+      "notes": "A 5-bar chart with printed values; query targets Amber."
+    },
+    {
+      "id": "bar_04",
+      "image": "bar_04.png",
+      "category": "bar",
+      "question": "What is the value of the Beta bar?",
+      "answer": "55",
+      "answer_aliases": [],
+      "notes": "A 4-bar chart with printed values; query targets Beta."
+    },
+    {
+      "id": "table_01",
+      "image": "table_01.png",
+      "category": "table",
+      "question": "What is the value in the Price column for the Widget C row?",
+      "answer": "19.99",
+      "answer_aliases": [
+        "$19.99"
+      ],
+      "notes": "A 4-row table; query targets one named row and column."
+    },
+    {
+      "id": "table_02",
+      "image": "table_02.png",
+      "category": "table",
+      "question": "What is the value in the Best column for the Mina row?",
+      "answer": "52.8s",
+      "answer_aliases": [
+        "52.8"
+      ],
+      "notes": "A 5-row table; query targets one named row and column."
+    },
+    {
+      "id": "table_03",
+      "image": "table_03.png",
+      "category": "table",
+      "question": "What is the value in the Humidity column for the West row?",
+      "answer": "63%",
+      "answer_aliases": [
+        "63"
+      ],
+      "notes": "A 3-row table; query targets one named row and column."
+    },
+    {
+      "id": "table_04",
+      "image": "table_04.png",
+      "category": "table",
+      "question": "What is the value in the Code column for the Beacon row?",
+      "answer": "K7P4",
+      "answer_aliases": [],
+      "notes": "A 5-row table; query targets one named row and column."
+    },
+    {
+      "id": "screenshot_01",
+      "image": "screenshot_01.png",
+      "category": "screenshot",
+      "question": "What is the PID on the line containing FATAL?",
+      "answer": "48213",
+      "answer_aliases": [],
+      "notes": "A dark worker log with one FATAL line containing a PID."
+    },
+    {
+      "id": "screenshot_02",
+      "image": "screenshot_02.png",
+      "category": "screenshot",
+      "question": "What value is assigned to timeout_ms?",
+      "answer": "7500",
+      "answer_aliases": [],
+      "notes": "A light configuration editor with a timeout assignment."
+    },
+    {
+      "id": "screenshot_03",
+      "image": "screenshot_03.png",
+      "category": "screenshot",
+      "question": "What value is assigned to release_tag?",
+      "answer": "Q7M9K2",
+      "answer_aliases": [],
+      "notes": "A dark deployment summary with a distinctive release tag."
+    },
+    {
+      "id": "screenshot_04",
+      "image": "screenshot_04.png",
+      "category": "screenshot",
+      "question": "What value is assigned to retry_limit?",
+      "answer": "7",
+      "answer_aliases": [],
+      "notes": "A light queue settings view with a numeric retry limit."
+    },
+    {
+      "id": "digits_01",
+      "image": "digits_01.png",
+      "category": "digits",
+      "question": "What is the code shown in the image?",
+      "answer": "HD8A58P",
+      "answer_aliases": [],
+      "notes": "A centered 7-character code using only unambiguous glyphs."
+    },
+    {
+      "id": "digits_02",
+      "image": "digits_02.png",
+      "category": "digits",
+      "question": "What is the code shown in the image?",
+      "answer": "KE3FJKSA",
+      "answer_aliases": [],
+      "notes": "A centered 8-character code using only unambiguous glyphs."
+    },
+    {
+      "id": "digits_03",
+      "image": "digits_03.png",
+      "category": "digits",
+      "question": "What is the code shown in the image?",
+      "answer": "CMM3UVJUD",
+      "answer_aliases": [],
+      "notes": "A centered 9-character code using only unambiguous glyphs."
+    },
+    {
+      "id": "digits_04",
+      "image": "digits_04.png",
+      "category": "digits",
+      "question": "What is the code shown in the image?",
+      "answer": "JEQZHGSPJ",
+      "answer_aliases": [],
+      "notes": "A centered 9-character code using only unambiguous glyphs."
+    },
+    {
+      "id": "count_01",
+      "image": "count_01.png",
+      "category": "count",
+      "question": "How many red shapes are there?",
+      "answer": "3",
+      "answer_aliases": [
+        "three"
+      ],
+      "notes": "There are 9 separated circles or squares; query targets red."
+    },
+    {
+      "id": "count_02",
+      "image": "count_02.png",
+      "category": "count",
+      "question": "How many blue shapes are there?",
+      "answer": "3",
+      "answer_aliases": [
+        "three"
+      ],
+      "notes": "There are 9 separated circles or squares; query targets blue."
+    },
+    {
+      "id": "count_03",
+      "image": "count_03.png",
+      "category": "count",
+      "question": "How many green shapes are there?",
+      "answer": "4",
+      "answer_aliases": [
+        "four"
+      ],
+      "notes": "There are 9 separated circles or squares; query targets green."
+    },
+    {
+      "id": "count_04",
+      "image": "count_04.png",
+      "category": "count",
+      "question": "How many yellow shapes are there?",
+      "answer": "4",
+      "answer_aliases": [
+        "four"
+      ],
+      "notes": "There are 7 separated circles or squares; query targets yellow."
+    },
+    {
+      "id": "word_01",
+      "image": "word_01.png",
+      "category": "word",
+      "question": "Which word is written in capital letters?",
+      "answer": "URGENT",
+      "answer_aliases": [],
+      "notes": "An original 54-word paragraph with exactly one all-caps word."
+    },
+    {
+      "id": "word_02",
+      "image": "word_02.png",
+      "category": "word",
+      "question": "Which word is written in capital letters?",
+      "answer": "HIDDEN",
+      "answer_aliases": [],
+      "notes": "An original 54-word paragraph with exactly one all-caps word."
+    },
+    {
+      "id": "word_03",
+      "image": "word_03.png",
+      "category": "word",
+      "question": "Which word is written in capital letters?",
+      "answer": "BRIGHT",
+      "answer_aliases": [],
+      "notes": "An original 56-word paragraph with exactly one all-caps word."
+    },
+    {
+      "id": "word_04",
+      "image": "word_04.png",
+      "category": "word",
+      "question": "Which word is written in capital letters?",
+      "answer": "SILENT",
+      "answer_aliases": [],
+      "notes": "An original 55-word paragraph with exactly one all-caps word."
+    }
+  ]
+}

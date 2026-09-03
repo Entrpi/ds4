@@ -256,6 +256,16 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ tests/dump_vision_embedding.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
+tests/vision_serial_probe.o: tests/vision_serial_probe.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/vision_serial_probe.c
+
+tests/vision_serial_probe: tests/vision_serial_probe.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(CFLAGS) -o $@ tests/vision_serial_probe.o $(CORE_OBJS) $(METAL_LDLIBS)
+else
+	$(NVCC) $(NVCCFLAGS) -o $@ tests/vision_serial_probe.o $(CORE_OBJS) $(CUDA_LDLIBS)
+endif
+
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 

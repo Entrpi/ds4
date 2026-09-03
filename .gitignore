@@ -22,3 +22,4 @@ __pycache__/
 # Track B: image substrate unit test binary
 tests/test_deepseek4_vision_image
 tests/dump_vision_embedding
+tests/vision_serial_probe
