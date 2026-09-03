@@ -19455,9 +19455,21 @@ ok = ds4_gpu_attention_prefill_static_mixed_heads_tensor(g->batch_heads,
     }
 
     if (ok && visual_tokens && !raw_batch_attention && !batch_attention_done) {
-        fprintf(stderr, "ds4: visual attention: unhandled chunk shape (il=%u pos0=%u n=%u ratio=%u) -- refusing rather than falling through\n",
-                il, pos0, n_tokens, ratio);
-        ok = false;
+        if (zero_prefix && compressed && n_tokens / ratio == 0) {
+            /* A compressed layer whose zero-prefix chunk is too short to emit a
+             * compressed key (Flash's odd layers are ratio 128): the whole chunk
+             * attends over its own raw rows, exactly like a dense layer
+             * (upstream's tp_attn_full_raw rule). */
+            const bool ring = n_tokens <= g->raw_cap;
+            ok = metal_graph_visual_attention(g, model, layer, il, pos0, n_tokens, visual_tokens,
+                                              ring ? g->layer_raw_cache[il] : g->batch_kv, n_tokens,
+                                              ring ? g->raw_cap : n_tokens, 0u, NULL, 0u, NULL, 0u);
+            if (ok) batch_attention_done = true;
+        } else {
+            fprintf(stderr, "ds4: visual attention: unhandled chunk shape (il=%u pos0=%u n=%u ratio=%u) -- refusing rather than falling through\n",
+                    il, pos0, n_tokens, ratio);
+            ok = false;
+        }
     }
     if (ok && !raw_batch_attention && !batch_attention_done) {
         uint32_t raw_prefix_tokens = 0;
@@ -43038,6 +43050,16 @@ static int ds4_session_sync_body(ds4_session *s, const ds4_tokens *prompt, char 
     if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;   /* S6 lazy graph */
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
+    /* Track B inc 3: the lazy graph alloc above zeroes the graph, so the image
+     * spans of the sync in flight are (re)published HERE, from the session,
+     * every time -- never only before the sync (the 09-03 identity leg found
+     * every image chunk prefilled as text that way). */
+    s->graph.prefill_vision_spans = s->sync_images;
+    s->graph.prefill_vision_span_count = s->sync_image_count;
+    s->graph.prefill_has_visual = s->sync_image_count != 0;
+    s->graph.vision_map = s->sync_image_count != 0 ? e->vision_model.map : NULL;
+    s->graph.vision_size = s->sync_image_count != 0 ? e->vision_model.size : 0;
+    s->graph.vision_weights = s->sync_image_count != 0 ? &e->vision_weights : NULL;
 
     if (s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&
@@ -43225,6 +43247,9 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
      * of synthetic ids, so it stops at the first recorded image block. */
     return ds4_vision_lineage_prefix_cap(&s->lineage, i);
 }
+
+const float *ds4_session_logits(const ds4_session *s) { return s ? s->logits : NULL; }
+int ds4_session_n_vocab(const ds4_session *s) { (void)s; return (int)DS4_N_VOCAB; }
 
 int ds4_session_argmax(ds4_session *s) {
     return sample_argmax(s->logits, DS4_N_VOCAB);

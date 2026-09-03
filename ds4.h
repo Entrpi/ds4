@@ -1314,6 +1314,11 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
+/* The live logits of the last synced/decoded position (DS4_N_VOCAB floats, valid
+ * until the next sync/decode).  Read-only; probes and gates use it for logit-level
+ * adjudication of greedy near-ties. */
+const float *ds4_session_logits(const ds4_session *s);
+int ds4_session_n_vocab(const ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
