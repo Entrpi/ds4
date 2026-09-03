@@ -198,6 +198,9 @@ const uint8_t *ds4_engine_vision_fingerprint(ds4_engine *e);
  * refuse by name. */
 #define DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL 1u
 #define DS4_VISION_PREPROCESS_VERSION 1u   /* bump when the preprocess (patch/downsample/budget/layout) changes */
+/* Synthetic image-row ids are DS4_VISION_ID_BASE + DeepSeek row type (== the
+ * vocabulary size; ds4.c static-asserts the two never drift). */
+#define DS4_VISION_ID_BASE 129280u
 typedef struct {
     float *data;
     uint32_t token_count;
@@ -222,6 +225,60 @@ int ds4_engine_vision_encode_file(ds4_engine *e, const char *path,
 int ds4_engine_vision_encode_memory(ds4_engine *e, const uint8_t *encoded, size_t encoded_len,
                                     ds4_vision_embedding *out, char *error, size_t error_cap);
 void ds4_vision_embedding_free(ds4_vision_embedding *embedding);
+/* Track B inc 3 (token stream, serial lane).  ds4_prompt_append_vision lays the
+ * encoder's natural grid out as one DeepSeek image block at the CURRENT prompt
+ * position (position-dependent padding, the "N"-order permutation, the four
+ * sentinel rows from the sidecar), pushes one synthetic id (DS4_N_VOCAB + row
+ * type) per row, and moves the finished [token_count x 4096] block into the span
+ * (the embedding is consumed).  The block's cache identity is the embedding's
+ * `identity`, never its fingerprint. */
+int ds4_prompt_append_vision(ds4_engine *e, ds4_tokens *tokens, ds4_vision_span *span,
+                             ds4_vision_embedding *embedding, char *error, size_t error_cap);
+/* Append one user or tool message whose text parts alternate with images
+ * (text_parts has image_count + 1 entries).  On success ownership of every
+ * embedding moves into the matching span; on failure the token stream and the
+ * embeddings are left exactly as they were. */
+int ds4_chat_append_multimodal_message(ds4_engine *e, ds4_tokens *tokens, const char *role,
+                                       const char *const *text_parts,
+                                       ds4_vision_embedding *embeddings, size_t image_count,
+                                       ds4_vision_span *spans, char *error, size_t error_cap);
+/* The ORDERED identity of one image block that conditioned a session
+ * checkpoint: its token span and the embedding's cache identity (charter A7). */
+typedef struct {
+    uint32_t token_start;
+    uint32_t token_count;
+    uint8_t  identity[32];
+} ds4_vision_identity;
+/* Engine-free core of ds4_prompt_append_vision (unit-tested without a model):
+ * sentinel_bf16[] is indexed by the DeepSeek row type (START, PAD, IMAGE unused,
+ * NEWLINE, END), each a 4096-wide BF16 vector. */
+int ds4_vision_prompt_append_rows(ds4_tokens *tokens, ds4_vision_span *span,
+                                  ds4_vision_embedding *embedding,
+                                  const uint16_t *const sentinel_bf16[5],
+                                  char *error, size_t error_cap);
+/* Every span must cover exactly one complete DeepSeek image block of the
+ * prompt, in token order, without overlap. */
+int ds4_vision_spans_validate(const ds4_tokens *prompt, const ds4_vision_span *images,
+                              size_t image_count, char *err, size_t errlen);
+/* The image lineage of a checkpoint (identities in token order) and the A7
+ * rules over it.  Pure, so the unit battery can pin them; the session owns one. */
+typedef struct {
+    ds4_vision_identity *v;
+    size_t n;
+} ds4_vision_lineage;
+void ds4_vision_lineage_clear(ds4_vision_lineage *l);
+int  ds4_vision_lineage_store(ds4_vision_lineage *l, const ds4_vision_span *images, size_t image_count);
+/* True when every recorded image sits at the same span with the same identity
+ * in `images`, and no extra image in `images` starts inside the checkpoint
+ * (checkpoint_len tokens).  An invalid checkpoint matches anything. */
+bool ds4_vision_lineage_prefix_matches(const ds4_vision_lineage *l, bool checkpoint_valid,
+                                       int checkpoint_len, const ds4_vision_span *images,
+                                       size_t image_count);
+/* Cap a token-prefix walk at the start of the first recorded block it enters. */
+int  ds4_vision_lineage_prefix_cap(const ds4_vision_lineage *l, int len);
+/* Truncate the lineage to blocks that end at or before pos.  Returns false when
+ * pos lands INSIDE a block: the caller must invalidate the whole checkpoint. */
+bool ds4_vision_lineage_rewind(ds4_vision_lineage *l, int pos);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
@@ -1230,6 +1287,27 @@ typedef enum {
  * checkpoint is a prefix, only the suffix is evaluated; otherwise the backend
  * state is refilled from scratch. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+/* Track B inc 3: sync to a prompt whose token stream carries image blocks.  Each
+ * span must cover exactly one complete DeepSeek image block in token order.  The
+ * live checkpoint is reused only when every image that conditioned it has the
+ * same span AND identity in the new prompt; otherwise the state is rebuilt.
+ * The CUDA device half of the image prefill is not in this build yet: any
+ * image-bearing sync is refused by name (text prompts are unaffected). */
+int ds4_session_sync_multimodal(ds4_session *s, const ds4_tokens *prompt,
+                                const ds4_vision_span *images, size_t image_count,
+                                char *err, size_t errlen);
+/* True only when every image that conditioned the live checkpoint has the same
+ * token span and identity in the supplied list (and the list has no extra image
+ * inside the checkpoint). */
+bool ds4_session_vision_state_matches(const ds4_session *s, const ds4_vision_span *images,
+                                      size_t image_count);
+/* True while the session holds, or is syncing, image-conditioned state.  Such
+ * state must never be written to a text-keyed cache (kvstore, bank payloads,
+ * agent cache) until the record format carries the identity list (inc 8). */
+bool ds4_session_has_vision_state(const ds4_session *s);
+/* The ordered identity list of the live checkpoint (count returned; *out may be
+ * NULL when the count is 0). */
+size_t ds4_session_vision_identities(const ds4_session *s, const ds4_vision_identity **out);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,

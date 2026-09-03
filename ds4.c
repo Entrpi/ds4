@@ -9592,6 +9592,12 @@ typedef struct {
 
     uint32_t prefill_cap;
     uint32_t raw_window;
+    /* Track B inc 3: the image spans of the prompt being prefilled on the serial
+     * lane.  The device half (embedding scatter, mixed attention, visual router)
+     * reads these; while it is absent every image-bearing sync is refused. */
+    const ds4_vision_span *prefill_vision_spans;
+    size_t prefill_vision_span_count;
+    bool prefill_has_visual;
 
     /* Batched prefill tensors.  Prefill is layer-major: a chunk of prompt
      * tokens moves through layer 0, then layer 1, and so on, updating the same
@@ -23669,6 +23675,290 @@ void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_thi
                    e->vocab.think_start_id : e->vocab.think_end_id);
 }
 
+/* ===================== Track B inc 3: image blocks in the token stream =====================
+ * Upstream's ds4_prompt_append_deepseek4_vision on the fork's engine fields.  The
+ * block assembly is a pure function of (layout, encoder rows, sentinel rows) so
+ * the unit battery can exercise the position-dependent padding, the permutation
+ * and the sentinel placement without a model. */
+static float ds4_vision_bf16_to_f32(uint16_t value) {
+    uint32_t bits = (uint32_t)value << 16;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static const uint16_t *ds4_deepseek4_vision_vector(const ds4_engine *e, uint64_t offset) {
+    const uint64_t bytes = 4096u * sizeof(uint16_t);
+    if (!e || !e->vision_model.map || offset > e->vision_model.size ||
+        bytes > e->vision_model.size - offset) return NULL;
+    return (const uint16_t *)((const uint8_t *)e->vision_model.map + offset);
+}
+
+/* Fill block[token_count x 4096] from the layout: IMAGE rows take the encoder
+ * row named by perm[], every other row is the BF16 sentinel of its type.
+ * sentinel[] is indexed by DS4_DEEPSEEK4_IMAGE_* (the IMAGE slot is unused). */
+static bool ds4_vision_block_assemble(const ds4_deepseek4_image_layout *layout,
+                                      const float *image_rows, uint32_t image_row_count,
+                                      const uint16_t *const sentinel[5],
+                                      float *block, char *error, size_t error_cap) {
+    uint32_t image_pos = 0;
+    for (uint32_t row = 0; row < layout->token_count; row++) {
+        const uint8_t type = layout->types[row];
+        float *dst = block + (uint64_t)row * 4096u;
+        if (type == DS4_DEEPSEEK4_IMAGE) {
+            if (image_pos >= layout->image_count) {
+                if (error && error_cap) snprintf(error, error_cap, "invalid DeepSeek image embedding permutation");
+                return false;
+            }
+            const uint32_t source = layout->perm[image_pos++];
+            if (source >= image_row_count) {
+                if (error && error_cap) snprintf(error, error_cap, "DeepSeek image permutation names a missing row");
+                return false;
+            }
+            memcpy(dst, image_rows + (uint64_t)source * 4096u, 4096u * sizeof(float));
+        } else {
+            if (type > DS4_DEEPSEEK4_IMAGE_END || !sentinel[type]) {
+                if (error && error_cap) snprintf(error, error_cap, "DeepSeek vision sentinels are not mapped");
+                return false;
+            }
+            const uint16_t *src = sentinel[type];
+            for (uint32_t d = 0; d < 4096u; d++) dst[d] = ds4_vision_bf16_to_f32(src[d]);
+        }
+    }
+    if (image_pos != layout->image_count) {
+        if (error && error_cap) snprintf(error, error_cap, "invalid DeepSeek image embedding count");
+        return false;
+    }
+    return true;
+}
+
+int ds4_vision_prompt_append_rows(ds4_tokens *tokens, ds4_vision_span *span,
+                                  ds4_vision_embedding *embedding,
+                                  const uint16_t *const sentinel_bf16[5],
+                                  char *error, size_t error_cap) {
+    if (!tokens || !span || !embedding || !embedding->data || embedding->token_count == 0 || !sentinel_bf16) {
+        if (error && error_cap) snprintf(error, error_cap, "invalid vision prompt input");
+        return 0;
+    }
+    if (embedding->layout != DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL ||
+        embedding->grid_height == 0 || embedding->grid_width == 0 ||
+        embedding->token_count != embedding->grid_height * embedding->grid_width) {
+        if (error && error_cap) snprintf(error, error_cap, "invalid DeepSeek vision embedding layout");
+        return 0;
+    }
+    if (tokens->len < 0) {
+        if (error && error_cap) snprintf(error, error_cap, "invalid token stream");
+        return 0;
+    }
+    /* DS4_N_VOCAB is a runtime shape value; the public id base must agree with it
+     * or every consumer's "id >= vocabulary" test would mis-classify rows. */
+    if ((uint32_t)DS4_N_VOCAB != DS4_VISION_ID_BASE) {
+        if (error && error_cap) snprintf(error, error_cap, "vocabulary size does not match DS4_VISION_ID_BASE");
+        return 0;
+    }
+    ds4_deepseek4_image_layout layout = {0};
+    if (!ds4_deepseek4_image_layout_build(&layout, embedding->grid_height, embedding->grid_width,
+                                          (uint32_t)tokens->len, error, error_cap)) return 0;
+    if (layout.image_count != embedding->token_count ||
+        layout.token_count > (uint32_t)(INT_MAX - tokens->len)) {
+        ds4_deepseek4_image_layout_free(&layout);
+        if (error && error_cap) snprintf(error, error_cap, "DeepSeek vision prompt is too large");
+        return 0;
+    }
+    const uint64_t values = (uint64_t)layout.token_count * 4096u;
+    if (values > SIZE_MAX / sizeof(float)) {
+        ds4_deepseek4_image_layout_free(&layout);
+        if (error && error_cap) snprintf(error, error_cap, "DeepSeek vision embedding is too large");
+        return 0;
+    }
+    float *block = malloc((size_t)values * sizeof(float));
+    if (!block) {
+        ds4_deepseek4_image_layout_free(&layout);
+        if (error && error_cap) snprintf(error, error_cap, "unable to allocate DeepSeek image block");
+        return 0;
+    }
+    if (!ds4_vision_block_assemble(&layout, embedding->data, embedding->token_count, sentinel_bf16,
+                                   block, error, error_cap)) {
+        free(block);
+        ds4_deepseek4_image_layout_free(&layout);
+        return 0;
+    }
+    const uint32_t token_start = (uint32_t)tokens->len;
+    for (uint32_t i = 0; i < layout.token_count; i++)
+        ds4_tokens_push(tokens, (int)(DS4_N_VOCAB + layout.types[i]));
+    free(embedding->data);
+    embedding->data = block;
+    embedding->token_count = layout.token_count;
+    embedding->layout = 0;
+    embedding->grid_width = 0;
+    embedding->grid_height = 0;
+    memset(span, 0, sizeof(*span));
+    span->token_start = token_start;
+    span->embedding = *embedding;
+    memset(embedding, 0, sizeof(*embedding));
+    ds4_deepseek4_image_layout_free(&layout);
+    return 1;
+}
+
+int ds4_prompt_append_vision(ds4_engine *e, ds4_tokens *tokens, ds4_vision_span *span,
+                             ds4_vision_embedding *embedding, char *error, size_t error_cap) {
+    if (!e || !e->vision_ready) {
+        if (error && error_cap) snprintf(error, error_cap, "vision encoder is not loaded");
+        return 0;
+    }
+    const ds4_deepseek4_vision_weights *w = &e->vision_weights;
+    const uint16_t *const sentinel[5] = {
+        ds4_deepseek4_vision_vector(e, w->image_start),
+        ds4_deepseek4_vision_vector(e, w->image_pad),
+        NULL,
+        ds4_deepseek4_vision_vector(e, w->image_newline),
+        ds4_deepseek4_vision_vector(e, w->image_end),
+    };
+    return ds4_vision_prompt_append_rows(tokens, span, embedding, sentinel, error, error_cap);
+}
+
+int ds4_vision_spans_validate(const ds4_tokens *prompt, const ds4_vision_span *images,
+                              size_t image_count, char *err, size_t errlen) {
+    if (!prompt || (image_count != 0 && !images)) {
+        if (err && errlen) snprintf(err, errlen, "invalid multimodal prompt");
+        return 0;
+    }
+    uint64_t previous_end = 0;
+    for (size_t i = 0; i < image_count; i++) {
+        const ds4_vision_span *span = &images[i];
+        const uint64_t end = (uint64_t)span->token_start + span->embedding.token_count;
+        if (!span->embedding.data || span->embedding.token_count == 0 ||
+            span->token_start < previous_end || end > (uint64_t)prompt->len) {
+            if (err && errlen) snprintf(err, errlen, "invalid or overlapping image token span");
+            return 0;
+        }
+        uint32_t cursor = 0, block_start = 0, image_start = 0, image_end = 0;
+        const int parsed = ds4_deepseek4_next_image_span(prompt->v + span->token_start,
+                                                         span->embedding.token_count, DS4_N_VOCAB,
+                                                         &cursor, &block_start, &image_start, &image_end);
+        if (parsed != 1 || block_start != 0 || image_end + 1u != cursor ||
+            cursor != span->embedding.token_count) {
+            if (err && errlen) snprintf(err, errlen, "image span does not cover one complete DeepSeek image block");
+            return 0;
+        }
+        previous_end = end;
+    }
+    return 1;
+}
+
+void ds4_vision_lineage_clear(ds4_vision_lineage *l) {
+    if (!l) return;
+    free(l->v);
+    l->v = NULL;
+    l->n = 0;
+}
+
+int ds4_vision_lineage_store(ds4_vision_lineage *l, const ds4_vision_span *images, size_t image_count) {
+    if (!l) return 0;
+    ds4_vision_identity *copy = NULL;
+    if (image_count != 0) {
+        if (!images || image_count > SIZE_MAX / sizeof(copy[0])) return 0;
+        copy = calloc(image_count, sizeof(copy[0]));
+        if (!copy) return 0;
+        for (size_t i = 0; i < image_count; i++) {
+            copy[i].token_start = images[i].token_start;
+            copy[i].token_count = images[i].embedding.token_count;
+            memcpy(copy[i].identity, images[i].embedding.identity, sizeof(copy[i].identity));
+        }
+    }
+    ds4_vision_lineage_clear(l);
+    l->v = copy;
+    l->n = image_count;
+    return 1;
+}
+
+bool ds4_vision_lineage_prefix_matches(const ds4_vision_lineage *l, bool checkpoint_valid,
+                                       int checkpoint_len, const ds4_vision_span *images,
+                                       size_t image_count) {
+    if (!l || (image_count != 0 && !images)) return false;
+    if (!checkpoint_valid) return true;
+    if (l->n > image_count) return false;
+    for (size_t i = 0; i < l->n; i++) {
+        const ds4_vision_identity *old = &l->v[i];
+        const ds4_vision_span *cur = &images[i];
+        if (old->token_start != cur->token_start ||
+            old->token_count != cur->embedding.token_count ||
+            memcmp(old->identity, cur->embedding.identity, sizeof(old->identity)) != 0) return false;
+    }
+    if (l->n < image_count) {
+        const ds4_vision_span *next = &images[l->n];
+        if (checkpoint_len > 0 && next->token_start < (uint32_t)checkpoint_len) return false;
+    }
+    return true;
+}
+
+int ds4_vision_lineage_prefix_cap(const ds4_vision_lineage *l, int len) {
+    if (!l) return len;
+    for (size_t i = 0; i < l->n; i++)
+        if (len > 0 && (uint64_t)len > l->v[i].token_start) len = (int)l->v[i].token_start;
+    return len;
+}
+
+bool ds4_vision_lineage_rewind(ds4_vision_lineage *l, int pos) {
+    if (!l) return true;
+    size_t keep = 0;
+    for (size_t i = 0; i < l->n; i++) {
+        const uint64_t start = l->v[i].token_start, end = start + l->v[i].token_count;
+        if (pos > 0 && (uint64_t)pos > start && (uint64_t)pos < end) return false;   /* inside a block */
+        if (end <= (uint64_t)(pos > 0 ? pos : 0)) keep++;
+    }
+    l->n = keep;   /* identities are in token order */
+    return true;
+}
+
+int ds4_chat_append_multimodal_message(ds4_engine *e, ds4_tokens *tokens, const char *role,
+                                       const char *const *text_parts,
+                                       ds4_vision_embedding *embeddings, size_t image_count,
+                                       ds4_vision_span *spans, char *error, size_t error_cap) {
+    if (!e || !tokens || !role || !text_parts || (image_count != 0 && (!embeddings || !spans))) {
+        if (error && error_cap) snprintf(error, error_cap, "invalid multimodal message");
+        return 0;
+    }
+    const bool tool = !strcmp(role, "tool") || !strcmp(role, "function");
+    const bool user = !strcmp(role, "user");
+    if (!tool && !user) {
+        if (error && error_cap) snprintf(error, error_cap, "multimodal messages require a user or tool role");
+        return 0;
+    }
+    if (image_count != 0 && !e->vision_ready) {
+        if (error && error_cap) snprintf(error, error_cap, "vision encoder is not loaded");
+        return 0;
+    }
+    for (size_t i = 0; i < image_count; i++) {
+        if (!embeddings[i].data || embeddings[i].token_count == 0) {
+            if (error && error_cap) snprintf(error, error_cap, "invalid image embedding");
+            return 0;
+        }
+    }
+    /* Same rendering as ds4_chat_append_message for these roles: a user turn
+     * marker, and the fork's "Tool: " prefix for tool results. */
+    const int old_len = tokens->len;
+    ds4_vocab *vocab = &e->vocab;
+    token_vec_push(tokens, vocab->user_id);
+    if (tool) bpe_tokenize_text(vocab, "Tool: ", tokens);
+    size_t moved = 0;
+    for (size_t i = 0; i <= image_count; i++) {
+        const char *text = text_parts[i] ? text_parts[i] : "";
+        bpe_tokenize_text(vocab, text, tokens);
+        if (i == image_count) break;
+        if (!ds4_prompt_append_vision(e, tokens, &spans[i], &embeddings[i], error, error_cap)) {
+            for (size_t j = 0; j < moved; j++) {
+                embeddings[j] = spans[j].embedding;
+                memset(&spans[j], 0, sizeof(spans[j]));
+            }
+            tokens->len = old_len;
+            return 0;
+        }
+        moved++;
+    }
+    return 1;
+}
+
 static void dump_tokens_fp(FILE *fp, const ds4_vocab *vocab, const token_vec *tokens) {
     fprintf(fp, "[");
     for (int i = 0; i < tokens->len; i++) {
@@ -28624,6 +28914,13 @@ struct ds4_session {
      * lease's committed-row basis; the estimate keeps pricing pending
      * intent, where no measurement can exist yet. */
     uint64_t graph_alloc_bytes;
+    /* Track B inc 3 (charter A7): the image spans published for the sync in
+     * flight, and the ORDERED identity list of the images that conditioned the
+     * live checkpoint.  Checkpoint reuse compares these; token ids alone are
+     * blind to which image sat behind a run of synthetic ids. */
+    const ds4_vision_span *sync_images;
+    size_t sync_image_count;
+    ds4_vision_lineage lineage;
 };
 
 #ifndef DS4_NO_GPU
@@ -41896,6 +42193,7 @@ void ds4_session_free(ds4_session *s) {
     }
 #endif
     token_vec_free(&s->checkpoint);
+    ds4_vision_lineage_clear(&s->lineage);   /* Track B inc 3 */
     free(s->logits);
     free(s->mtp_logits);
     free(s);
@@ -42364,7 +42662,91 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  *
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
+/* ===================== Track B inc 3: identity-guarded checkpoint reuse =====================
+ * (charter §2.3 / A7).  The serial checkpoint is reused only when every image
+ * that conditioned it sits at the same span with the same identity in the new
+ * prompt; the token-id prefix test alone cannot tell two images apart.  The
+ * rules live in the pure ds4_vision_lineage_* helpers; this is the wiring. */
+bool ds4_session_vision_state_matches(const ds4_session *s, const ds4_vision_span *images,
+                                      size_t image_count) {
+    return s && s->checkpoint_valid && s->lineage.n == image_count &&
+           ds4_vision_lineage_prefix_matches(&s->lineage, true, s->checkpoint.len, images, image_count);
+}
+
+bool ds4_session_has_vision_state(const ds4_session *s) {
+    return s && ((s->checkpoint_valid && s->lineage.n != 0) || s->sync_image_count != 0);
+}
+
+size_t ds4_session_vision_identities(const ds4_session *s, const ds4_vision_identity **out) {
+    if (out) *out = (s && s->checkpoint_valid) ? s->lineage.v : NULL;
+    return (s && s->checkpoint_valid) ? s->lineage.n : 0;
+}
+
+static int ds4_session_sync_body(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    if (s && !ds4_vision_lineage_prefix_matches(&s->lineage, s->checkpoint_valid, s->checkpoint.len,
+                                                 s->sync_images, s->sync_image_count)) {
+        ds4_session_invalidate(s);
+    }
+    if (s && s->sync_image_count != 0) {
+        const bool cuda = !ds4_session_is_cpu(s) && s->engine && s->engine->backend == DS4_BACKEND_CUDA;
+        if (!cuda) {
+            snprintf(err, errlen, "image prefill requires the CUDA backend (Metal and CPU refuse image blocks)");
+            return 1;
+        }
+#ifndef DS4_VISION_PREFILL_DEVICE
+        /* The device half of inc 3+4 (embedding scatter, mixed attention, the
+         * visual router) is not in this build: refuse by name rather than let
+         * synthetic ids fall through the text prefill's clamped gather. */
+        snprintf(err, errlen, "image prefill is not implemented in this build (Track B inc 3+4 device half)");
+        return 1;
+#endif
+    }
+    const int rc = ds4_session_sync_body(s, prompt, err, errlen);
+    if (rc == 0) {
+        if (!ds4_vision_lineage_store(&s->lineage, s->sync_images, s->sync_image_count)) {
+            ds4_session_invalidate(s);
+            snprintf(err, errlen, "unable to retain image prompt identity");
+            return 1;
+        }
+    } else if (s) {
+        ds4_vision_lineage_clear(&s->lineage);
+    }
+    return rc;
+}
+
+int ds4_session_sync_multimodal(ds4_session *s, const ds4_tokens *prompt,
+                                const ds4_vision_span *images, size_t image_count,
+                                char *err, size_t errlen) {
+    if (!s || !prompt || (image_count != 0 && !images)) {
+        snprintf(err, errlen, "invalid multimodal prompt");
+        return 1;
+    }
+    if (image_count != 0 && (!s->engine || !s->engine->vision_ready)) {
+        snprintf(err, errlen, "vision encoder is not loaded");
+        return 1;
+    }
+    if (!ds4_vision_spans_validate(prompt, images, image_count, err, errlen)) return 1;
+    s->sync_images = images;
+    s->sync_image_count = image_count;
+#ifndef DS4_NO_GPU
+    s->graph.prefill_vision_spans = images;
+    s->graph.prefill_vision_span_count = image_count;
+    s->graph.prefill_has_visual = image_count != 0;
+#endif
+    const int rc = ds4_session_sync(s, prompt, err, errlen);
+#ifndef DS4_NO_GPU
+    s->graph.prefill_vision_spans = NULL;
+    s->graph.prefill_vision_span_count = 0;
+    s->graph.prefill_has_visual = false;
+#endif
+    s->sync_images = NULL;
+    s->sync_image_count = 0;
+    return rc;
+}
+
+static int ds4_session_sync_body(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
         return 1;
@@ -42618,7 +43000,9 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     int n = s->checkpoint.len < prompt->len ? s->checkpoint.len : prompt->len;
     int i = 0;
     while (i < n && s->checkpoint.v[i] == prompt->v[i]) i++;
-    return i;
+    /* Track B inc 3 (A7): a token walk cannot see which image sat behind a run
+     * of synthetic ids, so it stops at the first recorded image block. */
+    return ds4_vision_lineage_prefix_cap(&s->lineage, i);
 }
 
 int ds4_session_argmax(ds4_session *s) {
@@ -44270,6 +44654,7 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+    ds4_vision_lineage_clear(&s->lineage);   /* Track B inc 3: no checkpoint, no image lineage */
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
@@ -44279,6 +44664,13 @@ void ds4_session_rewind(ds4_session *s, int pos) {
      * position with different content -- the exact ABA the generation
      * exists to catch. */
     if (pos < s->checkpoint.len) s->generation++;
+    /* Track B inc 3 (A7): a rewind INTO an image block would leave a partial
+     * block no later prompt can prove the identity of -> invalidate; a rewind
+     * before a block simply forgets that block. */
+    if (!ds4_vision_lineage_rewind(&s->lineage, pos)) {
+        ds4_session_invalidate(s);
+        return;
+    }
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
 }

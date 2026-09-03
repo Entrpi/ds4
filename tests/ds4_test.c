@@ -3,6 +3,7 @@
 #include "../ds4_server.c"
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
+#include "../ds4_image.h"
 #include <math.h>
 
 static ds4_engine *test_engine_fast;
@@ -1679,6 +1680,164 @@ static void test_tool_call_quality(void) {
 
 #endif
 
+
+/* ===================== Track B inc 3: image block token stream + checkpoint lineage =====================
+ * Box-free and engine-free: the public row builder takes the four BF16 sentinel
+ * rows as inputs, the span validator takes a token stream, and the A7 identity
+ * rules are pure functions over a ds4_vision_lineage.  What needs a model (the
+ * chat-template append, the CUDA prefill) is gated on .33. */
+static uint16_t test_f32_to_bf16(float f) { uint32_t b; memcpy(&b, &f, 4); return (uint16_t)(b >> 16); }
+
+static void test_vision_stub_embedding(ds4_vision_embedding *emb, uint32_t gh, uint32_t gw, uint8_t seed) {
+    memset(emb, 0, sizeof(*emb));
+    emb->layout = DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL;
+    emb->grid_height = gh; emb->grid_width = gw; emb->token_count = gh * gw;
+    emb->data = malloc((size_t)emb->token_count * 4096u * sizeof(float));
+    TEST_ASSERT(emb->data != NULL);
+    for (uint32_t r = 0; r < emb->token_count; r++)
+        for (uint32_t d = 0; d < 4096u; d++) emb->data[(size_t)r * 4096u + d] = (float)(r * 1000u + d);
+    memset(emb->fingerprint, seed, sizeof(emb->fingerprint));
+    memset(emb->identity, (uint8_t)(seed + 1), sizeof(emb->identity));
+}
+
+static void test_vision_prompt_group(void) {
+    uint16_t *sidecar = malloc((size_t)4 * 4096 * sizeof(uint16_t));
+    TEST_ASSERT(sidecar != NULL);
+    for (int t = 0; t < 4; t++)
+        for (int d = 0; d < 4096; d++) sidecar[t * 4096 + d] = test_f32_to_bf16((float)(100 * (t + 1) + (d % 7)));
+    const uint16_t *const sentinel[5] = { sidecar, sidecar + 4096, NULL, sidecar + 2 * 4096, sidecar + 3 * 4096 };
+    char err[256];
+
+    /* (a) one block at prefixes 0..3: ids follow the layout, IMAGE rows follow perm[],
+     *     sentinel rows carry the sidecar vectors, the span parses as one block. */
+    for (int prefix = 0; prefix < 4; prefix++) {
+        ds4_tokens toks = {0};
+        for (int i = 0; i < prefix; i++) ds4_tokens_push(&toks, 5 + i);
+        ds4_deepseek4_image_layout want = {0};
+        TEST_ASSERT(ds4_deepseek4_image_layout_build(&want, 3, 4, (uint32_t)prefix, err, sizeof(err)));
+        ds4_vision_embedding emb; test_vision_stub_embedding(&emb, 3, 4, 0x11);
+        ds4_vision_span span = {0};
+        TEST_ASSERT(ds4_vision_prompt_append_rows(&toks, &span, &emb, sentinel, err, sizeof(err)) == 1);
+        TEST_ASSERT(emb.data == NULL && span.embedding.data != NULL);   /* consumed into the span */
+        TEST_ASSERT(span.token_start == (uint32_t)prefix);
+        TEST_ASSERT(span.embedding.token_count == want.token_count);
+        TEST_ASSERT(toks.len == prefix + (int)want.token_count);
+        {   /* exactly one START and one END; alignment PAD rows only at the edges;
+             * IMAGE and NEWLINE rows strictly between them */
+            int fs = -1, le = -1, n_start = 0, n_end = 0;
+            for (uint32_t r = 0; r < want.token_count; r++) {
+                if (want.types[r] == DS4_DEEPSEEK4_IMAGE_START) { n_start++; if (fs < 0) fs = (int)r; }
+                if (want.types[r] == DS4_DEEPSEEK4_IMAGE_END) { n_end++; le = (int)r; }
+            }
+            TEST_ASSERT(n_start == 1 && n_end == 1 && fs >= 0 && le > fs);
+            for (uint32_t r = 0; r < want.token_count; r++) {
+                const uint8_t ty = want.types[r];
+                if ((int)r < fs || (int)r > le) TEST_ASSERT(ty == DS4_DEEPSEEK4_IMAGE_PAD);
+                else if ((int)r > fs && (int)r < le) TEST_ASSERT(ty == DS4_DEEPSEEK4_IMAGE || ty == DS4_DEEPSEEK4_IMAGE_NEWLINE || ty == DS4_DEEPSEEK4_IMAGE_PAD);
+            }
+            TEST_ASSERT(fs == (int)(3u - (uint32_t)prefix % 4u));   /* compress_pad leading PADs put START on the last slot of its 4-row group */
+            TEST_ASSERT(((uint32_t)prefix + (uint32_t)fs) % 4u == 3u);
+        }
+        uint32_t image_pos = 0;
+        for (uint32_t r = 0; r < want.token_count; r++) {
+            TEST_ASSERT(toks.v[prefix + (int)r] == (int)(DS4_VISION_ID_BASE + want.types[r]));
+            const float *row = span.embedding.data + (size_t)r * 4096u;
+            if (want.types[r] == DS4_DEEPSEEK4_IMAGE) {
+                const uint32_t src = want.perm[image_pos++];
+                TEST_ASSERT(row[0] == (float)(src * 1000u) && row[4095] == (float)(src * 1000u + 4095u));
+            } else {
+                const int slot = want.types[r] == DS4_DEEPSEEK4_IMAGE_START ? 0 :
+                                 want.types[r] == DS4_DEEPSEEK4_IMAGE_PAD ? 1 :
+                                 want.types[r] == DS4_DEEPSEEK4_IMAGE_NEWLINE ? 2 : 3;
+                TEST_ASSERT(row[0] == (float)(100 * (slot + 1)) && row[6] == (float)(100 * (slot + 1) + 6));
+            }
+        }
+        TEST_ASSERT(image_pos == 12u);
+        uint32_t cursor = 0, bs = 0, is = 0, ie = 0;
+        TEST_ASSERT(ds4_deepseek4_next_image_span(toks.v + prefix, want.token_count, DS4_VISION_ID_BASE,
+                                                  &cursor, &bs, &is, &ie) == 1);
+        TEST_ASSERT(bs == 0 && cursor == want.token_count && ie + 1u == cursor);
+        TEST_ASSERT(span.embedding.identity[0] == 0x12 && span.embedding.fingerprint[0] == 0x11);
+        TEST_ASSERT(ds4_vision_spans_validate(&toks, &span, 1, err, sizeof(err)) == 1);
+        ds4_deepseek4_image_layout_free(&want);
+        ds4_vision_embedding_free(&span.embedding);
+        ds4_tokens_free(&toks);
+    }
+
+    /* (b) two blocks back to back validate; overlap and a cut block are refused by name */
+    {
+        ds4_tokens toks = {0};
+        ds4_tokens_push(&toks, 7);
+        ds4_vision_embedding emb[2]; ds4_vision_span span[2] = {{0}, {0}};
+        test_vision_stub_embedding(&emb[0], 2, 2, 0x21);
+        test_vision_stub_embedding(&emb[1], 3, 3, 0x31);
+        TEST_ASSERT(ds4_vision_prompt_append_rows(&toks, &span[0], &emb[0], sentinel, err, sizeof(err)) == 1);
+        ds4_tokens_push(&toks, 9);
+        TEST_ASSERT(ds4_vision_prompt_append_rows(&toks, &span[1], &emb[1], sentinel, err, sizeof(err)) == 1);
+        TEST_ASSERT(span[1].token_start == span[0].token_start + span[0].embedding.token_count + 1u);
+        TEST_ASSERT(ds4_vision_spans_validate(&toks, span, 2, err, sizeof(err)) == 1);
+        ds4_vision_span bad[2] = { span[0], span[1] };
+        bad[1].token_start = span[0].token_start;
+        TEST_ASSERT(ds4_vision_spans_validate(&toks, bad, 2, err, sizeof(err)) == 0);
+        TEST_ASSERT(strstr(err, "overlapping") != NULL);
+        ds4_vision_span cut = span[0]; cut.embedding.token_count -= 1u;
+        TEST_ASSERT(ds4_vision_spans_validate(&toks, &cut, 1, err, sizeof(err)) == 0);
+        TEST_ASSERT(strstr(err, "complete DeepSeek image block") != NULL);
+        ds4_vision_span shifted = span[0]; shifted.token_start += 1u;   /* starts on a PAD/IMAGE row */
+        TEST_ASSERT(ds4_vision_spans_validate(&toks, &shifted, 1, err, sizeof(err)) == 0);
+        ds4_vision_embedding_free(&span[0].embedding); ds4_vision_embedding_free(&span[1].embedding);
+        ds4_tokens_free(&toks);
+    }
+
+    /* (c) A7 lineage rules: same span+identity matches, a different image at the
+     *     same span does not, an extra image inside the checkpoint does not, the
+     *     LCP walk is capped at the block start, a rewind into a block demands
+     *     invalidation, a rewind before it forgets it. */
+    {
+        ds4_vision_lineage l = {0};
+        ds4_vision_span same = {0}; same.token_start = 10; same.embedding.token_count = 20; same.embedding.data = (float *)1;
+        memset(same.embedding.identity, 0xAA, 32);
+        TEST_ASSERT(ds4_vision_lineage_store(&l, &same, 1) == 1 && l.n == 1 && l.v[0].token_start == 10);
+        TEST_ASSERT(ds4_vision_lineage_prefix_matches(&l, true, 40, &same, 1));
+        TEST_ASSERT(ds4_vision_lineage_prefix_matches(&l, false, 0, NULL, 0));   /* invalid checkpoint matches anything */
+        ds4_vision_span other = same; memset(other.embedding.identity, 0xBB, 32);
+        TEST_ASSERT(!ds4_vision_lineage_prefix_matches(&l, true, 40, &other, 1));
+        ds4_vision_span moved = same; moved.token_start = 11;
+        TEST_ASSERT(!ds4_vision_lineage_prefix_matches(&l, true, 40, &moved, 1));
+        TEST_ASSERT(!ds4_vision_lineage_prefix_matches(&l, true, 40, NULL, 0));     /* text prompt over an image checkpoint */
+        ds4_vision_span two[2] = { same, same }; two[1].token_start = 35;           /* second image INSIDE the checkpoint */
+        TEST_ASSERT(!ds4_vision_lineage_prefix_matches(&l, true, 40, two, 2));
+        two[1].token_start = 40;                                                    /* appended after it: fine */
+        TEST_ASSERT(ds4_vision_lineage_prefix_matches(&l, true, 40, two, 2));
+        TEST_ASSERT(ds4_vision_lineage_prefix_cap(&l, 40) == 10);
+        TEST_ASSERT(ds4_vision_lineage_prefix_cap(&l, 10) == 10);
+        TEST_ASSERT(ds4_vision_lineage_prefix_cap(&l, 3) == 3);
+        TEST_ASSERT(ds4_vision_lineage_rewind(&l, 35) == true && l.n == 1);    /* after the block: keeps it */
+        TEST_ASSERT(ds4_vision_lineage_rewind(&l, 20) == false);               /* inside: caller invalidates */
+        TEST_ASSERT(ds4_vision_lineage_rewind(&l, 10) == true && l.n == 0);    /* before: forgets it */
+        TEST_ASSERT(ds4_vision_lineage_store(&l, NULL, 0) == 1 && l.n == 0 && l.v == NULL);
+        ds4_vision_lineage_clear(&l);
+    }
+
+    /* (d) refusals of the row builder */
+    {
+        ds4_tokens toks = {0};
+        ds4_vision_embedding emb; ds4_vision_span span = {0};
+        test_vision_stub_embedding(&emb, 2, 2, 0x41);
+        emb.layout = 0;
+        TEST_ASSERT(ds4_vision_prompt_append_rows(&toks, &span, &emb, sentinel, err, sizeof(err)) == 0);
+        TEST_ASSERT(strstr(err, "layout") != NULL && emb.data != NULL && toks.len == 0);
+        emb.layout = DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL;
+        const uint16_t *const missing[5] = { sidecar, NULL, NULL, sidecar, sidecar };
+        TEST_ASSERT(ds4_vision_prompt_append_rows(&toks, &span, &emb, missing, err, sizeof(err)) == 0);
+        TEST_ASSERT(strstr(err, "sentinels") != NULL && toks.len == 0);
+        ds4_vision_embedding_free(&emb);
+        ds4_tokens_free(&toks);
+    }
+    free(sidecar);
+    printf("vision-prompt: ok\n");
+}
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -1702,6 +1861,7 @@ static const ds4_test_entry test_entries[] = {
     {"--metal-kernels", "metal-kernels", "isolated Metal kernel numeric regressions", test_metal_kernel_group},
     {"--metal-tensor-equivalence", "metal-tensor-equivalence", "fast/quality Metal prompt-logit and greedy equivalence", test_metal_mpp_equivalence},
 #endif
+    {"--vision-prompt", "vision-prompt", "Track B inc 3: image-block token stream + session identity units", test_vision_prompt_group},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 
