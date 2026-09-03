@@ -38748,6 +38748,20 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                                 for (uint32_t j = 0; j + 1u < DS4_DSPARK_BLOCK; j++)
                                     dbuf[b * DS4_CONT_MTP_MAX_DEPTH + j] =
                                         out_cand[r * DS4_DSPARK_BLOCK + (j + 1u)];
+                                /* Prefix-causality gate hook, the same one the MTP chain and
+                                 * batched-MTP branches carry: force the drafts at index >= from
+                                 * to a fixed (almost-always-wrong) token so the verify rejects
+                                 * them.  Without it the gate's forced-draft runs on a DSpark-only
+                                 * boot verified the REAL block (proven 09-03: identical accept
+                                 * stats to the unforced run) and passed vacuously.  Off (-1) in
+                                 * production. */
+                                if (ctx->mtp_force_draft_tok >= 0) {
+                                    const int fv = ctx->mtp_force_draft_tok;
+                                    const uint32_t from = ctx->mtp_force_draft_from > 0
+                                                          ? (uint32_t)ctx->mtp_force_draft_from : 0u;
+                                    for (uint32_t j = from; j + 1u < DS4_DSPARK_BLOCK; j++)
+                                        dbuf[b * DS4_CONT_MTP_MAX_DEPTH + j] = fv;
+                                }
                                 ndr[b] = (uint32_t)(DS4_DSPARK_BLOCK - 1);
                             }
                         }
@@ -39300,12 +39314,24 @@ int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
     if (dspark_only && !gate_accept) {
         GATE_ERR("cont_mtp_gate: DSpark-only boot (no MTP head): set DS4_CONT_MTP_ACCEPT -- "
                  "run E is the only leg that exercises the drafter"); return 2; }
+    /* Effective draft depth of run E.  The MTP chain takes DS4_CONT_MTP_DEPTH;
+     * the DSpark block drafter ALWAYS drafts its block (DS4_DSPARK_BLOCK-1 = 4
+     * verifiable drafts, or DS4_DSPARK_VERIFY_DEPTH 1..4) and ignores
+     * DS4_CONT_MTP_DEPTH, so with an armed drafter D=0 is not a reachable shape
+     * and the bit-identity branch must not be selected by the env alone. */
+    int Dg;
     {
         const char *deg = getenv("DS4_CONT_MTP_DEPTH");
-        fprintf(stderr, "ds4: CONT_MTP_GATE draft source: %s (D=%s)\n",
+        Dg = (deg && deg[0]) ? atoi(deg) : 1;
+        if (have_dspark) {
+            const char *dd = getenv("DS4_DSPARK_VERIFY_DEPTH");
+            const int dv = (dd && dd[0]) ? atoi(dd) : 0;
+            Dg = (dv >= 1 && dv < (int)DS4_DSPARK_BLOCK) ? dv : (int)(DS4_DSPARK_BLOCK - 1);
+        }
+        fprintf(stderr, "ds4: CONT_MTP_GATE draft source: %s (nominal D=%d%s; the forward may clamp lower per bank)\n",
                 dspark_only ? "DSpark drafter (DSpark-only boot; mode-1 probe skipped)"
                             : (have_dspark ? "MTP head + armed DSpark drafter (E drafts via DSpark)" : "MTP head"),
-                (deg && deg[0]) ? deg : "1 (default)");
+                Dg, have_dspark ? "; block drafter: DS4_DSPARK_VERIFY_DEPTH sets it, DS4_CONT_MTP_DEPTH does not apply" : "");
     }
     const char *ne = getenv("DS4_CONT_MTP_GATE_N");
     const char *te = getenv("DS4_CONT_MTP_GATE_T");
@@ -39421,8 +39447,6 @@ int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
                         : " (probe diverges beyond control)");
         if (gate_accept) {
             uint32_t amis = GATE_CMP("accept A-vs-E", out0, ol0, out2, ol2);
-            const char *deg = getenv("DS4_CONT_MTP_DEPTH");
-            const int Dg = (deg && deg[0]) ? atoi(deg) : 1;
             /* Engagement receipt: at D>=1 run E must have DRAFTED, or the accept path
              * never ran (a disarmed drafter, or the DSpark concurrency/kv/quench
              * auto-gates at N>1 -- multi-bank legs set DS4_DSPARK_MAX_NLIVE=0
@@ -39496,6 +39520,7 @@ int ds4_cont_mtp_gate(ds4_batch_ctx *ctx, char *err, size_t errlen) {
                     const int sens_struct = (!sfsame || smrel > PC_RTOL);   /* rollback-off must diverge */
                     if (dra == 0 || drb == 0 || drga == 0 || drgb == 0) {
                         rc = 2;
+                        GATE_ERR("cont_mtp_gate: a forced-draft prefix-causality run produced no drafts (draft source not engaged)");
                         fprintf(stderr, "ds4: CONT_MTP_GATE prefix-causality %s FAIL: a forced-draft run produced no drafts "
                                 "(on/on/off/off = %llu/%llu/%llu/%llu; spec never engaged)\n", lbl,
                                 (unsigned long long)dra, (unsigned long long)drb,
