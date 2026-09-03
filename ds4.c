@@ -2675,6 +2675,30 @@ static void tensor_expect_layout(
     }
 }
 
+/* Like tensor_expect_layout, but the tensor may carry either of two types;
+ * the consumer dispatches on the stored type (DSpark Markov table: F16 or Q8_0). */
+static void tensor_expect_layout_either(
+        const ds4_tensor *t,
+        uint32_t          type_a,
+        uint32_t          type_b,
+        uint32_t          ndim,
+        uint64_t          d0,
+        uint64_t          d1,
+        uint64_t          d2) {
+    if (!t) ds4_die("internal error: missing tensor while validating layout");
+    if (t->type != type_a && t->type != type_b) {
+        fprintf(stderr,
+                "ds4: tensor %.*s has type %s, expected %s or %s\n",
+                (int)t->name.len,
+                t->name.ptr,
+                tensor_type_name(t->type),
+                tensor_type_name(type_a),
+                tensor_type_name(type_b));
+        exit(1);
+    }
+    tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
+}
+
 static void tensor_expect_optional(
         const ds4_tensor *t,
         uint32_t          type,
@@ -3589,7 +3613,9 @@ static void dspark_weights_validate_layout(const ds4_dspark_weights *w, const ds
     tensor_expect_layout(w->main_proj,     DS4_TENSOR_Q8_0, 2, main_in, DS4_N_EMBD, 0);
     tensor_expect_layout(w->main_norm,     DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
     tensor_expect_layout(w->markov_w1,     DS4_TENSOR_F16,  2, markov_rank, DS4_N_VOCAB, 0);
-    tensor_expect_layout(w->markov_w2,     DS4_TENSOR_F16,  2, markov_rank, DS4_N_VOCAB, 0);
+    /* markov_w2 is F16 in the ship recipe or Q8_0 (halves the four full-table
+     * reads per draft block); the refine dispatches on the stored type. */
+    tensor_expect_layout_either(w->markov_w2, DS4_TENSOR_F16, DS4_TENSOR_Q8_0, 2, markov_rank, DS4_N_VOCAB, 0);
     tensor_expect_layout(w->conf_proj,     DS4_TENSOR_F32,  2, conf_in, 1, 0);
     tensor_expect_plain_layout(w->hc_head_fn, 2, hc_dim, DS4_N_HC, 0);
     tensor_expect_layout(w->hc_head_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
@@ -20803,8 +20829,14 @@ static bool metal_graph_dspark_markov_refine(
         if (ok) { stage = "gather"; ok = ds4_gpu_embed_tokens_hc_tensor(prev_embed, prev_ids,
                                         dspark_model->map, dspark_model->size, dw->markov_w1->abs_offset,
                                         mv, nb, mr, 1u) != 0; }
-        if (ok) { stage = "matvec"; ok = ds4_gpu_matmul_f16_tensor(bias, dspark_model->map, dspark_model->size,
-                                        dw->markov_w2->abs_offset, mr, vocab, prev_embed, nb) != 0; }
+        if (ok) { stage = "matvec";
+                  /* markov_w2 is [vocab][rank] in F16 (ship) or Q8_0: same entry shape,
+                   * mmvq at nb <= 8 and MMQ above -- dispatch on the stored type. */
+                  ok = (dw->markov_w2->type == DS4_TENSOR_Q8_0
+                        ? ds4_gpu_matmul_q8_0_tensor(bias, dspark_model->map, dspark_model->size,
+                                                     dw->markov_w2->abs_offset, mr, vocab, prev_embed, nb)
+                        : ds4_gpu_matmul_f16_tensor(bias, dspark_model->map, dspark_model->size,
+                                                    dw->markov_w2->abs_offset, mr, vocab, prev_embed, nb)) != 0; }
         if (ok) { stage = "argmax"; ok = ds4_gpu_dspark_markov_step_tensor(next_ids, base_logits, j, B, bias, (uint32_t)vocab, nb) != 0; }
         if (prev_ids) ds4_gpu_tensor_free(prev_ids);
         if (next_ids) ds4_gpu_tensor_free(next_ids);
@@ -28956,15 +28988,37 @@ int ds4_dspark_tap_validate(ds4_engine *e, ds4_session *s, const char *trace_pat
 typedef struct {
     const float    *base_logits_i;
     float          *refined;
-    const uint16_t *w2;          /* markov_w2 F16, row-major [vocab][rank] */
+    const void     *w2;          /* markov_w2 row-major [vocab][rank]: F16 rows or Q8_0 blocks */
+    uint32_t        w2_type;     /* DS4_TENSOR_F16 or DS4_TENSOR_Q8_0 */
     const float    *prev_embed;  /* [rank] */
     uint32_t        rank;
 } dspark_markov_ctx;
 
 static void dspark_markov_worker(void *vctx, uint64_t v0, uint64_t v1) {
     dspark_markov_ctx *c = vctx;
+    if (c->w2_type == DS4_TENSOR_Q8_0) {
+        /* block_q8_0 = { f16 d; int8 qs[32] } = 34 bytes; a row is rank/32 blocks. */
+        const uint32_t nblk = c->rank / 32u;
+        const size_t row_bytes = (size_t)nblk * 34u;
+        for (uint64_t v = v0; v < v1; v++) {
+            const uint8_t *row = (const uint8_t *)c->w2 + v * row_bytes;
+            float acc = 0.0f;
+            for (uint32_t b = 0; b < nblk; b++) {
+                const uint8_t *blk = row + (size_t)b * 34u;
+                uint16_t dh; memcpy(&dh, blk, sizeof(dh));
+                const int8_t *q = (const int8_t *)(blk + 2);
+                const float *x = c->prev_embed + (size_t)b * 32u;
+                float sum = 0.0f;
+                for (uint32_t k = 0; k < 32u; k++) sum += (float)q[k] * x[k];
+                acc += f16_to_f32(dh) * sum;
+            }
+            c->refined[v] = c->base_logits_i[v] + acc;
+        }
+        return;
+    }
+    const uint16_t *w2 = (const uint16_t *)c->w2;
     for (uint64_t v = v0; v < v1; v++) {
-        const uint16_t *row = c->w2 + v * c->rank;
+        const uint16_t *row = w2 + v * c->rank;
         float acc = 0.0f;
         for (uint32_t k = 0; k < c->rank; k++) acc += f16_to_f32(row[k]) * c->prev_embed[k];
         c->refined[v] = c->base_logits_i[v] + acc;
@@ -28977,6 +29031,10 @@ static void dspark_markov_worker(void *vctx, uint64_t v0, uint64_t v1) {
  * DS4_DSPARK_BLOCK_MAXSTEPS (per-record cap, 0=all). */
 int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_path) {
     if (!e || !s || !e->dspark_ready) { fprintf(stderr, "ds4: dspark block validate: drafter not loaded\n"); return 1; }
+    /* S6 lazy session graph: nothing has run a forward yet, so prefill_cap is
+     * still 0 and every record would be skipped ("pc=0 raw_cap=0", 09-03). */
+    { char gerr[256]; if (ds4_session_ensure_graph(s, gerr, sizeof(gerr)) != 0) {
+        fprintf(stderr, "ds4: dspark block validate: %s\n", gerr); return 1; } }
     ds4_gpu_graph *g = &s->graph;
     const ds4_model *base_model = &e->model;
     const ds4_weights *base_weights = &e->weights;
@@ -28988,7 +29046,7 @@ int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_p
     const uint32_t pc = g->prefill_cap;
     const uint32_t markov_rank = (uint32_t)dw->markov_w2->dim[0];
     const uint16_t *mw1 = (const uint16_t *)((const char *)dspark_model->map + dw->markov_w1->abs_offset);
-    const uint16_t *mw2 = (const uint16_t *)((const char *)dspark_model->map + dw->markov_w2->abs_offset);
+    const void *mw2 = (const char *)dspark_model->map + dw->markov_w2->abs_offset;   /* F16 or Q8_0 rows */
 
     int stride = 4, max_rec = 0, max_steps = 0;
     { const char *v = getenv("DS4_DSPARK_BLOCK_STRIDE");   if (v && atoi(v) > 0) stride = atoi(v); }
@@ -29139,7 +29197,7 @@ int ds4_dspark_block_validate(ds4_engine *e, ds4_session *s, const char *trace_p
             for (uint32_t i = 0; i + 1 < B; i++) {
                 const uint16_t *w1row = mw1 + (size_t)cand[i] * markov_rank;
                 for (uint32_t k = 0; k < markov_rank; k++) prev_embed[k] = f16_to_f32(w1row[k]);
-                dspark_markov_ctx mc = { blk + (size_t)i * vocab, refined, mw2, prev_embed, markov_rank };
+                dspark_markov_ctx mc = { blk + (size_t)i * vocab, refined, mw2, dw->markov_w2->type, prev_embed, markov_rank };
                 ds4_parallel_for(vocab, dspark_markov_worker, &mc);
                 int best = 0; float bv = refined[0];
                 for (uint64_t v = 1; v < vocab; v++) if (refined[v] > bv) { bv = refined[v]; best = (int)v; }

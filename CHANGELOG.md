@@ -7,6 +7,28 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased
 
+- **DSpark drafter: `markov_w2` may be stored Q8_0; the extractor now
+  emits it that way by default.** The Markov head reads the whole
+  `[rank x vocab]` table four times per draft block. With the table in
+  Q8_0 the on-device refine takes the existing Q8_0 matmul path (mmvq at
+  nb <= 8, MMQ above) instead of the F16 one: 0.18 ms vs 0.63 ms per
+  call on GB10 (3.5x; the F16 path reaches ~97 GB/s on this shape, the
+  Q8_0 path ~180), about 1.8 ms per draft block, and the drafter file is
+  31 MB smaller. Accept is unchanged: identical per-record pos-0 hits and
+  mean commit (3.70) on the recorded DS4DSPK1 trace, and within run-to-run
+  noise on a live ABBA (receipts in the fork's local A/B notes). The
+  loader accepts F16 or Q8_0 for this tensor (`tensor_expect_layout_either`),
+  so every published drafter keeps loading; `gguf-tools/dspark_extract.py
+  --markov-w2 f16` restores the old layout, and the new
+  `gguf-tools/gguf_requant_tensor.py` converts an existing drafter in
+  place (re-quantizes named tensors, copies everything else byte for
+  byte, `--verify` proves it). The host-side Markov refine used by the
+  block-validate gate gained a matching Q8_0 row path.
+- **`DS4_DSPARK_BLOCK_VALIDATE` measured nothing since the lazy session
+  graph landed**: it read `prefill_cap` before the graph existed, so every
+  trace record was skipped as `pc=0 raw_cap=0`. It now allocates the
+  session graph first.
+
 - **`--tool-call-reminder` now covers the Anthropic surface, live
   tool-result continuations, and output-only Responses chains** —
   closing the coverage gaps in the v0.6.5 feature, which despite its

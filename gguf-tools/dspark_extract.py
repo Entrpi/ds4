@@ -11,7 +11,9 @@ SHARED from the target (absent here).
 
 Drafter quant policy mirrors the proven single-head MTP GGUF: routed experts
 Q4_K, attn/proj/shared-experts/main_proj Q8_0, norms/hc/gate F32, markov/conf
-F16. The 3 layers are byte-identical in HF format to base layers, so the FP8
+F16, except markov_w2 which defaults to Q8_0 (--markov-w2 f16 restores the
+pre-09-03 layout; the engine reads that whole table four times per draft block
+and accepts either type). The 3 layers are byte-identical in HF format to base layers, so the FP8
 (e4m3 + ue8m0 block-128) / FP4 (e2m1 packed I8 + ue8m0 block-32) dequant is the
 same as deepseek4-quantize.c (ported here to numpy).
 
@@ -258,6 +260,14 @@ def main():
                          "expert tiers are IQ2_XXS gate/up + Q2_K down; the drafter "
                          "path dequantizes any of q4_k/q8_0/q2_k, and the ship drafters "
                          "(0731 and vision-exp) use q2_k for gate, up and down")
+    ap.add_argument("--markov-w2", default="q8_0", choices=["f16", "q8_0"],
+                    help="storage type of dspark.markov_w2 (the rank x vocab Markov table); "
+                         "the on-device refine reads the whole table four times per draft "
+                         "block and the engine dispatches on the stored type. Default q8_0 "
+                         "since the 2026-09-03 A/B (identical accept on the deterministic "
+                         "trace leg, 3.5x faster per call, 31 MB smaller); f16 = the "
+                         "pre-09-03 ship layout, still accepted by every engine build "
+                         "that has the dual-type loader")
     ap.add_argument("--validate", action="store_true")
     ap.add_argument("--layers", type=int, default=3)
     ap.add_argument("--checkpoint-variant", default=None,
@@ -288,6 +298,7 @@ def main():
                  "is required; the engine refuses a Vision-Exp drafter without it")
     QMAP = {"q4_k": QT.Q4_K, "q8_0": QT.Q8_0, "q2_k": QT.Q2_K}
     EXP = QMAP[args.experts]
+    MK2 = {"f16": QT.F16, "q8_0": QT.Q8_0}[args.markov_w2]
     EXPD = QMAP[args.experts_down] if args.experts_down else EXP
 
     db = STDB(args.src)
@@ -346,7 +357,7 @@ def main():
     add(w, "dspark.main_proj.weight", db.fp8("mtp.0.main_proj.weight"), QT.Q8_0)
     add(w, "dspark.main_norm.weight", db.f32("mtp.0.main_norm.weight"), QT.F32)
     add(w, "dspark.markov_w1.weight", db.f32("mtp.2.markov_head.markov_w1.weight"), QT.F16)
-    add(w, "dspark.markov_w2.weight", db.f32("mtp.2.markov_head.markov_w2.weight"), QT.F16)
+    add(w, "dspark.markov_w2.weight", db.f32("mtp.2.markov_head.markov_w2.weight"), MK2)
     add(w, "dspark.conf_proj.weight", db.f32("mtp.2.confidence_head.proj.weight"), QT.F32)
     add(w, "dspark.hc_head_fn.weight",    db.f32("mtp.2.hc_head_fn"),    QT.F32)
     add(w, "dspark.hc_head_base.weight",  db.f32("mtp.2.hc_head_base"),  QT.F32)
