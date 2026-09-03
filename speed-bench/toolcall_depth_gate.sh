@@ -36,6 +36,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 
 fail() { echo "TOOLCALL-DEPTH GATE: FAIL — $*"; cleanup; exit 1; }
 cleanup() {
+    # TG_KEEP=<local dir>: keep the per-draw jsonl (flake_retry_first_draw
+    # disclosures) as receipts before the work dir goes away.
+    if [ -n "${TG_KEEP:-}" ]; then mkdir -p "$TG_KEEP"; scp -q "$R:$WORK/gate_*.jsonl" "$TG_KEEP/" 2>/dev/null; fi
     ssh "$R" "p=\$(cat $WORK/srv.pid 2>/dev/null); [ -n \"\$p\" ] && kill \$p 2>/dev/null; sleep 2; [ -n \"\$p\" ] && kill -9 \$p 2>/dev/null; rm -rf $WORK" 2>/dev/null
 }
 
