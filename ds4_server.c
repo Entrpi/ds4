@@ -19534,14 +19534,19 @@ static ds4_backend default_server_backend(void) {
 #define LAUNCH_BASE_GGUF_0731   "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 #define LAUNCH_BASE_GGUF        "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
 #define LAUNCH_MTP_GGUF         "DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
-#define LAUNCH_DSPARK_GGUF_0731 "DSpark-drafter-Q2K-Q8-0731.gguf"
-#define LAUNCH_DSPARK_GGUF      "DSpark-drafter-Q2K-Q8.gguf"
+/* 2026-09-03: the ship drafters carry a Q8_0 Markov table ("MarkovQ8");
+ * the earlier F16-Markov files keep loading and are probed as fallbacks. */
+#define LAUNCH_DSPARK_GGUF_0731     "DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf"
+#define LAUNCH_DSPARK_GGUF_0731_F16 "DSpark-drafter-Q2K-Q8-0731.gguf"
+#define LAUNCH_DSPARK_GGUF          "DSpark-drafter-Q2K-Q8.gguf"   /* legacy pre-0731 drafter */
 /* Vision-Exp (2026-08-31): a third generation, opt-in until the default
  * flips.  Its base is selected only by name (GGUF_FILE or -m); its drafter
  * is the fork's own extraction with the 0731 recipe, and the engine refuses
- * any cross-generation support model, so no fallback drafter is offered. */
-#define LAUNCH_BASE_GGUF_VISION   "DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf"
-#define LAUNCH_DSPARK_GGUF_VISION "DSpark-drafter-Q2K-Q8-vision-exp.gguf"
+ * any cross-generation support model, so the only fallback offered is the
+ * same generation's earlier F16-Markov file. */
+#define LAUNCH_BASE_GGUF_VISION       "DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf"
+#define LAUNCH_DSPARK_GGUF_VISION     "DSpark-drafter-Q2K-Q8-MarkovQ8-vision-exp.gguf"
+#define LAUNCH_DSPARK_GGUF_VISION_F16 "DSpark-drafter-Q2K-Q8-vision-exp.gguf"
 
 static bool launch_file_ok(const char *path) {
     struct stat st;
@@ -19618,6 +19623,15 @@ static char *launch_join_pref2(const char *dir, const char *dir2,
     return launch_join2(dir, dir2, fallback);
 }
 
+static char *launch_join_pref3(const char *dir, const char *dir2,
+                               const char *preferred, const char *fallback,
+                               const char *fallback2) {
+    char *cand = launch_join2(dir, dir2, preferred);
+    if (launch_file_ok(cand)) return cand;
+    free(cand);
+    return launch_join_pref2(dir, dir2, fallback, fallback2);
+}
+
 /* Directory part of a path ("." for a bare name, "/" for a root file). */
 static char *launch_dirname(const char *mp) {
     const char *slash = strrchr(mp, '/');
@@ -19647,6 +19661,7 @@ static void launch_append(char *buf, size_t cap, int *off, const char *fmt, ...)
 typedef struct {
     const char *preferred;   /* drafter file name to probe first; NULL = do not probe */
     const char *fallback;    /* second name when the preferred file is absent, or NULL */
+    const char *fallback2;   /* third name, or NULL */
 } launch_drafter_plan;
 
 static launch_drafter_plan launch_drafter_names(bool no_spec, bool no_dspark,
@@ -19654,18 +19669,20 @@ static launch_drafter_plan launch_drafter_names(bool no_spec, bool no_dspark,
                                                 bool gen_vision, bool gen_0731,
                                                 const char *dspark_file_env)
 {
-    launch_drafter_plan p = { NULL, NULL };
+    launch_drafter_plan p = { NULL, NULL, NULL };
     if (no_spec || no_dspark || dspark_named || !has_sib) return p;
     if (dspark_file_env && dspark_file_env[0]) {
         p.preferred = dspark_file_env;            /* env names the file exactly */
     } else if (gen_vision) {
-        p.preferred = LAUNCH_DSPARK_GGUF_VISION;  /* only our stamped extraction pairs */
+        p.preferred = LAUNCH_DSPARK_GGUF_VISION;  /* only our stamped extractions pair */
+        p.fallback = LAUNCH_DSPARK_GGUF_VISION_F16;
     } else if (gen_0731) {
         /* Generation-matched drafter first; the legacy drafter beside a
          * 0731 base is a lossless (verification-exact) fallback, and the
          * accept guard floors genuinely broken pairings. */
         p.preferred = LAUNCH_DSPARK_GGUF_0731;
-        p.fallback = LAUNCH_DSPARK_GGUF;
+        p.fallback = LAUNCH_DSPARK_GGUF_0731_F16;
+        p.fallback2 = LAUNCH_DSPARK_GGUF;
     } else {
         p.preferred = LAUNCH_DSPARK_GGUF;
     }
@@ -19782,7 +19799,9 @@ static void launch_resolve_defaults(server_config *c,
                                                      sib != NULL, gen_vision, gen_0731,
                                                      getenv("DSPARK_FILE"));
     if (dplan.preferred) {
-        char *cand = dplan.fallback
+        char *cand = dplan.fallback2
+                   ? launch_join_pref3(sib, sib_lex, dplan.preferred, dplan.fallback, dplan.fallback2)
+                   : dplan.fallback
                    ? launch_join_pref2(sib, sib_lex, dplan.preferred, dplan.fallback)
                    : launch_join2(sib, sib_lex, dplan.preferred);
         if (launch_file_ok(cand)) {
@@ -31375,14 +31394,16 @@ static void test_launch_spec_decision_matrix(void) {
      * sibling directory means no probe at all. */
     launch_drafter_plan p;
     p = launch_drafter_names(false, false, false, true, true, false, NULL);
-    TEST_ASSERT(p.preferred && !strcmp(p.preferred, LAUNCH_DSPARK_GGUF_VISION) && p.fallback == NULL);
+    TEST_ASSERT(p.preferred && !strcmp(p.preferred, LAUNCH_DSPARK_GGUF_VISION));
+    TEST_ASSERT(p.fallback && !strcmp(p.fallback, LAUNCH_DSPARK_GGUF_VISION_F16) && p.fallback2 == NULL);
     p = launch_drafter_names(false, false, false, true, false, true, NULL);
     TEST_ASSERT(p.preferred && !strcmp(p.preferred, LAUNCH_DSPARK_GGUF_0731));
-    TEST_ASSERT(p.fallback && !strcmp(p.fallback, LAUNCH_DSPARK_GGUF));
+    TEST_ASSERT(p.fallback && !strcmp(p.fallback, LAUNCH_DSPARK_GGUF_0731_F16));
+    TEST_ASSERT(p.fallback2 && !strcmp(p.fallback2, LAUNCH_DSPARK_GGUF));
     p = launch_drafter_names(false, false, false, true, false, false, NULL);
-    TEST_ASSERT(p.preferred && !strcmp(p.preferred, LAUNCH_DSPARK_GGUF) && p.fallback == NULL);
+    TEST_ASSERT(p.preferred && !strcmp(p.preferred, LAUNCH_DSPARK_GGUF) && p.fallback == NULL && p.fallback2 == NULL);
     p = launch_drafter_names(false, false, false, true, true, false, "custom.gguf");
-    TEST_ASSERT(p.preferred && !strcmp(p.preferred, "custom.gguf") && p.fallback == NULL);
+    TEST_ASSERT(p.preferred && !strcmp(p.preferred, "custom.gguf") && p.fallback == NULL && p.fallback2 == NULL);
     p = launch_drafter_names(false, false, false, true, true, false, "");   /* empty env = unset */
     TEST_ASSERT(p.preferred && !strcmp(p.preferred, LAUNCH_DSPARK_GGUF_VISION));
     TEST_ASSERT(launch_drafter_names(true, false, false, true, true, false, NULL).preferred == NULL);   /* --no-spec */

@@ -130,12 +130,13 @@ the checkpoint's `rms_eps = 1e-20`, keys its disk KV cache and agent
 checkpoints separately from 0731, and refuses to pair a Vision-Exp base with
 the 0731 DSpark drafter or MTP file (and a 0731 base with the Vision-Exp
 drafter). Beside a Vision-Exp base, launch defaults auto-attach only
-`DSpark-drafter-Q2K-Q8-vision-exp.gguf`, the fork's own extraction with the
-0731 Q2K recipe.
+`DSpark-drafter-Q2K-Q8-MarkovQ8-vision-exp.gguf` (or the earlier
+`DSpark-drafter-Q2K-Q8-vision-exp.gguf` when that is what sits there), the
+fork's own extraction with the 0731 Q2K recipe.
 
 ```sh
 ./download_model.sh vision-q2       # Vision-Exp IQ2_XXS/Q2_K language GGUF + encoder (~88 GB)
-./download_model.sh drafter-vision  # the fork's Vision-Exp DSpark drafter (6.49 GiB; publication pending)
+./download_model.sh drafter-vision  # the fork's Vision-Exp DSpark drafter (6.46 GiB)
 ./ds4-server -m ./ds4flash.gguf -c 65536
 ```
 

@@ -25,8 +25,8 @@ VISION_ENCODER_FILE="DeepSeek-V4-Flash-Vision-Encoder.gguf"
 # The fork's DSpark drafters (extracted with gguf-tools/dspark_extract.py,
 # the 0731 recipe) are hosted separately from the language GGUFs.
 DRAFTER_REPO="${DSPARK_HF_REPO:-bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF}"
-DRAFTER_0731_FILE="DSpark-drafter-Q2K-Q8-0731.gguf"
-DRAFTER_VISION_FILE="DSpark-drafter-Q2K-Q8-vision-exp.gguf"
+DRAFTER_0731_FILE="DSpark-drafter-Q2K-Q8-MarkovQ8-0731.gguf"
+DRAFTER_VISION_FILE="DSpark-drafter-Q2K-Q8-MarkovQ8-vision-exp.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -92,12 +92,12 @@ Targets:
        already present.
 
   drafter-0731 / drafter-vision
-       The fork's DSpark speculative-decoding drafter (6.49 GiB) for the
+       The fork's DSpark speculative-decoding drafter (6.46 GiB) for the
        matching checkpoint, from $DRAFTER_REPO. ds4-server auto-attaches the
        drafter that sits beside its base GGUF; generations never mix.
-       drafter-vision: publication to $DRAFTER_REPO is pending; until it
-       lands the download fails with 404 (extract it locally with
-       gguf-tools/dspark_extract.py, see its docstring).
+       Since 2026-09-03 both carry a Q8_0 Markov table ("MarkovQ8" in the
+       name); the earlier F16-Markov files keep loading and are used when
+       the MarkovQ8 file is absent.
 
   *** PREVIOUS GENERATION (pre-0731): PREFER THE IMATRIX VERSIONS BELOW ***
 

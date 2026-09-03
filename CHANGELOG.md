@@ -23,7 +23,12 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
   `gguf-tools/gguf_requant_tensor.py` converts an existing drafter in
   place (re-quantizes named tensors, copies everything else byte for
   byte, `--verify` proves it). The host-side Markov refine used by the
-  block-validate gate gained a matching Q8_0 row path.
+  block-validate gate gained a matching Q8_0 row path. The ship drafters
+  are republished with the Q8_0 table as
+  `DSpark-drafter-Q2K-Q8-MarkovQ8-{0731,vision-exp}.gguf`
+  (`bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF`); launch defaults and
+  `download_model.sh drafter-0731 / drafter-vision` prefer them and fall
+  back to the earlier F16-Markov file names, which keep loading.
 - **`DS4_DSPARK_BLOCK_VALIDATE` measured nothing since the lazy session
   graph landed**: it read `prefill_cap` before the graph existed, so every
   trace record was skipped as `pc=0 raw_cap=0`. It now allocates the
