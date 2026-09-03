@@ -44,6 +44,15 @@ typedef struct {
 } ds4_deepseek4_vision_weights;
 #endif
 
+/* Track B inc 2 (CUDA): encode row-major normalized 14x14 RGB patches
+ * ([grid_h*grid_w x 588] F32) into the natural row-major 3x3-aligned grid
+ * ([ceil(grid_h/3)*ceil(grid_w/3) x 4096] F32).  The sidecar map must be
+ * registered (ds4_gpu_set_model_map_range).  Returns 1 on success. */
+int ds4_gpu_deepseek4_vision_encode(float *out, const float *patches,
+                                    uint32_t grid_h, uint32_t grid_w,
+                                    const void *model_map, uint64_t model_size,
+                                    const ds4_deepseek4_vision_weights *weights);
+
 /* =========================================================================
  * GPU Tensor and Command Lifetime.
  * =========================================================================

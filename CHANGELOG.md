@@ -65,9 +65,10 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
   the epsilon is now taken from every checkpoint after a range check,
   and a deviation from the shape default is announced), and prints the
   variant on the boot line. Image input is NOT implemented: the encoder
-  sidecar is not consumed, and image/file/audio content blocks on all
-  three API surfaces are now refused with a named 400 instead of being
-  silently flattened to their text parts. The 0731 checkpoint remains
+  sidecar is not run (loading it is the `--vision` entry below), and
+  image/file/audio content blocks on all three API surfaces are now
+  refused with a named 400 instead of being silently flattened to their
+  text parts. The 0731 checkpoint remains
   the auto-picked default. Boot-verified on GB10 (2026-09-02): the
   variant banner, the named 400s on all three surfaces, both wrong-pairing
   refusals, the auto-attached-drafter degrade, cache isolation under a
@@ -112,6 +113,83 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
     0731 baselines is pending (frozen-suite re-base); the default does
     not move before it lands, and the DSpark yield-quench guard keeps
     its 0731 calibration (2.16) until re-measured on Vision-Exp.
+- **`--vision FILE`: the Vision-Exp encoder sidecar loads, binds and
+  validates (Track B increments 0 and 1; image input still pending)** —
+  the first two increments of image input for
+  DeepSeek-V4-Flash-Vision-Exp, upstream-interop by design (the same
+  sidecar GGUF, synthetic ids, preprocess and token layout as upstream
+  antirez/ds4 `110afdd`, so upstream's binary serves as the oracle for
+  every later increment):
+  - Image substrate imported verbatim from upstream: the vendored
+    single-header JPEG/PNG decoders (`third_party/iris`, MIT),
+    `ds4_image.[ch]` (SHA-256 fingerprints, EXIF orientation, decode,
+    bicubic resize, the Vision-Exp preprocess: patch 14, downsample 3,
+    ≤ 384 tokens on a single variable-resolution grid, the N-order token
+    layout with its position-dependent alignment pad) and its unit test,
+    run by `make test`. The GLM 5.3 preprocess is dropped (the fork is
+    DeepSeek-only). The substrate links with libc + `-lm` alone.
+  - `--vision FILE` on the server, CLI and agent opens the encoder sidecar
+    GGUF and binds it: architecture `deepseek4-vision`, variant
+    `vision-exp`, `general.source.revision` equal to the base's, exactly
+    316 tensors, the 11 geometry expectations and every tensor's
+    type/rank/dims (BF16 ViT/aligner/sentinels, F32 router biases).
+    Refusals are by name and fail the open: a non-Vision-Exp base, a
+    distributed role, any bind mismatch. Nothing is auto-attached (launch
+    defaults never look for a sidecar). The boot line reports
+    `vision sidecar bound: … (316 tensors, sha256 …)`; the file's SHA-256
+    is the sidecar half of the image cache identity. Images are still
+    refused with the named 400s on all three surfaces: no API surface
+    feeds the encoder yet.
+  - `ds4 --validate-vision FILE` opens only the sidecar (no base) and
+    prints name, variant, revision, the 316-tensor bind verdict and the
+    SHA-256; the shipped encoder validates in about 3 s.
+- **The Vision-Exp image encoder runs on CUDA, bit-exact against
+  upstream (Track B increment 2)** — upstream antirez/ds4's DeepSeek
+  encoder (`110afdd`: the 32-block ViT, the aligner, the BF16 round-trip
+  points and the cuBLAS call, byte for byte) re-expressed on the fork's
+  idioms: every launch on the current stream, weights through the
+  registered sidecar map, the fork's global cuBLAS handle bound to the
+  stream around the GEMM and refused under graph capture, a caller-owned
+  BF16 staging buffer instead of the shared scratch. Compiled into every
+  CUDA build by default (`-DDS4_NO_VISION_ENCODER` opts out; Metal and CPU
+  refuse by name). Engine API: `ds4_engine_vision_encode_file/memory`
+  return a `[tokens x 4096]` F32 embedding in upstream's natural layout
+  with the image SHA-256 (`fingerprint`, upstream-identical) and the cache
+  identity (`identity` = SHA-256 of image ‖ sidecar ‖ preprocess version).
+  The sidecar gets its own residency row (`DS4_WEIGHT_RESIDENCY_VISION`,
+  boot line `vision=`) and catalog line. No API surface feeds it images
+  yet: the named 400s stay. Receipt (GB10, 2026-09-03): the fork's
+  embeddings are bit-identical (`max_abs=0`) to upstream's own binary on
+  all eight fixture images (16x16 to 2400x1800, 8:1 aspect, PNG and JPEG),
+  the fork reproducing itself exactly across runs while upstream's encoder
+  differed between two of its own runs on one shape; the text path is
+  unchanged with the encoder compiled in (unit battery + 0731 golden on the
+  same binary). Oracle harness `tests/dump_vision_embedding` +
+  `tests/compare_vision_dumps.py` are tracked (they build unchanged against
+  upstream's tree).
+- **`DS4_CONT_MTP_GATE=1` certifies a DSpark drafter** — the in-engine
+  losslessness gate (the s11 frontier-invariance / token-identity proof)
+  required a `--mtp` boot; 0731 and Vision-Exp retired the MTP head, so
+  their ship pairings (base + DSpark drafter) exited rc=2 and could not
+  be certified by it. The gate now accepts an armed DSpark drafter as the
+  draft source (exactly the forward's own arming predicate). On a
+  DSpark-only boot the MTP-chain-only mode-1 probe is skipped and
+  reported n/a, `DS4_CONT_MTP_ACCEPT` is required, and the draft source
+  is announced. Engagement receipts: run E records the finished sequence's
+  draft and hit counts and every forced-draft prefix-causality run its
+  draft count (the per-run accept lines carry the hits), and a run with
+  zero drafts at D ≥ 1 is rc=2 with a named cause, so a disarmed drafter
+  can never pass as lossless by luck.
+  On a DSpark boot the gate's effective depth is the block drafter's
+  (`DS4_DSPARK_VERIFY_DEPTH`; `DS4_CONT_MTP_DEPTH` does not apply, D=0 is
+  not a DSpark shape) and the forced-draft hook reaches the DSpark
+  block-draft fill, so the prefix-causality legs really do push wrong
+  drafts through the verify: the forced runs' accept stats now differ
+  from the unforced run (hits 0 at the first position), the N=8
+  sensitivity leg diverges with rollback off, and the rollback self-check
+  stays byte-exact. GB10 receipts on the ship pairings: Vision-Exp base +
+  its drafter at N=1 (D=4 and D=1) and N=8, and the 0731 pairing at N=1,
+  all rc=0.
 
 ## v0.6.5 — 2026-08-27
 

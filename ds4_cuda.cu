@@ -31746,3 +31746,11 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_n2_split_residual_tensor(
     }
     return ok;
 }
+
+/* ===== Track B inc 2: DeepSeek-V4-Flash-Vision-Exp encoder (ViT + aligner) =====
+ * Included last so the helpers see warp_sum_f32, cuda_ok, cuda_model_range_ptr,
+ * cuda_cublas_ws_prep, g_cublas and ds4_current_stream from this TU. */
+#ifndef DS4_NO_VISION_ENCODER   /* inc 2: compiled in by default on CUDA; -DDS4_NO_VISION_ENCODER opts out (both TUs) */
+#include "ds4_vit_common.cuh"
+#include "ds4_deepseek4_vision_gpu.cuh"
+#endif

@@ -244,6 +244,18 @@ tests/test_deepseek4_vision_image.o: tests/test_deepseek4_vision_image.c ds4_ima
 tests/test_deepseek4_vision_image: tests/test_deepseek4_vision_image.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
+# Track B inc 2: the encoder oracle harness (built unchanged against upstream
+# antirez/ds4 @110afdd; the two dumps must be byte-identical).
+tests/dump_vision_embedding.o: tests/dump_vision_embedding.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/dump_vision_embedding.c
+
+tests/dump_vision_embedding: tests/dump_vision_embedding.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(CFLAGS) -o $@ tests/dump_vision_embedding.o $(CORE_OBJS) $(METAL_LDLIBS)
+else
+	$(NVCC) $(NVCCFLAGS) -o $@ tests/dump_vision_embedding.o $(CORE_OBJS) $(CUDA_LDLIBS)
+endif
+
 ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
@@ -277,7 +289,7 @@ ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_repack.h
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_repack.h ds4_vit_common.cuh ds4_deepseek4_vision_gpu.cuh
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 # Vendored mmq pieces. ds4_mmq.cu transitively pulls in mmq.cuh which has
@@ -325,4 +337,4 @@ test: ds4_test ds4-eval tests/test_deepseek4_vision_image
 	./tests/test_deepseek4_vision_image
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_deepseek4_vision_image tests/test_deepseek4_vision_image.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_deepseek4_vision_image tests/test_deepseek4_vision_image.o tests/dump_vision_embedding tests/dump_vision_embedding.o

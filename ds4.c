@@ -23024,6 +23024,7 @@ struct ds4_engine {
     bool mtp_ready;
     bool dspark_ready;
     bool vision_ready;
+    bool vision_map_ready;    /* Track B inc 2: sidecar map registered with the GPU layer */
     bool boot_prewarm_done;   /* inc-14b: prewarm ran (or was attempted) */
     /* v0.5.1 inc4: MTP accept guard -- a process-wide mismatch detector for
      * the MTP draft arms (DSpark has its own calibrated yield quench; these
@@ -40809,6 +40810,11 @@ mtp_done:;
             why = "the base model is not a Vision-Exp checkpoint (image input needs DeepSeek-V4-Flash-Vision-Exp)";
         } else if (opt->distributed.role != DS4_DISTRIBUTED_NONE) {
             why = "not supported under a distributed role yet";
+        } else if (!g_ds4_source_revision[0]) {
+            /* Review follow-up (Sol F15): the sidecar's revision is compared
+             * only against a recorded base revision; an unstamped Vision-Exp
+             * base would pair any sidecar silently.  Refuse by name. */
+            why = "the base model records no general.source.revision, so the sidecar cannot be revision-matched (requant with a stamped source)";
         } else {
             model_open(&e->vision_model, opt->vision_path, graph_backend, false);
             if (!deepseek4_vision_weights_bind(&e->vision_weights, &e->vision_model,
@@ -40868,7 +40874,7 @@ mtp_done:;
          * aliases; the first-class knob refuses to share the boot with
          * them (strict conflict = typed open failure, the plan's "no
          * interacting negative flags"). */
-        int res_pol[3]; /* base, mtp, drafter -- the uts[]/cats[] order */
+        int res_pol[4]; /* base, mtp, drafter, vision -- the uts[]/cats[] order */
         {
             const ds4_residency_inputs common = {
                 NULL,
@@ -40877,12 +40883,13 @@ mtp_done:;
                 getenv("DS4_CUDA_DIRECT_MODEL") != NULL,
             };
             const char *glob = getenv("DS4_WEIGHT_RESIDENCY");
-            const struct { const char *nm; const char *ov; } rsrc[3] = {
+            const struct { const char *nm; const char *ov; } rsrc[4] = {
                 {"base",    getenv("DS4_WEIGHT_RESIDENCY_BASE")},
                 {"mtp",     getenv("DS4_WEIGHT_RESIDENCY_MTP")},
                 {"drafter", getenv("DS4_WEIGHT_RESIDENCY_DRAFTER")},
+                {"vision",  getenv("DS4_WEIGHT_RESIDENCY_VISION")},   /* Track B: the encoder sidecar */
             };
-            for (int ri = 0; ri < 3; ri++) {
+            for (int ri = 0; ri < 4; ri++) {
                 ds4_residency_inputs in = common;
                 in.explicit_val = rsrc[ri].ov && rsrc[ri].ov[0] ? rsrc[ri].ov
                                                                 : glob;
@@ -40903,12 +40910,13 @@ mtp_done:;
                         "is deprecated (mechanism-only lever); prefer "
                         "DS4_WEIGHT_RESIDENCY=eager|mapped\n");
             fprintf(stderr,
-                    "ds4: weight residency: base=%s mtp=%s drafter=%s (%s)\n",
+                    "ds4: weight residency: base=%s mtp=%s drafter=%s (%s) vision=%s\n",
                     ds4_residency_name(res_pol[0]),
                     ds4_residency_name(res_pol[1]),
                     ds4_residency_name(res_pol[2]),
-                    glob || rsrc[0].ov || rsrc[1].ov || rsrc[2].ov
-                        ? "explicit" : "legacy-alias");
+                    glob || rsrc[0].ov || rsrc[1].ov || rsrc[2].ov || rsrc[3].ov
+                        ? "explicit" : "legacy-alias",
+                    ds4_residency_name(res_pol[3]));
         }
         /* memgov D1a-1: declare every served mmap as a model source BEFORE
          * its first weight-class allocation (the artifact build below is
@@ -40933,6 +40941,11 @@ mtp_done:;
                                             e->dspark_model.fd, res_pol[2],
                                             "drafter", dspark_prov);
         }
+        if (e->vision_ready) {   /* Track B inc 2: the encoder sidecar is a served mmap too */
+            (void)ds4_gpu_model_source_bind(e->vision_model.map, e->vision_model.size,
+                                            DS4_MSRC_ROLE_AUXILIARY, e->vision_model.fd,
+                                            res_pol[3], "vision", opt->vision_path);
+        }
         /* memgov D1a-2: one semantic-catalog line per source — the D1a
          * gate's positive engagement signal (the tripwire at the pre-cache
          * site is its negative twin). */
@@ -40941,6 +40954,7 @@ mtp_done:;
                 {"base", &e->model, 1},
                 {"mtp", &e->mtp_model, e->mtp_ready},
                 {"drafter", &e->dspark_model, e->dspark_ready},
+                {"vision",  &e->vision_model, e->vision_ready},   /* Track B: the encoder sidecar */
             };
             for (size_t ci = 0; ci < sizeof(cats) / sizeof(cats[0]); ci++) {
                 ds4_model_catalog_counts cc;
@@ -41069,6 +41083,24 @@ mtp_done:;
             *out = NULL;
             return 1;
         }
+        /* Track B inc 2: the encoder sidecar's tensor bytes become device-readable
+         * the same way (registered UVA views), so ds4_vit_weight() can resolve
+         * offsets; the encoder itself uploads nothing else. */
+        if (e->vision_ready &&
+            !ds4_gpu_set_model_map_range(e->vision_model.map,
+                                          e->vision_model.size,
+                                          e->vision_model.tensor_data_pos,
+                                          e->vision_model.size - e->vision_model.tensor_data_pos,
+                                          e->vision_model.max_tensor_bytes))
+        {
+            fprintf(stderr,
+                    "ds4: %s failed to map the vision sidecar views; aborting startup.\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->vision_ready) e->vision_map_ready = true;
 #ifndef __APPLE__
         const char *weight_ipc_manifest = getenv("DS4_CUDA_WEIGHT_IPC_MANIFEST");
         if (weight_ipc_manifest && weight_ipc_manifest[0]) {
@@ -41160,6 +41192,7 @@ mtp_done:;
                 {"base", &e->model, 1, load_slice},
                 {"mtp", &e->mtp_model, e->mtp_ready, 0},
                 {"drafter", &e->dspark_model, e->dspark_ready, 0},
+                {"vision", &e->vision_model, e->vision_ready, 0},   /* Track B: uts[] order == res_pol[] order */
             };
             for (size_t si = 0; si < sizeof(uts) / sizeof(uts[0]); si++) {
                 if (!uts[si].on || uts[si].mm->n_tensors == 0) continue;
@@ -41339,6 +41372,109 @@ bool ds4_engine_has_vision(ds4_engine *e) {
 
 const uint8_t *ds4_engine_vision_fingerprint(ds4_engine *e) {
     return (e && e->vision_ready) ? e->vision_fingerprint : NULL;
+}
+
+/* ===== Track B inc 2: encode one image through the sidecar (CUDA only) =====
+ * Preprocess (ds4_image.c, upstream-identical) -> ds4_gpu_deepseek4_vision_encode
+ * -> the natural-grid [rows x 4096] F32 block.  The caller owns out->data. */
+static int ds4_engine_vision_encode_image(ds4_engine *e, const ds4_image *image,
+                                          ds4_vision_embedding *out,
+                                          char *error, size_t error_cap) {
+    if (!e || !image || !out || !e->vision_ready) {
+        if (error && error_cap) snprintf(error, error_cap, "vision encoder is not loaded (--vision)");
+        return 0;
+    }
+    memset(out, 0, sizeof(*out));
+#if defined(DS4_NO_GPU) || defined(__APPLE__) || defined(DS4_NO_VISION_ENCODER)
+    if (error && error_cap)
+        snprintf(error, error_cap, "the Vision-Exp encoder is not built into this binary (CUDA builds carry it unless -DDS4_NO_VISION_ENCODER; Metal/CPU: not implemented)");
+    return 0;
+#else
+    if (!e->vision_map_ready) {
+        if (error && error_cap)
+            snprintf(error, error_cap, "vision sidecar is not mapped on %s", ds4_backend_name(e->backend));
+        return 0;
+    }
+    ds4_deepseek4_image_patches patches = {0};
+    if (!ds4_image_preprocess_deepseek4(&patches, image, error, error_cap)) return 0;
+    const uint32_t token_count = patches.llm_grid_height * patches.llm_grid_width;
+    /* The encoder writes ceil(grid/3)^2 rows (its 3x3 alignment); the preprocess
+     * derives llm_grid the same way today, but the two are independent
+     * derivations of one number, so a preprocess change must refuse here rather
+     * than overflow the caller-owned buffer. */
+    {
+        const uint32_t enc_rows = ((patches.grid_height + 2u) / 3u) * ((patches.grid_width + 2u) / 3u);
+        if (enc_rows != token_count || token_count == 0u) {
+            if (error && error_cap)
+                snprintf(error, error_cap, "vision preprocess/encoder row count mismatch (%u vs %u)",
+                         (unsigned)token_count, (unsigned)enc_rows);
+            ds4_deepseek4_image_patches_free(&patches);
+            return 0;
+        }
+    }
+    float *embedding = malloc((size_t)token_count * 4096u * sizeof(float));
+    int ok = 0;
+    if (embedding) {
+        ok = ds4_gpu_deepseek4_vision_encode(embedding, patches.patches,
+                                             patches.grid_height, patches.grid_width,
+                                             e->vision_model.map, e->vision_model.size,
+                                             &e->vision_weights);
+    }
+    out->content_width = patches.content_width;
+    out->content_height = patches.content_height;
+    out->grid_width = patches.llm_grid_width;
+    out->grid_height = patches.llm_grid_height;
+    ds4_deepseek4_image_patches_free(&patches);
+    if (!embedding) {
+        if (error && error_cap) snprintf(error, error_cap, "unable to allocate the vision output");
+        return 0;
+    }
+    if (!ok) {
+        free(embedding);
+        if (error && error_cap) snprintf(error, error_cap, "DeepSeek V4 vision inference failed");
+        return 0;
+    }
+    out->data = embedding;
+    out->token_count = token_count;
+    out->layout = DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL;
+    out->width = image->width;
+    out->height = image->height;
+    memcpy(out->fingerprint, image->fingerprint, sizeof(out->fingerprint));
+    {   /* charter §2.2: identity = SHA-256(image || sidecar weights || preprocess version) */
+        uint8_t buf[32 + 32 + 4];
+        const uint32_t ver = DS4_VISION_PREPROCESS_VERSION;
+        memcpy(buf, image->fingerprint, 32);
+        memcpy(buf + 32, e->vision_fingerprint, 32);
+        buf[64] = (uint8_t)(ver & 0xffu); buf[65] = (uint8_t)((ver >> 8) & 0xffu);
+        buf[66] = (uint8_t)((ver >> 16) & 0xffu); buf[67] = (uint8_t)((ver >> 24) & 0xffu);
+        ds4_image_sha256(buf, sizeof(buf), out->identity);
+    }
+    return 1;
+#endif
+}
+
+int ds4_engine_vision_encode_file(ds4_engine *e, const char *path,
+                                  ds4_vision_embedding *out, char *error, size_t error_cap) {
+    ds4_image image = {0};
+    if (!ds4_image_decode_file(&image, path, error, error_cap)) return 0;
+    int ok = ds4_engine_vision_encode_image(e, &image, out, error, error_cap);
+    ds4_image_free(&image);
+    return ok;
+}
+
+int ds4_engine_vision_encode_memory(ds4_engine *e, const uint8_t *encoded, size_t encoded_len,
+                                    ds4_vision_embedding *out, char *error, size_t error_cap) {
+    ds4_image image = {0};
+    if (!ds4_image_decode_memory(&image, encoded, encoded_len, error, error_cap)) return 0;
+    int ok = ds4_engine_vision_encode_image(e, &image, out, error, error_cap);
+    ds4_image_free(&image);
+    return ok;
+}
+
+void ds4_vision_embedding_free(ds4_vision_embedding *embedding) {
+    if (!embedding) return;
+    free(embedding->data);
+    memset(embedding, 0, sizeof(*embedding));
 }
 
 const char *ds4_engine_model_name(ds4_engine *e) {

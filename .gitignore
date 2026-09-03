@@ -21,3 +21,4 @@ __pycache__/
 /.antigravitycli/
 # Track B: image substrate unit test binary
 tests/test_deepseek4_vision_image
+tests/dump_vision_embedding

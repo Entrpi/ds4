@@ -189,6 +189,39 @@ const char *ds4_engine_source_revision(ds4_engine *e);
  * 32-byte SHA-256 of the sidecar file is the cache identity's sidecar half. */
 bool ds4_engine_has_vision(ds4_engine *e);
 const uint8_t *ds4_engine_vision_fingerprint(ds4_engine *e);
+
+/* Track B inc 2: one encoded image = a [token_count x 4096] F32 block in the
+ * encoder's natural row-major grid (layout DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL);
+ * the N-order permutation and the sentinel rows are applied at prompt-append
+ * time once the block's position is known (inc 3).  fingerprint = SHA-256 of
+ * the decoded image bytes (upstream-identical).  CUDA only: other builds
+ * refuse by name. */
+#define DS4_VISION_LAYOUT_DEEPSEEK4_NATURAL 1u
+#define DS4_VISION_PREPROCESS_VERSION 1u   /* bump when the preprocess (patch/downsample/budget/layout) changes */
+typedef struct {
+    float *data;
+    uint32_t token_count;
+    uint32_t layout;
+    uint32_t grid_width;
+    uint32_t grid_height;
+    uint32_t width;
+    uint32_t height;
+    uint32_t content_width;
+    uint32_t content_height;
+    uint8_t fingerprint[32];   /* SHA-256 of the decoded image (upstream-identical; the oracle dumps carry it) */
+    uint8_t identity[32];      /* SHA-256(fingerprint || sidecar sha256 || DS4_VISION_PREPROCESS_VERSION le32):
+                                * the cache identity of this embedding (charter §2.2); everything that keys,
+                                * scores or persists image-conditioned state must use THIS, never fingerprint */
+} ds4_vision_embedding;
+typedef struct {
+    uint32_t token_start;
+    ds4_vision_embedding embedding;
+} ds4_vision_span;
+int ds4_engine_vision_encode_file(ds4_engine *e, const char *path,
+                                  ds4_vision_embedding *out, char *error, size_t error_cap);
+int ds4_engine_vision_encode_memory(ds4_engine *e, const uint8_t *encoded, size_t encoded_len,
+                                    ds4_vision_embedding *out, char *error, size_t error_cap);
+void ds4_vision_embedding_free(ds4_vision_embedding *embedding);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
