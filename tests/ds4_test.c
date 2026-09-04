@@ -2065,6 +2065,108 @@ static void test_vision_cache_group(void) {
     printf("vision-cache: ok\n");
 }
 
+/* Track B inc 5: the multimodal compaction protocol's pure half.  A transcript
+ * of 100 tokens holds four image blocks: A @10 (10 rows), B @30, C @50 with NO
+ * embedding (a reference span: restored by identity, data gone), D @70. */
+static void test_vision_compact_group(void) {
+    float dummy = 0.0f;
+    ds4_vision_span img[4];
+    memset(img, 0, sizeof(img));
+    const uint32_t starts[4] = {10u, 30u, 50u, 70u};
+    for (int i = 0; i < 4; i++) {
+        img[i].token_start = starts[i];
+        img[i].embedding.token_count = 10u;
+        img[i].embedding.data = i == 2 ? NULL : &dummy;
+        memset(img[i].embedding.identity, 0x40 + i, sizeof(img[i].embedding.identity));
+    }
+    /* (a) the tail start: pushed past the data-less block C, pulled back to the
+     *     start of a straddled data-bearing block, clamped to bottom, untouched
+     *     when no block is involved. */
+    TEST_ASSERT(ds4_vision_spans_compact_tail(img, 4, 0u, 100u) == 60u);      /* C reaches past 0 */
+    TEST_ASSERT(ds4_vision_spans_compact_tail(img, 4, 35u, 100u) == 60u);     /* B straddled, but C wins first */
+    TEST_ASSERT(ds4_vision_spans_compact_tail(img, 4, 55u, 100u) == 60u);     /* inside C: past its end */
+    TEST_ASSERT(ds4_vision_spans_compact_tail(img, 4, 60u, 100u) == 60u);     /* at C's end: unchanged */
+    TEST_ASSERT(ds4_vision_spans_compact_tail(img, 4, 65u, 100u) == 65u);     /* between C and D */
+    TEST_ASSERT(ds4_vision_spans_compact_tail(img, 4, 75u, 100u) == 70u);     /* D straddled: its start */
+    TEST_ASSERT(ds4_vision_spans_compact_tail(img, 4, 70u, 100u) == 70u);     /* on D's first row */
+    TEST_ASSERT(ds4_vision_spans_compact_tail(img, 4, 80u, 100u) == 80u);     /* just after D */
+    TEST_ASSERT(ds4_vision_spans_compact_tail(img, 4, 100u, 100u) == 100u);   /* empty tail stays empty */
+    TEST_ASSERT(ds4_vision_spans_compact_tail(img, 4, 120u, 100u) == 100u);   /* clamped */
+    TEST_ASSERT(ds4_vision_spans_compact_tail(NULL, 0, 7u, 100u) == 7u);
+    {   /* a data-less block reaching past bottom empties the tail */
+        ds4_vision_span late = img[2];
+        late.token_start = 95u;
+        TEST_ASSERT(ds4_vision_spans_compact_tail(&late, 1, 90u, 100u) == 100u);
+    }
+    {   /* all data-bearing: only the straddle rule applies */
+        ds4_vision_span d[4];
+        memcpy(d, img, sizeof(d));
+        d[2].embedding.data = &dummy;
+        TEST_ASSERT(ds4_vision_spans_compact_tail(d, 4, 0u, 100u) == 0u);
+        TEST_ASSERT(ds4_vision_spans_compact_tail(d, 4, 55u, 100u) == 50u);
+        TEST_ASSERT(ds4_vision_spans_compact_tail(d, 4, 35u, 100u) == 30u);
+    }
+    /* (b) retained-image selection: whole blocks inside [tail, bottom) survive
+     *     with token_start rebased; the rest are dropped; ownership is shared. */
+    {
+        ds4_vision_span out[4];
+        bool kept[4];
+        memset(out, 0, sizeof(out));
+        TEST_ASSERT(ds4_vision_spans_retain(img, 4, 60u, 100u, 5u, out, kept) == 1);
+        TEST_ASSERT(!kept[0] && !kept[1] && !kept[2] && kept[3]);
+        TEST_ASSERT(out[0].token_start == 15u && out[0].embedding.token_count == 10u);
+        TEST_ASSERT(out[0].embedding.data == &dummy && out[0].embedding.identity[0] == 0x43);
+        TEST_ASSERT(img[3].token_start == 70u);   /* the source list is untouched */
+
+        TEST_ASSERT(ds4_vision_spans_retain(img, 4, 0u, 100u, 5u, out, kept) == 4);
+        TEST_ASSERT(kept[0] && kept[1] && kept[2] && kept[3]);
+        TEST_ASSERT(out[0].token_start == 15u && out[1].token_start == 35u &&
+                    out[2].token_start == 55u && out[3].token_start == 75u);
+        TEST_ASSERT(out[2].embedding.data == NULL && out[1].embedding.data == &dummy);
+
+        TEST_ASSERT(ds4_vision_spans_retain(img, 4, 30u, 100u, 0u, out, kept) == 3);   /* A dropped */
+        TEST_ASSERT(!kept[0] && kept[1] && out[0].token_start == 0u && out[2].token_start == 40u);
+        TEST_ASSERT(ds4_vision_spans_retain(img, 4, 30u, 75u, 0u, out, kept) == 2);    /* D crosses bottom */
+        TEST_ASSERT(kept[1] && kept[2] && !kept[3]);
+        TEST_ASSERT(ds4_vision_spans_retain(img, 4, 35u, 100u, 0u, out, kept) == 2);   /* B crosses the cut */
+        TEST_ASSERT(!kept[1] && kept[2] && kept[3] && out[0].token_start == 15u);
+        TEST_ASSERT(ds4_vision_spans_retain(img, 4, 100u, 100u, 0u, out, kept) == 0);
+        TEST_ASSERT(ds4_vision_spans_retain(NULL, 0, 0u, 100u, 0u, out, kept) == 0);
+        TEST_ASSERT(ds4_vision_spans_retain(img, 4, 60u, 100u, 5u, NULL, NULL) == 1);  /* count-only form */
+    }
+    /* (c) the two together: the cut a compaction actually uses never splits a
+     *     block and never retains a data-less one it would have to prefill. */
+    for (uint32_t cut = 0; cut <= 100u; cut++) {
+        const uint32_t tail = ds4_vision_spans_compact_tail(img, 4, cut, 100u);
+        bool kept[4];
+        ds4_vision_spans_retain(img, 4, tail, 100u, 0u, NULL, kept);
+        for (int i = 0; i < 4; i++) {
+            const uint32_t end = img[i].token_start + img[i].embedding.token_count;
+            const bool straddles = img[i].token_start < tail && end > tail;
+            TEST_ASSERT(!straddles);
+            if (!img[i].embedding.data) TEST_ASSERT(!kept[i]);
+            if (kept[i]) TEST_ASSERT(img[i].token_start >= tail);
+        }
+    }
+    /* (d) the sync guard's scan: first image row at or after `from`. */
+    {
+        ds4_tokens t = {0};
+        for (int i = 0; i < 6; i++) ds4_tokens_push(&t, 100 + i);
+        TEST_ASSERT(ds4_vision_prompt_first_image_row(&t, 0) == -1);
+        ds4_tokens_push(&t, (int)(DS4_VISION_ID_BASE + 0));   /* START at 6 */
+        ds4_tokens_push(&t, (int)(DS4_VISION_ID_BASE + 2));
+        ds4_tokens_push(&t, 7);
+        TEST_ASSERT(ds4_vision_prompt_first_image_row(&t, 0) == 6);
+        TEST_ASSERT(ds4_vision_prompt_first_image_row(&t, 6) == 6);
+        TEST_ASSERT(ds4_vision_prompt_first_image_row(&t, 7) == 7);
+        TEST_ASSERT(ds4_vision_prompt_first_image_row(&t, 8) == -1);
+        TEST_ASSERT(ds4_vision_prompt_first_image_row(&t, -3) == 6);
+        TEST_ASSERT(ds4_vision_prompt_first_image_row(NULL, 0) == -1);
+        ds4_tokens_free(&t);
+    }
+    printf("vision-compact: ok\n");
+}
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -2090,6 +2192,7 @@ static const ds4_test_entry test_entries[] = {
 #endif
     {"--vision-prompt", "vision-prompt", "Track B inc 3: image-block token stream + session identity units", test_vision_prompt_group},
     {"--vision-cache", "vision-cache", "Track B inc 8: identity markers in cache keys, payload lineage, reference spans", test_vision_cache_group},
+    {"--vision-compact", "vision-compact", "Track B inc 5: multimodal compaction tail, retained-image selection, sync guard scan", test_vision_compact_group},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

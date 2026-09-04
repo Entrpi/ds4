@@ -21637,6 +21637,16 @@ static bool metal_graph_scatter_visual_rows(ds4_gpu_graph *g, const token_vec *p
                 synthetic, pos0, covered);
         ok = false;
     }
+    if (ok) {
+        /* Engagement tell (gates must PROVE the visual path ran): once per
+         * process, the first chunk that carried image rows. */
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            fprintf(stderr, "ds4: image prefill engaged (first chunk @%u: %u image rows of %u, %zu span(s) published)\n",
+                    pos0, covered, n_tokens, g->prefill_vision_span_count);
+        }
+    }
     return ok;
 }
 
@@ -21665,6 +21675,16 @@ static bool metal_graph_prefill_layer_major(
     g->prefill_host_pos0 = 0;
     g->prefill_host_count = (uint32_t)prompt->len;
     const bool visual_chunk = metal_graph_visual_tokens_for_batch(g, start, n_tokens) != NULL;
+    if (!visual_chunk) {
+        /* inc 5 (defense in depth): a chunk that carries image rows while no
+         * spans were published must not fall through the clamped gather. */
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            if (prompt->v[start + i] >= (int)DS4_N_VOCAB) {
+                fprintf(stderr, "ds4: image prefill: chunk @%u carries image rows but no image spans were published\n", start);
+                return false;
+            }
+        }
+    }
 
     if (!metal_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) return false;
 
@@ -24193,6 +24213,58 @@ int ds4_vision_spans_require_data(const ds4_vision_span *images, size_t image_co
         }
     }
     return 1;
+}
+
+uint32_t ds4_vision_spans_compact_tail(const ds4_vision_span *images, size_t n,
+                                       uint32_t tail_start, uint32_t bottom) {
+    if (tail_start > bottom) tail_start = bottom;
+    /* 1. a block the cache no longer holds the data of cannot be prefilled
+     *    again: the tail starts after the last such block that reaches it. */
+    for (size_t i = 0; images && i < n; i++) {
+        const ds4_vision_span *sp = &images[i];
+        if (sp->embedding.data) continue;
+        const uint64_t end = (uint64_t)sp->token_start + sp->embedding.token_count;
+        if (end > tail_start) tail_start = end > bottom ? bottom : (uint32_t)end;
+    }
+    /* 2. never cut inside a block: pull the start back to the block's own
+     *    start (blocks are ordered and never overlap, so at most one straddles
+     *    the cut, and it starts at or after every earlier block's end). */
+    for (size_t i = 0; images && i < n; i++) {
+        const ds4_vision_span *sp = &images[i];
+        if (!sp->embedding.data) continue;
+        const uint64_t end = (uint64_t)sp->token_start + sp->embedding.token_count;
+        if (sp->token_start < tail_start && end > tail_start) {
+            tail_start = sp->token_start;
+            break;
+        }
+    }
+    return tail_start;
+}
+
+int ds4_vision_prompt_first_image_row(const ds4_tokens *prompt, int from) {
+    if (!prompt || !prompt->v) return -1;
+    for (int i = from < 0 ? 0 : from; i < prompt->len; i++)
+        if (prompt->v[i] >= (int)DS4_VISION_ID_BASE) return i;
+    return -1;
+}
+
+size_t ds4_vision_spans_retain(const ds4_vision_span *images, size_t n,
+                               uint32_t tail_start, uint32_t bottom, uint32_t dst_start,
+                               ds4_vision_span *out, bool *kept) {
+    size_t kept_n = 0;
+    for (size_t i = 0; images && i < n; i++) {
+        const ds4_vision_span *sp = &images[i];
+        const uint64_t end = (uint64_t)sp->token_start + sp->embedding.token_count;
+        const bool keep = sp->token_start >= tail_start && end <= (uint64_t)bottom;
+        if (kept) kept[i] = keep;
+        if (!keep) continue;
+        if (out) {
+            out[kept_n] = *sp;
+            out[kept_n].token_start = (uint32_t)((uint64_t)dst_start + (sp->token_start - tail_start));
+        }
+        kept_n++;
+    }
+    return kept_n;
 }
 
 int ds4_chat_append_multimodal_message(ds4_engine *e, ds4_tokens *tokens, const char *role,
@@ -42258,6 +42330,11 @@ void ds4_vision_embedding_free(ds4_vision_embedding *embedding) {
     memset(embedding, 0, sizeof(*embedding));
 }
 
+int ds4_engine_embd_dim(ds4_engine *e) {
+    (void)e;
+    return (int)DS4_N_EMBD;
+}
+
 const char *ds4_engine_model_name(ds4_engine *e) {
     (void)e;
     return DS4_MODEL_SHAPE_NAME;
@@ -43129,15 +43206,29 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         return 1;
 #endif
     }
-    if (s && s->sync_image_count != 0) {
-        /* inc 8 reference spans: every data-less span must lie inside the part
-         * of the prompt the checkpoint already holds (the sync will only
-         * prefill from resume on). */
-        const uint32_t resume = (s->checkpoint_valid && prompt && prompt->len >= s->checkpoint.len &&
+    if (s && prompt) {
+        const uint32_t resume = (s->checkpoint_valid && prompt->len >= s->checkpoint.len &&
                                  ds4_tokens_starts_with(prompt, &s->checkpoint))
                                     ? (uint32_t)s->checkpoint.len : 0u;
-        if (!ds4_vision_spans_require_data(s->sync_images, s->sync_image_count, resume, err, errlen))
-            return 1;
+        if (s->sync_image_count != 0) {
+            /* inc 8 reference spans: every data-less span must lie inside the
+             * part of the prompt the checkpoint already holds (the sync will
+             * only prefill from resume on). */
+            if (!ds4_vision_spans_require_data(s->sync_images, s->sync_image_count, resume, err, errlen))
+                return 1;
+        } else {
+            /* inc 5: an image row can only be prefilled through the multimodal
+             * entry (spans published).  The plain path would gather it as a
+             * clamped token embedding and the model would see garbage, silently
+             * -- exactly what happened to the agent's first image observation. */
+            const int row = ds4_vision_prompt_first_image_row(prompt, (int)resume);
+            if (row >= 0) {
+                snprintf(err, errlen,
+                         "prompt carries an image row at %d but no image spans were published: "
+                         "sync it with ds4_session_sync_multimodal", row);
+                return 1;
+            }
+        }
     }
     const int rc = ds4_session_sync_body(s, prompt, err, errlen);
     if (rc == 0) {

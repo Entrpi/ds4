@@ -188,6 +188,8 @@ const char *ds4_engine_source_revision(ds4_engine *e);
 /* Track B: 1 when a Vision-Exp encoder sidecar is bound (validated); the
  * 32-byte SHA-256 of the sidecar file is the cache identity's sidecar half. */
 bool ds4_engine_has_vision(ds4_engine *e);
+/* Width of one residual/embedding row (the F32 image block's second dimension). */
+int ds4_engine_embd_dim(ds4_engine *e);
 const uint8_t *ds4_engine_vision_fingerprint(ds4_engine *e);
 
 /* Track B inc 2: one encoded image = a [token_count x 4096] F32 block in the
@@ -296,6 +298,28 @@ int  ds4_vision_spans_require_data(const ds4_vision_span *images, size_t image_c
 /* Cap len at the first recorded block it enters (identity-list form, for
  * callers that hold a payload's list rather than a session). */
 int  ds4_vision_identities_prefix_cap(const ds4_vision_identity *v, size_t n, int len);
+/* inc 5 (multimodal compaction, charter A9).  A compaction keeps the verbatim
+ * tail [tail_start, bottom) of a transcript and moves it to dst_start.
+ * ds4_vision_spans_compact_tail: the start the tail may actually use so that it
+ * never carries PART of an image block, nor a block whose embedding is gone (a
+ * reference span cannot be prefilled again): the cut is pushed past every
+ * data-less block that ends after it, then pulled back to the start of a
+ * data-bearing block that straddles it.  Returns the adjusted start (<= bottom).
+ * ds4_vision_spans_retain: shallow-copies every span lying wholly inside
+ * [tail_start, bottom) into out[] in order, token_start rebased to dst_start,
+ * flags it in kept[] (n entries) and returns the count.  Embedding ownership is
+ * untouched: the caller frees the DROPPED spans' data only once the rebuilt
+ * transcript has synced, and on failure discards out[] and keeps the old list. */
+uint32_t ds4_vision_spans_compact_tail(const ds4_vision_span *images, size_t n,
+                                       uint32_t tail_start, uint32_t bottom);
+/* Index of the first image row (synthetic id >= DS4_VISION_ID_BASE) at or after
+ * `from`, or -1.  ds4_session_sync refuses to prefill such a row when no spans
+ * were published: an image block only ever enters the KV through
+ * ds4_session_sync_multimodal (otherwise the gather would clamp it to row 0). */
+int      ds4_vision_prompt_first_image_row(const ds4_tokens *prompt, int from);
+size_t   ds4_vision_spans_retain(const ds4_vision_span *images, size_t n,
+                                 uint32_t tail_start, uint32_t bottom, uint32_t dst_start,
+                                 ds4_vision_span *out, bool *kept);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);

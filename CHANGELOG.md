@@ -7,6 +7,36 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased
 
+- **Track B inc 5: image input on the CLI and the agent.**  `ds4 --vision
+  FILE` now makes `/read FILE` accept a PNG or JPEG in the interactive
+  prompt (sniffed by magic): the image is encoded, laid out as one DeepSeek
+  image block after the user marker, and every later sync of the chat
+  passes the whole image list, so a text turn after an image turn extends
+  the same checkpoint instead of rebuilding it; the Think-Max prefix rewrite
+  and turn rollback move or trim the image spans with the transcript.
+  `ds4-agent --vision FILE` gains the `view_image` tool (upstream's schema):
+  the image becomes part of the tool observation itself, appended as one
+  tool-role multimodal message whose embeddings the worker owns.  The
+  agent's context compaction is multimodal: the verbatim tail never cuts
+  through an image block, image blocks wholly inside the tail are retained
+  with their positions rebased, dropped embeddings are freed only after the
+  rebuilt transcript synced (a failed rebuild restores the old list), and a
+  block the cache no longer holds the embedding of (a restored session's
+  reference span) is never retained, since it cannot be prefilled again.
+  Session save/restore works with images: the record carries the identity
+  markers and the v4 lineage of inc 8, and after `/switch` the worker
+  rebuilds its image list as reference spans from the restored lineage, so
+  follow-up turns extend the restored checkpoint; `/strip` refuses a session
+  with image blocks (its text has no form for them).  Two engine guards land
+  with it, found when the agent's first image observation came back as
+  garbage: the plain `ds4_session_sync` now refuses by name to prefill an
+  image row when no image spans were published (only the multimodal entry
+  may carry a block into the KV; before, the gather clamped the rows to
+  token 0 and the model saw noise), and the CUDA layer-major prefill refuses
+  a chunk with image rows when the visual path is off.  The scatter logs
+  `image prefill engaged` once per process, so a gate can prove the path
+  ran.  `DS4_REPL_TOKEN_DUMP` is a CLI diagnostic that records the synced
+  transcript per REPL turn.
 - **Track B inc 8 (cache safety): image-conditioned state persists only
   under its identity.**  Every cache key and record now carries the ordered
   image lineage of the state it names.  The kvstore text renderer emits one

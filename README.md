@@ -117,15 +117,19 @@ enabled explicitly with `--mtp`. The current MTP/speculative decoding path is
 still experimental: it is correctness-gated and currently provides at most a
 slight speedup, not a meaningful generation-speed win.
 
-### DeepSeek V4 Flash Vision-Exp (text-only, opt-in)
+### DeepSeek V4 Flash Vision-Exp (image input on the CLI and the agent, opt-in)
 
 `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` (2026-08-31) is a separate
 continued-training checkpoint of Flash with an image encoder. This fork
-accepts its language GGUF as a **text-only** model: image input is not
-implemented (image, file and audio content blocks are refused with a 400
-rather than silently dropped; the encoder sidecar is downloaded beside the
-weights for when it is), and the 0731 checkpoint stays the auto-picked
-default. The engine reads the checkpoint variant off the GGUF metadata, takes
+serves its language GGUF, and with the encoder sidecar (`--vision FILE`)
+takes image input on the serial lane: `ds4 --vision` makes `/read FILE`
+accept a PNG or JPEG in the interactive prompt, and `ds4-agent --vision`
+adds the `view_image` tool (the image becomes part of the tool
+observation; context compaction and session save/restore keep the image
+blocks). The server surfaces still refuse image, file and audio content
+blocks with a 400 rather than silently dropping them (the batched lane
+comes later), and the 0731 checkpoint stays the auto-picked default. The
+engine reads the checkpoint variant off the GGUF metadata, takes
 the checkpoint's `rms_eps = 1e-20`, keys its disk KV cache and agent
 checkpoints separately from 0731, and refuses to pair a Vision-Exp base with
 the 0731 DSpark drafter or MTP file (and a 0731 base with the Vision-Exp
@@ -138,6 +142,8 @@ fork's own extraction with the 0731 Q2K recipe.
 ./download_model.sh vision-q2       # Vision-Exp IQ2_XXS/Q2_K language GGUF + encoder (~88 GB)
 ./download_model.sh drafter-vision  # the fork's Vision-Exp DSpark drafter (6.46 GiB)
 ./ds4-server -m ./ds4flash.gguf -c 65536
+./ds4 -m ./ds4flash.gguf --vision ./DeepSeek-V4-Flash-Vision-Encoder.gguf   # then: /read photo.png
+./ds4-agent -m ./ds4flash.gguf --vision ./DeepSeek-V4-Flash-Vision-Encoder.gguf  # view_image tool
 ```
 
 Pass `-m` explicitly: a bare `ds4-server` prefers the 0731 GGUF in
@@ -919,7 +925,7 @@ ds4>
 The interactive CLI is a real multi-turn DS4 chat. It keeps the rendered chat
 transcript and the live graph KV checkpoint, so each turn extends the previous
 conversation. Useful commands are `/help`, `/think`, `/think-max`, `/nothink`,
-`/ctx N`, `/read FILE`, and `/quit`. Ctrl+C interrupts the current generation
+`/ctx N`, `/read FILE` (a text prompt, or a PNG/JPEG image with `--vision`), and `/quit`. Ctrl+C interrupts the current generation
 and returns to `ds4>`.
 
 The CLI defaults to thinking mode. Use `/nothink` or `--nothink` for direct

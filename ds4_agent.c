@@ -97,6 +97,9 @@ typedef struct {
     agent_config *cfg;
     ds4_session *session;
     ds4_tokens transcript;
+    ds4_vision_span *images;   /* Track B inc 5: every image block of the transcript, in order */
+    size_t image_count;
+    size_t image_cap;
     char *cache_dir;
     char *sysprompt_path;
     char session_sha[41];
@@ -360,6 +363,69 @@ static void *xrealloc(void *ptr, size_t n) {
     return p;
 }
 
+/* ---- Track B inc 5: the worker's image list -------------------------------
+ * One span per image block of w->transcript, in token order.  Every sync
+ * passes the whole list (a text turn after an image turn included), or the
+ * session would see its image-conditioned checkpoint as foreign and rebuild. */
+static void agent_worker_images_clear(agent_worker *w) {
+    if (!w) return;
+    for (size_t i = 0; i < w->image_count; i++)
+        ds4_vision_embedding_free(&w->images[i].embedding);
+    free(w->images);
+    w->images = NULL;
+    w->image_count = 0;
+    w->image_cap = 0;
+}
+
+/* Move `count` spans in (the source entries are zeroed: ownership transfers). */
+static void agent_worker_images_append(agent_worker *w,
+                                       ds4_vision_span *spans,
+                                       size_t count) {
+    if (!count) return;
+    if (w->image_count + count > w->image_cap) {
+        size_t cap = w->image_cap ? w->image_cap : 4;
+        while (cap < w->image_count + count) cap *= 2;
+        w->images = xrealloc(w->images, cap * sizeof(w->images[0]));
+        w->image_cap = cap;
+    }
+    memcpy(w->images + w->image_count, spans, count * sizeof(spans[0]));
+    w->image_count += count;
+    memset(spans, 0, count * sizeof(spans[0]));
+}
+
+static bool agent_worker_images_fit_tokens(const agent_worker *w,
+                                           const ds4_tokens *tokens) {
+    if (!w || !tokens) return false;
+    for (size_t i = 0; i < w->image_count; i++) {
+        uint64_t end = (uint64_t)w->images[i].token_start +
+                       w->images[i].embedding.token_count;
+        if (end > (uint64_t)tokens->len) return false;
+    }
+    return true;
+}
+
+/* After a session restore the live checkpoint's image blocks are known by
+ * identity only (inc 8 lineage): rebuild the list as REFERENCE spans (start,
+ * count, identity, no embedding) so later syncs reproduce them.  A sync that
+ * would have to prefill one refuses by block (its data is gone); the
+ * compaction tail never retains such a block for that reason. */
+static void agent_worker_images_from_session(agent_worker *w) {
+    agent_worker_images_clear(w);
+    const ds4_vision_identity *ids = NULL;
+    const size_t n = ds4_session_vision_identities(w->session, &ids);
+    if (!n) return;
+    w->images = xmalloc(n * sizeof(w->images[0]));
+    memset(w->images, 0, n * sizeof(w->images[0]));
+    for (size_t i = 0; i < n; i++) {
+        w->images[i].token_start = ids[i].token_start;
+        w->images[i].embedding.token_count = ids[i].token_count;
+        memcpy(w->images[i].embedding.identity, ids[i].identity,
+               sizeof(w->images[i].embedding.identity));
+    }
+    w->image_count = n;
+    w->image_cap = n;
+}
+
 static void write_all(int fd, const char *p, size_t n) {
     while (n) {
         ssize_t wr = write(fd, p, n);
@@ -497,7 +563,7 @@ static void usage(FILE *fp) {
         "Options:\n"
         "  -m, --model FILE        GGUF model path. Default: ds4flash.gguf\n"
         "  --mtp FILE             Optional MTP support GGUF.\n"
-        "  --vision FILE          Vision-Exp encoder sidecar GGUF (binds + validates; image input pending).\n"
+        "  --vision FILE          Vision-Exp encoder sidecar GGUF: enables the view_image tool.\n"
         "  --mtp-draft N          Maximum MTP draft tokens. Default: 1\n"
         "  --mtp-margin F         MTP verifier margin. Default: 3\n"
         "  -c, --ctx N            Context size. Default: 100000\n"
@@ -763,6 +829,8 @@ static const char agent_tools_prompt_after_edit[] =
     "bash_status to check it early or bash_stop to terminate it.\n\n"
     "Use google_search to find web pages. Use visit_page to read a known URL with a visible browser. "
     "The first web call may ask the user for permission to start Chrome.\n\n"
+    "Use view_image to look at a local PNG or JPEG (a screenshot, a diagram, a rendered page): "
+    "the image itself becomes part of the observation. It needs ds4-agent --vision.\n\n"
     "### Available Tool Schemas\n\n"
     "{\n"
     "  \"type\": \"function\",\n"
@@ -853,6 +921,20 @@ static const char agent_tools_prompt_after_edit[] =
     "        \"max_lines\": {\"type\": \"number\"},\n"
     "        \"whole\": {\"type\": \"boolean\"},\n"
     "        \"raw\": {\"type\": \"boolean\"}\n"
+    "      },\n"
+    "      \"required\": [\"path\"]\n"
+    "    }\n"
+    "  }\n"
+    "}\n\n"
+    "{\n"
+    "  \"type\": \"function\",\n"
+    "  \"function\": {\n"
+    "    \"name\": \"view_image\",\n"
+    "    \"description\": \"Open a local PNG or JPEG as a visual observation.\",\n"
+    "    \"parameters\": {\n"
+    "      \"type\": \"object\",\n"
+    "      \"properties\": {\n"
+    "        \"path\": {\"type\": \"string\"}\n"
     "      },\n"
     "      \"required\": [\"path\"]\n"
     "    }\n"
@@ -2701,6 +2783,7 @@ static const char *agent_tool_viz_prefix(const char *name) {
     if (!strcmp(name, "search")) return "search ";
     if (!strcmp(name, "google_search")) return "google ";
     if (!strcmp(name, "visit_page")) return "visit ";
+    if (!strcmp(name, "view_image")) return "view ";
     return NULL;
 }
 
@@ -3693,10 +3776,22 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
         ds4_tokens rebuilt = {0};
         ds4_tokenize_rendered_chat(w->engine, text, &rebuilt);
         expected_tokens = (uint32_t)rebuilt.len;
+        /* inc 5: the rebuilt text is image-free (checked above); the worker's
+         * current image list belongs to the transcript being LEFT, so it must
+         * not shape this sync.  It is restored for the caller, who replaces it
+         * on success (agent_worker_images_from_session) or keeps it on failure. */
+        ds4_vision_span *saved_images = w->images;
+        const size_t saved_count = w->image_count, saved_cap = w->image_cap;
+        w->images = NULL;
+        w->image_count = 0;
+        w->image_cap = 0;
         if (agent_worker_sync_tokens(w, &rebuilt, true, err, err_len) != 0) {
             ds4_session_invalidate(w->session);
             ok = false;
         }
+        w->images = saved_images;
+        w->image_count = saved_count;
+        w->image_cap = saved_cap;
         ds4_tokens_free(&rebuilt);
     } else if (ok &&
                ds4_session_load_payload(w->session, fp, hdr.payload_bytes,
@@ -3988,7 +4083,8 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
                                     bool publish_progress,
                                     char *err, size_t err_len) {
     int old_pos = ds4_session_pos(w->session);
-    int common = ds4_session_common_prefix(w->session, tokens);
+    int common = ds4_session_common_prefix_multimodal(w->session, tokens,
+                                                      w->images, w->image_count);
     int cached = common == old_pos && tokens->len >= old_pos ? common : 0;
     int suffix = tokens->len - cached;
     if (suffix < 0) suffix = tokens->len;
@@ -4013,7 +4109,18 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
     ds4_session_set_display_progress(w->session,
                                      publish_progress ? worker_progress_cb : NULL,
                                      publish_progress ? w : NULL);
-    int rc = ds4_session_sync(w->session, tokens, err, err_len);
+    int rc;
+    if (w->image_count && !agent_worker_images_fit_tokens(w, tokens)) {
+        snprintf(err, err_len, "image spans do not fit the agent transcript");
+        rc = 1;
+    } else {
+        /* inc 5: always the multimodal form -- with an empty list it is the
+         * plain sync, and with images it carries the identity the checkpoint
+         * reuse is decided on. */
+        rc = ds4_session_sync_multimodal(w->session, tokens,
+                                         w->images, w->image_count,
+                                         err, err_len);
+    }
     ds4_session_set_progress(w->session, NULL, NULL);
     ds4_session_set_display_progress(w->session, NULL, NULL);
     return rc;
@@ -4025,6 +4132,7 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
  * by Flash and Pro; agent_kv_load_path() checks the model id, so switching
  * model families rebuilds this cache instead of restoring incompatible KV. */
 static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len) {
+    agent_worker_images_clear(w);
     ds4_tokens sys = {0};
     agent_worker_build_system_tokens(w, &sys);
 
@@ -5096,6 +5204,17 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
         free(path);
         return false;
     }
+    if (ds4_kvstore_text_has_image_marker(text, text_bytes)) {
+        /* inc 5: a stripped session is rebuilt by re-tokenizing its text, and
+         * an image block has no text form (its load is refused since inc 8). */
+        snprintf(err, err_len,
+                 "session carries image blocks and cannot be stripped: "
+                 "its KV payload is the only form they have");
+        free(title);
+        free(text);
+        free(path);
+        return false;
+    }
 
     ds4_tokens stripped_tokens = {0};
     ds4_tokenize_rendered_chat(w->engine, text, &stripped_tokens);
@@ -5198,6 +5317,7 @@ static bool agent_worker_switch_session(agent_worker *w, const char *prefix,
     if (ok) {
         ds4_tokens_free(&w->transcript);
         w->transcript = loaded;
+        agent_worker_images_from_session(w);   /* inc 5: reference spans from the restored lineage */
         free(w->session_title);
         w->session_title = meta.title ? xstrdup(meta.title) : xstrdup("(no user prompt)");
         w->session_created_at = meta.created_at ? meta.created_at : (uint64_t)time(NULL);
@@ -5439,18 +5559,6 @@ static void agent_worker_set_more(agent_worker *w, const char *path,
     w->more_next_line = next_line;
     w->more_bare = bare;
     w->more_valid = path && path[0] && next_line > 0;
-}
-
-static bool agent_tool_result_fits_context(agent_worker *w, const char *result,
-                                           int reserve_tokens,
-                                           int *tokens_out) {
-    ds4_tokens tmp = {0};
-    ds4_tokens_copy(&tmp, &w->transcript);
-    ds4_chat_append_message(w->engine, &tmp, "tool", result ? result : "");
-    int tokens = tmp.len;
-    ds4_tokens_free(&tmp);
-    if (tokens_out) *tokens_out = tokens;
-    return tokens + reserve_tokens < w->cfg->gen.ctx_size;
 }
 
 /* Read file text for the model.  Normal mode shows plain line numbers.  Raw
@@ -6899,22 +7007,251 @@ static char *agent_execute_tool_call(agent_worker *w, const agent_tool_call *cal
     }
 }
 
+/* ---- Track B inc 5: tool observations that may carry images ---------------
+ * The result of one tool block is text parts alternating with images (from
+ * view_image).  A text-only observation is appended exactly as before (one
+ * tool-role message); one with images becomes a tool-role multimodal message
+ * whose image blocks join the worker's image list once committed. */
+typedef struct {
+    char *text;
+    size_t len;
+    size_t cap;
+} agent_tool_text_part;
+
+typedef struct {
+    agent_tool_text_part *parts;
+    size_t part_count;
+    size_t part_cap;
+    ds4_vision_embedding *images;
+    size_t image_count;
+    size_t image_cap;
+} agent_tool_observation;
+
+static void agent_tool_observation_init(agent_tool_observation *obs) {
+    memset(obs, 0, sizeof(*obs));
+    obs->parts = xmalloc(sizeof(obs->parts[0]));
+    memset(obs->parts, 0, sizeof(obs->parts[0]));
+    obs->part_count = 1;
+    obs->part_cap = 1;
+}
+
+static void agent_tool_observation_puts(agent_tool_observation *obs,
+                                        const char *text) {
+    if (!obs->part_count) agent_tool_observation_init(obs);
+    agent_tool_text_part *part = &obs->parts[obs->part_count - 1];
+    size_t n = text ? strlen(text) : 0;
+    if (part->len + n + 1 > part->cap) {
+        size_t cap = part->cap ? part->cap : 128;
+        while (cap < part->len + n + 1) cap *= 2;
+        part->text = xrealloc(part->text, cap);
+        part->cap = cap;
+    }
+    if (n) memcpy(part->text + part->len, text, n);
+    part->len += n;
+    part->text[part->len] = '\0';
+}
+
+/* Consume the embedding and open the text part that follows the image. */
+static void agent_tool_observation_add_image(agent_tool_observation *obs,
+                                             ds4_vision_embedding *embedding) {
+    if (obs->image_count == obs->image_cap) {
+        size_t cap = obs->image_cap ? obs->image_cap * 2 : 2;
+        obs->images = xrealloc(obs->images, cap * sizeof(obs->images[0]));
+        obs->image_cap = cap;
+    }
+    obs->images[obs->image_count++] = *embedding;
+    memset(embedding, 0, sizeof(*embedding));
+    if (obs->part_count == obs->part_cap) {
+        size_t cap = obs->part_cap ? obs->part_cap * 2 : 2;
+        obs->parts = xrealloc(obs->parts, cap * sizeof(obs->parts[0]));
+        obs->part_cap = cap;
+    }
+    memset(&obs->parts[obs->part_count++], 0, sizeof(obs->parts[0]));
+}
+
+static void agent_tool_observation_free(agent_tool_observation *obs) {
+    if (!obs) return;
+    for (size_t i = 0; i < obs->part_count; i++) free(obs->parts[i].text);
+    for (size_t i = 0; i < obs->image_count; i++)
+        ds4_vision_embedding_free(&obs->images[i]);
+    free(obs->parts);
+    free(obs->images);
+    memset(obs, 0, sizeof(*obs));
+}
+
+static void agent_tool_view_image(agent_worker *w,
+                                  const agent_tool_call *call,
+                                  agent_tool_observation *obs) {
+    const char *path = agent_tool_arg_value(call, "path");
+    if (!path || !path[0]) {
+        agent_tool_observation_puts(obs, "Tool error: view_image requires path\n");
+        return;
+    }
+    if (!ds4_engine_has_vision(w->engine)) {
+        agent_tool_observation_puts(
+            obs, "Tool error: view_image requires ds4-agent --vision FILE\n");
+        return;
+    }
+    ds4_vision_embedding embedding = {0};
+    char err[256] = {0};
+    if (!ds4_engine_vision_encode_file(w->engine, path, &embedding,
+                                       err, sizeof(err))) {
+        agent_tool_observation_puts(obs, "Tool error: view_image failed: ");
+        agent_tool_observation_puts(obs, err[0] ? err : "unable to decode image");
+        agent_tool_observation_puts(obs, "\n");
+        return;
+    }
+
+    char shown[PATH_MAX + 80];
+    snprintf(shown, sizeof(shown), "\n[tool:view_image] %s\n", path);
+    agent_publish(w, shown, strlen(shown));
+    agent_tool_observation_add_image(obs, &embedding);
+    char meta[192];
+    snprintf(meta, sizeof(meta),
+             "\nImage observation attached (%ux%u, %u visual tokens).\n",
+             obs->images[obs->image_count - 1].width,
+             obs->images[obs->image_count - 1].height,
+             obs->images[obs->image_count - 1].token_count);
+    agent_tool_observation_puts(obs, meta);
+}
+
 /* Execute all tool calls from one DSML block, preserving per-call labels in the
- * combined result so the model can associate observations with calls. */
-static char *agent_execute_tool_calls(agent_worker *w, const agent_tool_calls *calls) {
-    agent_buf all = {0};
+ * combined observation so the model can associate observations with calls. */
+static agent_tool_observation agent_execute_tool_observation(
+        agent_worker *w, const agent_tool_calls *calls) {
+    agent_tool_observation obs;
+    agent_tool_observation_init(&obs);
     for (int i = 0; i < calls->len; i++) {
-        char *res = agent_execute_tool_call(w, &calls->v[i]);
         char hdr[128];
         snprintf(hdr, sizeof(hdr), "Tool result %d (%s):\n", i + 1,
                  calls->v[i].name ? calls->v[i].name : "unknown");
-        agent_buf_puts(&all, hdr);
-        agent_buf_puts(&all, res);
-        if (res[0] && res[strlen(res) - 1] != '\n') agent_buf_puts(&all, "\n");
+        agent_tool_observation_puts(&obs, hdr);
+        if (calls->v[i].name && !strcmp(calls->v[i].name, "view_image")) {
+            agent_tool_view_image(w, &calls->v[i], &obs);
+            continue;
+        }
+        char *res = agent_execute_tool_call(w, &calls->v[i]);
+        agent_tool_observation_puts(&obs, res);
+        if (res[0] && res[strlen(res) - 1] != '\n')
+            agent_tool_observation_puts(&obs, "\n");
         free(res);
     }
-    if (calls->len == 0) agent_buf_puts(&all, "Tool error: empty tool call block\n");
-    return agent_buf_take(&all);
+    if (calls->len == 0)
+        agent_tool_observation_puts(&obs, "Tool error: empty tool call block\n");
+    return obs;
+}
+
+static void agent_vision_spans_free(ds4_vision_span *spans, size_t count) {
+    if (!spans) return;
+    for (size_t i = 0; i < count; i++)
+        ds4_vision_embedding_free(&spans[i].embedding);
+    free(spans);
+}
+
+/* Render the observation as the transcript + one tool message.  The
+ * observation keeps its embeddings (the message gets deep copies), so a
+ * fit probe and the commit can both build from the same observation. */
+static bool agent_tool_observation_build(agent_worker *w,
+                                         const agent_tool_observation *obs,
+                                         ds4_tokens *tokens,
+                                         ds4_vision_span **spans_out,
+                                         char *err, size_t err_len) {
+    *spans_out = NULL;
+    ds4_tokens_copy(tokens, &w->transcript);
+    if (obs->image_count == 0) {
+        /* Text-only: the exact message the agent has always appended. */
+        ds4_chat_append_message(w->engine, tokens, "tool",
+                                obs->part_count && obs->parts[0].text ?
+                                obs->parts[0].text : "");
+        return true;
+    }
+    const char **parts = xmalloc(obs->part_count * sizeof(parts[0]));
+    for (size_t i = 0; i < obs->part_count; i++)
+        parts[i] = obs->parts[i].text ? obs->parts[i].text : "";
+    ds4_vision_embedding *images = xmalloc(obs->image_count * sizeof(images[0]));
+    ds4_vision_span *spans = xmalloc(obs->image_count * sizeof(spans[0]));
+    memset(images, 0, obs->image_count * sizeof(images[0]));
+    memset(spans, 0, obs->image_count * sizeof(spans[0]));
+    const int n_embd = ds4_engine_embd_dim(w->engine);
+    for (size_t i = 0; i < obs->image_count; i++) {
+        const ds4_vision_embedding *src = &obs->images[i];
+        if (!src->data || src->token_count == 0 || n_embd <= 0 ||
+            (uint64_t)src->token_count >
+                SIZE_MAX / (uint64_t)n_embd / sizeof(float)) {
+            snprintf(err, err_len, "invalid image observation embedding");
+            for (size_t j = 0; j < i; j++)
+                ds4_vision_embedding_free(&images[j]);
+            free(images);
+            free(spans);
+            free(parts);
+            ds4_tokens_free(tokens);
+            return false;
+        }
+        const size_t bytes = (size_t)src->token_count *
+                             (size_t)n_embd * sizeof(float);
+        images[i] = *src;
+        images[i].data = malloc(bytes);
+        if (!images[i].data) {
+            snprintf(err, err_len, "unable to copy image observation embedding");
+            for (size_t j = 0; j <= i; j++)
+                ds4_vision_embedding_free(&images[j]);
+            free(images);
+            free(spans);
+            free(parts);
+            ds4_tokens_free(tokens);
+            return false;
+        }
+        memcpy(images[i].data, src->data, bytes);
+    }
+    bool ok = ds4_chat_append_multimodal_message(
+        w->engine, tokens, "tool",
+        parts, images, obs->image_count, spans,
+        err, err_len) != 0;
+    free(parts);
+    if (!ok) {
+        for (size_t i = 0; i < obs->image_count; i++) {
+            ds4_vision_embedding_free(&images[i]);
+            ds4_vision_embedding_free(&spans[i].embedding);
+        }
+    }
+    free(images);
+    if (!ok) {
+        free(spans);
+        ds4_tokens_free(tokens);
+        return false;
+    }
+    *spans_out = spans;
+    return true;
+}
+
+static bool agent_tool_observation_fits(agent_worker *w,
+                                        const agent_tool_observation *obs,
+                                        int reserve_tokens,
+                                        int *tokens_out) {
+    ds4_tokens tmp = {0};
+    ds4_vision_span *spans = NULL;
+    char err[160] = {0};
+    if (!agent_tool_observation_build(w, obs, &tmp, &spans, err, sizeof(err)))
+        return false;
+    int tokens = tmp.len;
+    ds4_tokens_free(&tmp);
+    agent_vision_spans_free(spans, obs->image_count);
+    if (tokens_out) *tokens_out = tokens;
+    return tokens + reserve_tokens < w->cfg->gen.ctx_size;
+}
+
+static bool agent_tool_observation_commit(agent_worker *w,
+                                          agent_tool_observation *obs,
+                                          char *err, size_t err_len) {
+    ds4_tokens next = {0};
+    ds4_vision_span *spans = NULL;
+    if (!agent_tool_observation_build(w, obs, &next, &spans, err, err_len))
+        return false;
+    ds4_tokens_free(&w->transcript);
+    w->transcript = next;
+    agent_worker_images_append(w, spans, obs->image_count);
+    free(spans);
+    return true;
 }
 
 /* If compaction happens while a bash process is still alive, inject a small
@@ -7070,7 +7407,8 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
 
     ds4_session_set_progress(w->session, worker_progress_cb, w);
     ds4_session_set_display_progress(w->session, worker_progress_cb, w);
-    if (ds4_session_sync(w->session, &prompt, err, err_len) != 0) {
+    if (ds4_session_sync_multimodal(w->session, &prompt, w->images, w->image_count,
+                                    err, err_len) != 0) {
         ds4_session_set_progress(w->session, NULL, NULL);
         ds4_session_set_display_progress(w->session, NULL, NULL);
         ds4_session_invalidate(w->session);
@@ -7145,6 +7483,17 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
     }
 
     int tail_start = agent_compact_tail_start(w, bottom, sys.len);
+    if (w->image_count) {
+        /* inc 5 (charter A9): the verbatim tail never carries part of an image
+         * block, nor a block the cache no longer holds the embedding of. */
+        const int floored = (int)ds4_vision_spans_compact_tail(w->images, w->image_count,
+                                                               (uint32_t)tail_start,
+                                                               (uint32_t)bottom);
+        if (floored != tail_start)
+            agent_trace(w, "compaction tail moved %d -> %d around image blocks",
+                        tail_start, floored);
+        tail_start = floored < sys.len ? sys.len : floored;
+    }
     ds4_tokens compacted = {0};
     ds4_tokens_copy(&compacted, &sys);
 
@@ -7159,7 +7508,26 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
     free(summary_msg.ptr);
     free(summary.ptr);
 
+    const int tail_dst_start = compacted.len;
     agent_tokens_append_range(&compacted, &w->transcript, tail_start, bottom);
+
+    /* Retained images: the blocks wholly inside the tail, rebased to where the
+     * tail now sits.  Shallow copies: nothing is freed until the rebuilt
+     * transcript has synced, so a failed rebuild restores the old list intact. */
+    ds4_vision_span *old_images = w->images;
+    const size_t old_image_count = w->image_count;
+    const size_t old_image_cap = w->image_cap;
+    ds4_vision_span *new_images = NULL;
+    bool *kept_images = NULL;
+    size_t new_image_count = 0;
+    if (old_image_count) {
+        new_images = xmalloc(old_image_count * sizeof(new_images[0]));
+        kept_images = xmalloc(old_image_count * sizeof(kept_images[0]));
+        new_image_count = ds4_vision_spans_retain(old_images, old_image_count,
+                                                  (uint32_t)tail_start, (uint32_t)bottom,
+                                                  (uint32_t)tail_dst_start,
+                                                  new_images, kept_images);
+    }
 
     agent_publishf(w,
         "\x1b[1;95mCOMPACTING\x1b[0m rebuilding context: old=%d summary+tail=%d tail=%d\n",
@@ -7169,13 +7537,30 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
     ds4_tokens_copy(&old_transcript, &w->transcript);
     ds4_tokens_free(&w->transcript);
     w->transcript = compacted;
+    w->images = new_images;
+    w->image_count = new_image_count;
+    w->image_cap = old_image_count;
     if (agent_worker_sync_tokens(w, &w->transcript, true, err, err_len) != 0) {
         ds4_session_invalidate(w->session);
         ds4_tokens_free(&w->transcript);
         w->transcript = old_transcript;
+        free(new_images);
+        w->images = old_images;
+        w->image_count = old_image_count;
+        w->image_cap = old_image_cap;
+        free(kept_images);
         ds4_tokens_free(&sys);
         return false;
     }
+    for (size_t i = 0; i < old_image_count; i++) {
+        if (!kept_images[i])
+            ds4_vision_embedding_free(&old_images[i].embedding);
+    }
+    free(old_images);
+    free(kept_images);
+    if (old_image_count)
+        agent_trace(w, "compaction retained %zu of %zu image blocks",
+                    new_image_count, old_image_count);
     agent_worker_note_system_prompt_seen(w);
     ds4_tokens_free(&old_transcript);
     ds4_tokens_free(&sys);
@@ -7313,7 +7698,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
 
         const ds4_tokens *prompt_for_sync = &w->transcript;
         int old_pos = ds4_session_pos(w->session);
-        int common = ds4_session_common_prefix(w->session, &w->transcript);
+        int common = ds4_session_common_prefix_multimodal(w->session, &w->transcript,
+                                                          w->images, w->image_count);
         int cached = common == old_pos && w->transcript.len >= old_pos ? common : 0;
 
         int suffix = prompt_for_sync->len - cached;
@@ -7338,7 +7724,20 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         char err[160];
         ds4_session_set_progress(w->session, worker_progress_cb, w);
         ds4_session_set_display_progress(w->session, worker_progress_cb, w);
-        if (ds4_session_sync(w->session, prompt_for_sync, err, sizeof(err)) != 0) {
+        /* inc 5: every sync carries the worker's image list -- a tool round
+         * after a view_image observation prefills that block from its spans
+         * (the plain sync would gather its rows as clamped token embeddings;
+         * the engine now refuses that by name). */
+        int sync_rc;
+        if (w->image_count && !agent_worker_images_fit_tokens(w, prompt_for_sync)) {
+            snprintf(err, sizeof(err), "image spans do not fit the agent transcript");
+            sync_rc = 1;
+        } else {
+            sync_rc = ds4_session_sync_multimodal(w->session, prompt_for_sync,
+                                                  w->images, w->image_count,
+                                                  err, sizeof(err));
+        }
+        if (sync_rc != 0) {
             ds4_session_set_progress(w->session, NULL, NULL);
             ds4_session_set_display_progress(w->session, NULL, NULL);
             agent_set_error(w, err);
@@ -7447,44 +7846,43 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             return 0;
         }
 
-        char *tool_result;
+        agent_tool_observation observation;
+        agent_tool_observation_init(&observation);
         if (early_tool_error) {
-            agent_buf b = {0};
-            agent_buf_puts(&b, "Tool error: ");
-            agent_buf_puts(&b, stream.tool_preflight_error_msg[0] ?
-                           stream.tool_preflight_error_msg :
-                           "edit old selector failed before new was generated");
-            agent_buf_puts(&b, "\n");
-            tool_result = agent_buf_take(&b);
+            agent_tool_observation_puts(&observation, "Tool error: ");
+            agent_tool_observation_puts(&observation,
+                                        stream.tool_preflight_error_msg[0] ?
+                                        stream.tool_preflight_error_msg :
+                                        "edit old selector failed before new was generated");
+            agent_tool_observation_puts(&observation, "\n");
         } else if (malformed_tool) {
-            agent_buf b = {0};
-            agent_buf_puts(&b, "Tool error: invalid DSML tool call: ");
-            agent_buf_puts(&b, dsml.error[0] ? dsml.error : "parse error");
-            agent_buf_puts(&b, "\n");
-            agent_buf_puts(&b, agent_dsml_syntax_reminder);
-            tool_result = agent_buf_take(&b);
+            agent_tool_observation_puts(&observation, "Tool error: invalid DSML tool call: ");
+            agent_tool_observation_puts(&observation, dsml.error[0] ? dsml.error : "parse error");
+            agent_tool_observation_puts(&observation, "\n");
+            agent_tool_observation_puts(&observation, agent_dsml_syntax_reminder);
         } else {
-            tool_result = agent_execute_tool_calls(w, &dsml.calls);
+            agent_tool_observation_free(&observation);
+            observation = agent_execute_tool_observation(w, &dsml.calls);
         }
         int projected_tokens = 0;
-        if (!agent_tool_result_fits_context(w, tool_result,
-                                            AGENT_TOOL_RESULT_RESERVE_TOKENS,
-                                            &projected_tokens))
+        if (!agent_tool_observation_fits(w, &observation,
+                                         AGENT_TOOL_RESULT_RESERVE_TOKENS,
+                                         &projected_tokens))
         {
             if (!agent_worker_compact(w, "tool result would exceed context",
                                       compact_err, sizeof(compact_err)))
             {
-                free(tool_result);
+                agent_tool_observation_free(&observation);
                 agent_dsml_parser_free(&dsml);
                 agent_set_error(w, compact_err[0] ? compact_err : "context compaction failed");
                 return 1;
             }
-            if (!agent_tool_result_fits_context(w, tool_result,
-                                                AGENT_TOOL_RESULT_RESERVE_TOKENS,
-                                                &projected_tokens))
+            if (!agent_tool_observation_fits(w, &observation,
+                                             AGENT_TOOL_RESULT_RESERVE_TOKENS,
+                                             &projected_tokens))
             {
-                free(tool_result);
-                agent_buf b = {0};
+                agent_tool_observation_free(&observation);
+                agent_tool_observation_init(&observation);
                 char msg[256];
                 snprintf(msg, sizeof(msg),
                          "Tool error: tool result still does not fit after context compaction "
@@ -7492,18 +7890,25 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                          "Retry with a smaller read/search/bash output.\n",
                          projected_tokens, w->cfg->gen.ctx_size,
                          AGENT_TOOL_RESULT_RESERVE_TOKENS);
-                agent_buf_puts(&b, msg);
-                tool_result = agent_buf_take(&b);
-                if (!agent_tool_result_fits_context(w, tool_result, 16, NULL)) {
-                    free(tool_result);
+                agent_tool_observation_puts(&observation, msg);
+                if (!agent_tool_observation_fits(w, &observation, 16, NULL)) {
+                    agent_tool_observation_free(&observation);
                     agent_dsml_parser_free(&dsml);
                     agent_set_error(w, "context full after compaction");
                     return 1;
                 }
             }
         }
-        ds4_chat_append_message(w->engine, &w->transcript, "tool", tool_result);
-        free(tool_result);
+        char append_err[160] = {0};
+        if (!agent_tool_observation_commit(w, &observation,
+                                           append_err, sizeof(append_err))) {
+            agent_tool_observation_free(&observation);
+            agent_dsml_parser_free(&dsml);
+            agent_set_error(w, append_err[0] ? append_err :
+                            "unable to append tool observation");
+            return 1;
+        }
+        agent_tool_observation_free(&observation);
         agent_dsml_parser_free(&dsml);
 
         char *queued_user = worker_request_queued_user_drain(w);
@@ -9003,6 +9408,7 @@ static void agent_worker_free(agent_worker *w) {
     ds4_web_free(w->web);
     ds4_session_free(w->session);
     ds4_tokens_free(&w->transcript);
+    agent_worker_images_clear(w);
     free(w->cache_dir);
     free(w->sysprompt_path);
     free(w->session_title);
