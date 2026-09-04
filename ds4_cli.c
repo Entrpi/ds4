@@ -625,7 +625,7 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
                                                        ds4_token_eos(engine),
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
-                                                       err,
+                                                       NULL, err,
                                                        sizeof(err));
             cli_dist_busy_set(cfg, false);
             if (ntok < 0) {
@@ -1381,7 +1381,7 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
                                                        ds4_token_eos(engine),
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
-                                                       err,
+                                                       NULL, err,
                                                        sizeof(err));
             cli_dist_busy_set(cfg, false);
             if (ntok < 0) {

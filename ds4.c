@@ -42978,9 +42978,18 @@ static bool ds4_mtp_exact_policy_use_seq(ds4_session *s) {
     return use_seq;
 }
 
+static void ds4_spec_stats_apply(ds4_spec_stats *st, int drafted,
+                                 int accepted_drafts) {
+    if (!st) return;
+    st->drafted = drafted;
+    st->accepted = accepted_drafts > 0 ? accepted_drafts : 0;
+}
+
 static void ds4_mtp_accept_gate_record(ds4_session *s,
                                        int accepted_drafts,
-                                       int proposed_drafts) {
+                                       int proposed_drafts,
+                                       ds4_spec_stats *stats) {
+    ds4_spec_stats_apply(stats, proposed_drafts, accepted_drafts);
     if (!s || proposed_drafts <= 0) return;
     if (accepted_drafts < 0) accepted_drafts = 0;
     if (accepted_drafts > proposed_drafts) accepted_drafts = proposed_drafts;
@@ -43016,7 +43025,12 @@ static void ds4_mtp_accept_gate_record(ds4_session *s,
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
+                                        ds4_spec_stats *stats,
                                         char *err, size_t errlen) {
+    if (stats) {
+        stats->drafted = 0;
+        stats->accepted = 0;
+    }
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     if (s->distributed) {
         if (!accepted) return 0;
@@ -43194,7 +43208,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     (target_done - cycle_t0) * 1000.0,
                     (now_sec() - cycle_t0) * 1000.0);
         }
-        ds4_mtp_accept_gate_record(s, 0, draft_n);
+        ds4_mtp_accept_gate_record(s, 0, draft_n, stats);
         ds4_mtp_accept_trace(s, "first-miss", cycle_start,
                              first_token, drafts, draft_n, n_accept);
         return n_accept;
@@ -43215,7 +43229,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         getenv("DS4_MTP_PRESERVE_TARGET_FRONTIER") != NULL;
     if (preserve_target_frontier && draft_cap > 1) {
         have_draft_frontier = spec_frontier_snapshot(&draft_frontier, s);
-        if (!have_draft_frontier) return n_accept;
+        if (!have_draft_frontier) {
+            ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
+            return n_accept;
+        }
     }
     for (; draft_n < draft_cap; draft_n++) {
         ds4_gpu_tensor *prev_hc = (draft_n & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
@@ -43242,6 +43259,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 s->graph.mtp_n_raw = mtp_n_raw_after_draft;
                 spec_frontier_free(&draft_frontier);
             }
+            ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
             return n_accept;
         }
         if (mtp_fast_top2) mtp_last_top2 = mtp_top2;
@@ -43257,6 +43275,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             spec_frontier_free(&draft_frontier);
             snprintf(err, errlen, "MTP draft frontier restore failed");
             s->checkpoint_valid = false;
+            ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
             return -1;
         }
         s->graph.mtp_n_raw = mtp_n_raw_after_draft;
@@ -43293,6 +43312,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                 free(row_logits);
                 snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
                 s->checkpoint_valid = false;
+                ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
                 return -1;
             }
             memcpy(s->logits, row_logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
@@ -43321,7 +43341,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         (done - mtp_t0) * 1000.0,
                         (done - cycle_t0) * 1000.0);
             }
-            ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+            ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n, stats);
             ds4_mtp_accept_trace(s, "margin-skip", cycle_start,
                                  first_token, drafts, draft_n, n_accept);
             return n_accept;
@@ -43380,6 +43400,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (!ok) {
             snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
             s->checkpoint_valid = false;
+            ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
             return -1;
         }
         s->checkpoint_valid = true;
@@ -43404,7 +43425,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     (done - mtp_t0) * 1000.0,
                     (done - cycle_t0) * 1000.0);
         }
-        ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+        ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n, stats);
         ds4_mtp_accept_trace(s, "exact-seq", cycle_start,
                              first_token, drafts, draft_n, n_accept);
         return n_accept;
@@ -43461,7 +43482,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             spec_frontier_free(&frontier);
             free(row0_logits);
             free(row_logits);
-            ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+            ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n, stats);
             ds4_mtp_accept_trace(s, "decode2", cycle_start,
                                  first_token, drafts, draft_n, n_accept);
             return n_accept;
@@ -43497,7 +43518,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             spec_frontier_free(&frontier);
             free(row0_logits);
             free(row_logits);
-            ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+            ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n, stats);
             ds4_mtp_accept_trace(s, "decode2", cycle_start,
                                  first_token, drafts, draft_n, n_accept);
             return n_accept;
@@ -43882,7 +43903,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                         free(shadow_exact_logits0);
                         free(shadow_exact_logits1);
                         free(row_tops);
-                        ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+                        ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n, stats);
                         ds4_mtp_accept_trace(s, "micro-exact-replay-debug", cycle_start,
                                              first_token, drafts, draft_n, n_accept);
                         return n_accept;
@@ -43930,7 +43951,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     free(shadow_exact_logits0);
                     free(shadow_exact_logits1);
                     free(row_tops);
-                    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+                    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n, stats);
                     ds4_mtp_accept_trace(s, "micro", cycle_start,
                                          first_token, drafts, draft_n, n_accept);
                     return n_accept;
@@ -43982,7 +44003,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     free(shadow_exact_logits0);
                     free(shadow_exact_logits1);
                     free(row_tops);
-                    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+                    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n, stats);
                     ds4_mtp_accept_trace(s, "verify-v2-decode3", cycle_start,
                                          first_token, drafts, draft_n, n_accept);
                     return n_accept;
@@ -44025,7 +44046,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     free(shadow_exact_logits0);
                     free(shadow_exact_logits1);
                     free(row_tops);
-                    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+                    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n, stats);
                     ds4_mtp_accept_trace(s, "micro-prefix", cycle_start,
                                          first_token, drafts, draft_n, n_accept);
                     return n_accept;
@@ -44075,7 +44096,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     free(shadow_exact_logits0);
                     free(shadow_exact_logits1);
                     free(row_tops);
-                    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+                    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n, stats);
                     ds4_mtp_accept_trace(s, "micro-exact-replay", cycle_start,
                                          first_token, drafts, draft_n, n_accept);
                     return n_accept;
@@ -44133,7 +44154,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     free(shadow_exact_logits0);
                     free(shadow_exact_logits1);
                     free(row_tops);
-                    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+                    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n, stats);
                     ds4_mtp_accept_trace(s, "micro-replay", cycle_start,
                                          first_token, drafts, draft_n, n_accept);
                     return n_accept;
@@ -44156,6 +44177,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
             free(shadow_exact_logits0);
             free(shadow_exact_logits1);
             free(row_tops);
+            ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
             return -1;
         }
         spec_frontier_free(&frontier);
@@ -44204,6 +44226,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         if (!_ver_raw_ok) {
             snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
             s->checkpoint_valid = false;
+            ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
             return -1;
         }
         token_vec_push(&s->checkpoint, drafts[i]);
@@ -44220,6 +44243,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         {
             snprintf(err, errlen, "%s logits readback failed", ds4_backend_name(e->backend));
             s->checkpoint_valid = false;
+            ds4_spec_stats_apply(stats, draft_n, n_accept - 1);
             return -1;
         }
         logits_on_host = true;
@@ -44258,7 +44282,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                     n_accept);
         }
     }
-    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n);
+    ds4_mtp_accept_gate_record(s, n_accept - 1, draft_n, stats);
     ds4_mtp_accept_trace(s, "seq", cycle_start,
                          first_token, drafts, draft_n, n_accept);
     return n_accept;
