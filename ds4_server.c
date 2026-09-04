@@ -674,6 +674,12 @@ typedef struct {
     stop_list stops;
     char *raw_body;
     char *prompt_text;
+    /* Track B inc 6: the prompt's image blocks (one span per DeepSeek image
+     * block in `prompt`, token order; the request owns the embeddings).
+     * Empty until inc 7's parsers fill it; every admission already passes
+     * it to the engine, which validates it against the bank lineage. */
+    ds4_vision_span *images;
+    size_t image_count;
     tool_schema_orders tool_orders;
     int max_tokens;
     /* Inc 0b: did the CLIENT send a budget?  Parsers preload max_tokens with
@@ -904,6 +910,9 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    for (size_t i = 0; i < r->image_count; i++)
+        ds4_vision_embedding_free(&r->images[i].embedding);   /* inc 6 */
+    free(r->images);
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
@@ -11055,7 +11064,7 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                                               cache_text_override,
                                               cache_text_ext,
                                               cache_text_key,
-                                              &hooks, NULL, err, sizeof(err));
+                                              &hooks, NULL, NULL, 0, err, sizeof(err));
 }
 
 static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
@@ -11135,6 +11144,10 @@ static void kv_cache_store_bank(server *s, int bank, const char *reason,
     }
     ds4_tokens tokens = { (int *)htok, (int)hl, (int)hl };
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+    /* inc 6: the bank's image lineage keys the record (the warm text already
+     * carries the markers; the kvstore checks they agree). */
+    const ds4_vision_identity *bank_ids = NULL;
+    const size_t bank_ids_n = ds4_batch_ctx_bank_lineage(s->batch_ctx, bank, &bank_ids);
     /* Bank-tier record: keyed by the SERVING ctx (the bank's geometry),
      * never the serial session's -- v0.5.2 right-sizing can shrink that
      * session, and a bank record must keep restoring across boots at -c. */
@@ -11142,7 +11155,7 @@ static void kv_cache_store_bank(server *s, int bank, const char *reason,
                         s->session, s->serial_boot_ctx,
                         &tokens, (int)hl, reason,
                         s->warm[bank].text, 0, "bank",
-                        &hooks, &staged, err, sizeof(err));
+                        &hooks, &staged, bank_ids, bank_ids_n, err, sizeof(err));
     ds4_session_payload_file_free(&staged);
     if (ok) {
         s->warm[bank].stored_tokens = hl;   /* v0.5.1 inc3b pacing marker */
@@ -15326,17 +15339,40 @@ static void warm_rec_invalidate(server *s, int bank) {
     warm_records_gauge_refresh(s);
 }
 
-/* Append the committed generation (tokens[0..n-2]) to b as detokenized text. */
-/* false when the committed tokens carry image rows: a bank has no image
- * lineage yet (inc 6), so its text can key nothing (inc 8). */
-static bool cont_append_committed_text(server *s, buf *b, const int *tokens, int n) {
+/* Append the committed tokens[0..n-2] to b as detokenized text (the engine
+ * never forwards the final sample).  A generated suffix is text and renders
+ * byte-identically to every earlier release.  A bank HISTORY that carries
+ * image rows (the aborted-admission record) renders through the kvstore's
+ * lineage renderer, one identity marker per block from bank `bank`'s
+ * recorded lineage (inc 8's key rule, inc 6's producer); false when the rows
+ * have no lineage to key them by (the record is not made). */
+static bool cont_append_committed_text(server *s, buf *b, const int *tokens, int n, int bank) {
     const int n_vocab = ds4_engine_vocab_size(s->engine);
-    for (int k = 0; k < n - 1; k++) {
-        if (tokens[k] < 0 || tokens[k] >= n_vocab) return false;
-        size_t pl = 0;
-        char *piece = ds4_token_text(s->engine, tokens[k], &pl);
-        if (piece) { buf_append(b, piece, pl); free(piece); }
+    bool synthetic = false;
+    for (int k = 0; k < n - 1; k++)
+        if (tokens[k] < 0 || tokens[k] >= n_vocab) { synthetic = true; break; }
+    if (!synthetic) {
+        for (int k = 0; k < n - 1; k++) {
+            size_t pl = 0;
+            char *piece = ds4_token_text(s->engine, tokens[k], &pl);
+            if (piece) { buf_append(b, piece, pl); free(piece); }
+        }
+        return true;
     }
+    const ds4_vision_identity *ids = NULL;
+    const size_t n_ids = s->batch_ctx ? ds4_batch_ctx_bank_lineage(s->batch_ctx, bank, &ids) : 0;
+    if (n_ids == 0 || n <= 1) return false;
+    const ds4_tokens view = { (int *)tokens, n - 1, n - 1 };
+    size_t len = 0;
+    char err[160] = {0};
+    char *text = ds4_kvstore_render_tokens_text_lineage(s->engine, &view, ids, n_ids, &len, err, sizeof(err));
+    if (!text) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: bank=%d committed history cannot be keyed: %s", bank, err);
+        return false;
+    }
+    buf_append(b, text, len);
+    free(text);
     return true;
 }
 
@@ -15385,7 +15421,7 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
             ds4_batch_ctx_bank_committed(s->batch_ctx, bank, &btoks) : 0;
         if (bl > 0 && btoks && j->req.prompt_text && j->req.prompt_text[0]) {
             buf tb = {0};
-            const bool keyable = cont_append_committed_text(s, &tb, btoks, bl);
+            const bool keyable = cont_append_committed_text(s, &tb, btoks, bl, bank);
             if (keyable && tb.len &&
                 byte_prefix_match(j->req.prompt_text, strlen(j->req.prompt_text),
                                   tb.ptr, tb.len)) {
@@ -15415,7 +15451,7 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
         j->req.prompt_preserves_reasoning)
     {
         buf_puts(&tb, j->req.prompt_text);
-        if (!cont_append_committed_text(s, &tb, tokens, n)) {
+        if (!cont_append_committed_text(s, &tb, tokens, n, bank)) {
             buf_free(&tb);
             server_log(DS4_LOG_GENERATION,
                        "ds4-server: bank=%d retires without a warm record: committed history carries image rows without lineage",
@@ -15443,7 +15479,7 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
     } else {
         if (j->req.kind != REQ_CHAT || j->req.has_tools) return;
         buf gen = {0};
-        const bool gen_keyable = cont_append_committed_text(s, &gen, tokens, n);
+        const bool gen_keyable = cont_append_committed_text(s, &gen, tokens, n, bank);
         const char *close = gen_keyable && gen.ptr ? strstr(gen.ptr, "</think>") : NULL;
         char *visible = close ? build_toolless_thinking_visible_text(
                                     &j->req, close + strlen("</think>"))
@@ -15629,7 +15665,23 @@ static bool cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
             occ[o->cont_bank] = true;
     }
     const char *ptext = j->req.prompt_text;
-    const size_t plen = ptext ? strlen(ptext) : 0;
+    size_t plen = ptext ? strlen(ptext) : 0;
+    /* Track B inc 6: an image-bearing request takes a directed COLD placement.
+     * Every warm/fork/partial shape splices the bank's exact history with a
+     * TEXT suffix, which cannot carry an image block, and the record text of
+     * a prompt with images is keyed by identity markers only once inc 7's
+     * render seam mints them.  plen = 0 disables every match branch below;
+     * the victim pick at the tail still runs, so the placement is directed. */
+    if (j->req.image_count != 0) {
+        static int disclosed = 0;
+        if (disclosed < 4) {
+            disclosed++;
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: image request (%zu block%s) takes a cold bank placement (warm reuse of image prompts lands with the multimodal render seam)",
+                       j->req.image_count, j->req.image_count == 1 ? "" : "s");
+        }
+        plen = 0;
+    }
     int best = -1;
     size_t best_len = 0;
     for (int b = 0; b < s->batch_ctx_max_seq; b++) {
@@ -16175,6 +16227,11 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
     req->max_new = request_decode_budget(&j->req, s->default_tokens);
     req->eos     = ds4_token_eos(s->engine);
     req->user    = j;
+    /* Track B inc 6: the image list rides every admission (request == bank
+     * coordinates on a cold admit; the engine validates reference spans
+     * against the bank lineage on any reuse and degrades to cold itself). */
+    req->images      = j->req.images;
+    req->image_count = j->req.image_count;
     /* A2a: engine-reported placement + warm-continuation matching (may swap
      * req->tokens for the bank-exact effective prompt in j->warm_prompt).
      * Inc 6b: a bank continuation takes its DIRECTED claim admission
@@ -17804,7 +17861,7 @@ static const char *mem_class_names[DS4_MEMC__COUNT] = {
     "weight_derived", "weight_import",  "weight_artifact", "weight_host_pin",
     "stage_pin",      "scalars_mirror", "session_tensors", "kv_primary",
     "batch_bank",     "scratch_sticky", "kernel_partials", "graph_exec",
-    "diag",
+    "diag",           "vision_encoder",
 };
 static const char *mem_domain_names[DS4_MEMD__COUNT] = {
     "unified_device", "pinned_host",
@@ -17815,7 +17872,7 @@ static const char *mem_obs_source_names[3] = { "none", "cuda_free", "meminfo_ava
  * (ds4_mem_gov.h) -- same fixed-cardinality contract as the census. */
 static const char *gov_consumer_names[DS4_GOVC__COUNT] = {
     "engine_boot", "prewarm", "batch_bank_plan", "serial_session",
-    "static_batch",
+    "static_batch", "vision_encoder",
 };
 static const char *gov_status_names[DS4_GOV_STATUS__COUNT] = {
     "admit", "refuse_class", "refuse_live", "retry_obs", "unsupported",
@@ -29770,7 +29827,7 @@ static void test_mem_census_trim_residue_shape(void) {
     /* Class/domain bounds are compile-time enums; assert the fixed
      * cardinality the metrics render (D0a-3) will bake in. */
     TEST_ASSERT(DS4_MEMC_ENGINE_OTHER == 0);
-    TEST_ASSERT(DS4_MEMC__COUNT == 17);
+    TEST_ASSERT(DS4_MEMC__COUNT == 18);   /* inc 9: + vision_encoder */
     TEST_ASSERT(DS4_MEMD__COUNT == 2);
 }
 

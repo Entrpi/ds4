@@ -190,8 +190,11 @@ static void cuda_substrate_cover(const void *model_map, uint64_t bytes) {
 static ds4_mem_cell g_mem_census[DS4_MEMC__COUNT][DS4_MEMD__COUNT];
 static uint64_t g_mem_census_faults;
 static uint64_t g_mem_census_epoch;   /* D0b-2 seqlock (ds4_mem_gov.h) */
-static int g_mem_scope_stack[8];
-static int g_mem_scope_depth;
+/* Track B inc 9: thread-local -- the Vision-Exp encoder brackets its scratch
+ * from the request thread (outside the inference lock), and a shared stack
+ * would re-tag whatever the worker allocates meanwhile. */
+static thread_local int g_mem_scope_stack[8];
+static thread_local int g_mem_scope_depth;
 
 /* MT-6 (gap-3 closes): the typed observation provider, defined later in
  * this file; declared here so the early-file budget/routing decisions
@@ -643,7 +646,7 @@ static size_t g_cublas_ws_bytes = 0;
  *     instrument.  If poison twins the always-zero needles across the gate
  *     battery, no picked alg reads the workspace and OFF is safe; if the
  *     needles move, some alg DOES read it and OFF must not ship. */
-static void cuda_cublas_ws_prep(cudaStream_t stream) {
+static int cuda_cublas_ws_mode(void) {
     static int mode = -1;
     if (mode < 0) {
         const char *env = getenv("DS4_CUDA_WS_MEMSET");
@@ -651,9 +654,83 @@ static void cuda_cublas_ws_prep(cudaStream_t stream) {
         if (env && env[0] == '1') mode = 1;
         else if (env && (env[0] == 'p' || env[0] == 'P')) mode = 2;
     }
+    return mode;
+}
+static void cuda_cublas_ws_prep(cudaStream_t stream) {
+    const int mode = cuda_cublas_ws_mode();
     if (mode == 0 || !g_cublas_ws) return;
     (void)cudaMemsetAsync(g_cublas_ws, mode == 1 ? 0 : 0xFF,
                           g_cublas_ws_bytes, stream);
+}
+
+/* Track B inc 9: the Vision-Exp encoder's own lane -- a dedicated stream, a
+ * dedicated cuBLAS handle with its own split-K workspace (same 32 MiB size as
+ * the inference handle: cuBLAS keys algorithm selection on the workspace
+ * size, and V1 bit-exactness was measured under that size) and, through the
+ * thread-local capture-stream override, every encoder launch on that
+ * stream.  The inference thread's handle and streams are never touched, so
+ * an encode may run on the request thread while the worker decodes.
+ * Created lazily on the first encode; never freed (process lifetime, like
+ * the inference handle). */
+static int cublas_ok(cublasStatus_t st, const char *what);
+static int cuda_ok(cudaError_t err, const char *what);
+static cudaStream_t   g_vision_stream;
+static cublasHandle_t g_cublas_vision;
+static void          *g_cublas_vision_ws;
+static size_t         g_cublas_vision_ws_bytes;
+static int            g_vision_lane_ready;
+static thread_local cudaStream_t t_vision_lane_saved_stream;
+static thread_local int t_vision_lane_depth;
+static int cuda_vision_lane_init(void) {
+    if (g_vision_lane_ready) return 1;
+    if (!g_cublas_ready) return 0;   /* the backend init owns math-mode policy */
+    if (!cuda_ok(cudaStreamCreateWithFlags(&g_vision_stream, cudaStreamNonBlocking),
+                 "vision stream create")) return 0;
+    if (!cublas_ok(cublasCreate(&g_cublas_vision), "create vision handle")) return 0;
+    cublasMath_t mm = CUBLAS_DEFAULT_MATH;
+    if (cublasGetMathMode(g_cublas, &mm) == CUBLAS_STATUS_SUCCESS)
+        (void)cublasSetMathMode(g_cublas_vision, mm);
+    if (g_cublas_ws_bytes != 0 &&
+        cudaMalloc(&g_cublas_vision_ws, g_cublas_ws_bytes) == cudaSuccess) {
+        g_cublas_vision_ws_bytes = g_cublas_ws_bytes;
+        (void)cublasSetWorkspace(g_cublas_vision, g_cublas_vision_ws, g_cublas_vision_ws_bytes);
+        cuda_mem_note_alloc(DS4_MEMC_VISION_ENCODER, DS4_MEMD_UNIFIED_DEVICE,
+                            g_cublas_ws_bytes, g_cublas_ws_bytes);
+    } else {
+        (void)cudaGetLastError();
+        g_cublas_vision_ws = NULL;
+        g_cublas_vision_ws_bytes = 0;
+    }
+    (void)cublasSetStream(g_cublas_vision, g_vision_stream);
+    g_vision_lane_ready = 1;
+    return 1;
+}
+static void cuda_cublas_vision_ws_prep(cudaStream_t stream) {
+    const int mode = cuda_cublas_ws_mode();
+    if (mode == 0 || !g_cublas_vision_ws) return;
+    (void)cudaMemsetAsync(g_cublas_vision_ws, mode == 1 ? 0 : 0xFF,
+                          g_cublas_vision_ws_bytes, stream);
+}
+/* Enter/leave the lane on the CALLING thread: the thread-local stream
+ * override routes every ds4_current_stream() launch to the vision stream. */
+extern "C" int ds4_gpu_vision_lane_begin(void) {
+    if (!cuda_vision_lane_init()) return 0;
+    if (t_vision_lane_depth++ == 0) {
+        t_vision_lane_saved_stream = t_ds4_capture_stream;
+        ds4_capture_set_stream(g_vision_stream);
+    }
+    return 1;
+}
+extern "C" int ds4_gpu_vision_lane_end(void) {
+    int ok = 1;
+    if (t_vision_lane_depth > 0 && --t_vision_lane_depth == 0) {
+        ok = cuda_ok(cudaStreamSynchronize(g_vision_stream), "vision lane sync");
+        ds4_capture_set_stream(t_vision_lane_saved_stream);
+    }
+    return ok;
+}
+extern "C" int ds4_gpu_vision_lane_active(void) {
+    return t_vision_lane_depth > 0;
 }
 
 static int g_quality_mode;

@@ -52,6 +52,15 @@ int ds4_gpu_deepseek4_vision_encode(float *out, const float *patches,
                                     uint32_t grid_h, uint32_t grid_w,
                                     const void *model_map, uint64_t model_size,
                                     const ds4_deepseek4_vision_weights *weights);
+/* Track B inc 9: the encoder's own lane -- a dedicated stream and cuBLAS
+ * handle, entered on the CALLING thread (thread-local stream override) so an
+ * encode may run outside the inference lock beside the worker's decode.
+ * begin returns 0 when the lane cannot be created (the caller encodes on the
+ * legacy stream instead); end synchronizes the lane's stream and restores
+ * the thread's previous stream.  Nesting is balanced by depth. */
+int ds4_gpu_vision_lane_begin(void);
+int ds4_gpu_vision_lane_end(void);
+int ds4_gpu_vision_lane_active(void);
 
 /* =========================================================================
  * GPU Tensor and Command Lifetime.

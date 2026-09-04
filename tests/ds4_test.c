@@ -2068,6 +2068,112 @@ static void test_vision_cache_group(void) {
 /* Track B inc 5: the multimodal compaction protocol's pure half.  A transcript
  * of 100 tokens holds four image blocks: A @10 (10 rows), B @30, C @50 with NO
  * embedding (a reference span: restored by identity, data gone), D @70. */
+/* Track B inc 6+9: the batched lane's pure helpers. */
+static void test_vision_cont_group(void) {
+    float dummy = 0.0f;
+    ds4_vision_span img[3];
+    memset(img, 0, sizeof(img));
+    const uint32_t starts[3] = {10u, 30u, 50u};
+    for (int i = 0; i < 3; i++) {
+        img[i].token_start = starts[i];
+        img[i].embedding.token_count = 10u;
+        img[i].embedding.data = &dummy;
+        memset(img[i].embedding.identity, 0x40 + i, sizeof(img[i].embedding.identity));
+    }
+    ds4_vision_identity lin[3];
+    memset(lin, 0, sizeof(lin));
+    for (int i = 0; i < 3; i++) {
+        lin[i].token_start = starts[i];
+        lin[i].token_count = 10u;
+        memset(lin[i].identity, 0x40 + i, sizeof(lin[i].identity));
+    }
+    char err[192];
+    /* (a) admission verdicts against a reuse point and a bank lineage */
+    TEST_ASSERT(ds4_vision_spans_admit_check(NULL, 0, 0u, NULL, 0, err, sizeof(err)) == DS4_VISION_ADMIT_OK);
+    TEST_ASSERT(ds4_vision_spans_admit_check(img, 3, 0u, NULL, 0, err, sizeof(err)) == DS4_VISION_ADMIT_OK);   /* cold: data everywhere */
+    {   /* warm at P=40: A and B are reference spans equal to the lineage, C past P carries data */
+        ds4_vision_span ref[3]; memcpy(ref, img, sizeof(ref));
+        ref[0].embedding.data = NULL; ref[1].embedding.data = NULL;
+        TEST_ASSERT(ds4_vision_spans_admit_check(ref, 3, 40u, lin, 2, err, sizeof(err)) == DS4_VISION_ADMIT_OK);
+        TEST_ASSERT(ds4_vision_spans_admit_check(ref, 3, 40u, lin, 3, err, sizeof(err)) == DS4_VISION_ADMIT_OK);   /* lineage entry C at/after P is not consulted */
+        /* a straddled block */
+        TEST_ASSERT(ds4_vision_spans_admit_check(ref, 3, 35u, lin, 2, err, sizeof(err)) == DS4_VISION_ADMIT_COLD);
+        TEST_ASSERT(strstr(err, "straddles") != NULL);
+        /* identity mismatch on a prefix block */
+        ds4_vision_identity bad[2] = { lin[0], lin[1] };
+        bad[1].identity[0] ^= 0xff;
+        TEST_ASSERT(ds4_vision_spans_admit_check(ref, 3, 40u, bad, 2, err, sizeof(err)) == DS4_VISION_ADMIT_COLD);
+        TEST_ASSERT(strstr(err, "not the bank's recorded block") != NULL);
+        /* the bank records a block below P the request does not carry */
+        ds4_vision_span one[2] = { ref[0], ref[2] };
+        TEST_ASSERT(ds4_vision_spans_admit_check(one, 2, 40u, lin, 2, err, sizeof(err)) == DS4_VISION_ADMIT_COLD);
+        TEST_ASSERT(strstr(err, "does not carry") != NULL);
+        /* a data-less block the engine would have to prefill */
+        ref[2].embedding.data = NULL;
+        TEST_ASSERT(ds4_vision_spans_admit_check(ref, 3, 40u, lin, 2, err, sizeof(err)) == DS4_VISION_ADMIT_REJECT);
+        TEST_ASSERT(strstr(err, "no embedding") != NULL);
+        TEST_ASSERT(ds4_vision_spans_admit_check(ref, 3, 0u, NULL, 0, err, sizeof(err)) == DS4_VISION_ADMIT_REJECT);   /* cold needs data everywhere */
+        /* no lineage at all while P > 0: the prefix blocks are unrecorded -> cold */
+        ref[2].embedding.data = &dummy;
+        TEST_ASSERT(ds4_vision_spans_admit_check(ref, 3, 40u, NULL, 0, err, sizeof(err)) == DS4_VISION_ADMIT_COLD);
+    }
+    /* (b) the partial-cut cap never lands inside a recorded block */
+    {
+        ds4_vision_identity blk = { 100u, 50u, {0} };
+        TEST_ASSERT(ds4_vision_lineage_cut_cap(&blk, 1, 120u, 1u) == 100u);
+        TEST_ASSERT(ds4_vision_lineage_cut_cap(&blk, 1, 120u, 32u) == 96u);
+        TEST_ASSERT(ds4_vision_lineage_cut_cap(&blk, 1, 160u, 32u) == 160u);
+        TEST_ASSERT(ds4_vision_lineage_cut_cap(&blk, 1, 100u, 32u) == 96u);
+        TEST_ASSERT(ds4_vision_lineage_cut_cap(&blk, 1, 150u, 32u) == 96u);    /* 150 -> aligned 128 lands inside -> 100 -> 96 */
+        TEST_ASSERT(ds4_vision_lineage_cut_cap(NULL, 0, 77u, 32u) == 64u);
+        ds4_vision_identity two[2] = { { 64u, 16u, {0} }, { 90u, 30u, {0} } };
+        TEST_ASSERT(ds4_vision_lineage_cut_cap(two, 2, 100u, 32u) == 64u);   /* 100 -> 90 -> 64 (block start, not inside) */
+        TEST_ASSERT(ds4_vision_lineage_cut_cap(two, 2, 70u, 32u) == 64u);    /* 70 inside [64,80) -> 64 (a block start is not inside) */
+    }
+    /* (c) lineage coverage of a token stream */
+    {
+        enum { NV = 100 };
+        const int toks[6] = { 1, NV + 0, NV + 2, NV + 4, NV + 1, 2 };
+        ds4_vision_identity e1 = { 1u, 4u, {0} };
+        TEST_ASSERT(ds4_vision_identities_cover_rows(&e1, 1, toks, 6, NV));
+        ds4_vision_identity e2 = { 1u, 3u, {0} };
+        TEST_ASSERT(!ds4_vision_identities_cover_rows(&e2, 1, toks, 6, NV));        /* an image row left uncovered */
+        TEST_ASSERT(!ds4_vision_identities_cover_rows(NULL, 0, toks, 6, NV));       /* image rows, no entries */
+        ds4_vision_identity e3 = { 0u, 5u, {0} };
+        TEST_ASSERT(!ds4_vision_identities_cover_rows(&e3, 1, toks, 6, NV));        /* covers a text row */
+        const int text[3] = { 1, 2, 3 };
+        TEST_ASSERT(ds4_vision_identities_cover_rows(NULL, 0, text, 3, NV));
+        TEST_ASSERT(!ds4_vision_identities_cover_rows(&e1, 1, text, 3, NV));
+        ds4_vision_identity dup[2] = { e1, e1 };
+        TEST_ASSERT(!ds4_vision_identities_cover_rows(dup, 2, toks, 6, NV));        /* overlap / out of order */
+        ds4_vision_identity past = { 1u, 6u, {0} };
+        TEST_ASSERT(!ds4_vision_identities_cover_rows(&past, 1, toks, 6, NV));
+    }
+    /* (d) chunk commit appends exactly the blocks wholly inside the range */
+    {
+        ds4_vision_lineage l = {0};
+        TEST_ASSERT(ds4_vision_lineage_append_in_range(&l, img, 3, 0u, 25u));
+        TEST_ASSERT(l.n == 1 && l.v[0].token_start == 10u && l.v[0].token_count == 10u && l.v[0].identity[0] == 0x40);
+        TEST_ASSERT(ds4_vision_lineage_append_in_range(&l, img, 3, 25u, 45u));
+        TEST_ASSERT(l.n == 2 && l.v[1].token_start == 30u && l.v[1].identity[0] == 0x41);
+        TEST_ASSERT(ds4_vision_lineage_append_in_range(&l, img, 3, 45u, 55u));   /* C straddles: nothing */
+        TEST_ASSERT(l.n == 2);
+        TEST_ASSERT(ds4_vision_lineage_append_in_range(&l, img, 3, 45u, 60u));
+        TEST_ASSERT(l.n == 3 && l.v[2].token_start == 50u);
+        TEST_ASSERT(ds4_vision_lineage_rewind(&l, 45));
+        TEST_ASSERT(l.n == 2);
+        ds4_vision_lineage_clear(&l);
+    }
+    /* (e) the encoder's scratch estimate mirrors the allocation list */
+    {
+        const uint64_t one = ds4_vision_encoder_scratch_bytes(1u, 1u);
+        TEST_ASSERT(one == (18252ull + 17408ull) * 4ull + 9216ull * 2ull);
+        TEST_ASSERT(ds4_vision_encoder_scratch_bytes(2u, 2u) > one);
+        TEST_ASSERT(ds4_vision_encoder_scratch_bytes(0u, 4u) == 0u);
+        TEST_ASSERT(ds4_vision_encoder_scratch_bytes(30u, 30u) > ds4_vision_encoder_scratch_bytes(29u, 30u));
+    }
+}
+
 static void test_vision_compact_group(void) {
     float dummy = 0.0f;
     ds4_vision_span img[4];
@@ -2193,6 +2299,7 @@ static const ds4_test_entry test_entries[] = {
     {"--vision-prompt", "vision-prompt", "Track B inc 3: image-block token stream + session identity units", test_vision_prompt_group},
     {"--vision-cache", "vision-cache", "Track B inc 8: identity markers in cache keys, payload lineage, reference spans", test_vision_cache_group},
     {"--vision-compact", "vision-compact", "Track B inc 5: multimodal compaction tail, retained-image selection, sync guard scan", test_vision_compact_group},
+    {"--vision-cont", "vision-cont", "Track B inc 6+9: batched admission span verdicts, partial-cut cap, lineage coverage + commit, encoder scratch estimate", test_vision_cont_group},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

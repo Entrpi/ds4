@@ -24,3 +24,4 @@ tests/test_deepseek4_vision_image
 tests/dump_vision_embedding
 tests/vision_serial_probe
 tests/vision_cache_probe
+tests/vision_cont_probe

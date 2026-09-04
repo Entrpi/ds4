@@ -190,7 +190,7 @@ int main(int argc, char **argv) {
         const ds4_vision_identity *ids = NULL;
         const size_t n_ids = ds4_session_vision_identities(s, &ids);
         const bool stored = ds4_kvstore_store_live_prefix_text(&kc, e, s, ctx, &p.toks, prompt_len, "cold",
-                                                               NULL, 0, NULL, NULL, NULL, err, sizeof(err));
+                                                               NULL, 0, NULL, NULL, NULL, NULL, 0, err, sizeof(err));
         printf("\"session_images\":%zu,\"stored\":%s,\"store_err\":\"", n_ids, stored ? "true" : "false");
         json_escape(err, strlen(err));
         printf("\",");

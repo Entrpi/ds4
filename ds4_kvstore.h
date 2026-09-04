@@ -247,6 +247,15 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                          * cont bank, not the serial session).
                                          * NULL = stage from the session (serial). */
                                         const ds4_session_payload_file *staged_in,
+                                        /* Track B inc 6: the bank's image lineage
+                                         * for a staged BANK payload (borrowed;
+                                         * NULL/0 for text banks).  The key must
+                                         * reproduce it, marker for marker, or
+                                         * the record is not written.  Ignored
+                                         * for serial records (the session's
+                                         * own lineage keys those). */
+                                        const ds4_vision_identity *bank_ids,
+                                        size_t bank_ids_n,
                                         char *err,
                                         size_t err_len);
 /* v0.3 durable banks: find a stored record whose text is a byte-prefix of

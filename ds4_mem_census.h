@@ -50,6 +50,7 @@ typedef enum {                       /* FIXED cardinality -- census sec 6.
     DS4_MEMC_KERNEL_PARTIALS,        /* boot-fixed kernel buffers + ws     */
     DS4_MEMC_GRAPH_EXEC,             /* instantiated graphs (empirical)    */
     DS4_MEMC_DIAG,                   /* env-gated selftest/verify buffers  */
+    DS4_MEMC_VISION_ENCODER,         /* Track B inc 9: encoder scratch     */
     DS4_MEMC__COUNT
 } ds4_mem_consumer_class;
 

@@ -122,13 +122,16 @@ slight speedup, not a meaningful generation-speed win.
 `deepseek-ai/DeepSeek-V4-Flash-Vision-Exp` (2026-08-31) is a separate
 continued-training checkpoint of Flash with an image encoder. This fork
 serves its language GGUF, and with the encoder sidecar (`--vision FILE`)
-takes image input on the serial lane: `ds4 --vision` makes `/read FILE`
+takes image input: `ds4 --vision` makes `/read FILE`
 accept a PNG or JPEG in the interactive prompt, and `ds4-agent --vision`
 adds the `view_image` tool (the image becomes part of the tool
 observation; context compaction and session save/restore keep the image
-blocks). The server surfaces still refuse image, file and audio content
-blocks with a 400 rather than silently dropping them (the batched lane
-comes later), and the 0731 checkpoint stays the auto-picked default. The
+blocks). The engine's batched bank path serves image prompts (per-bank
+image lineage, engine-validated reuse, the encoder on its own stream and
+memory-governance family `DS4_MEMGOV_VISION`), but the server surfaces
+still refuse image, file and audio content blocks with a 400 rather than
+silently dropping them (the API parsers land next), and the 0731
+checkpoint stays the auto-picked default. The
 engine reads the checkpoint variant off the GGUF metadata, takes
 the checkpoint's `rms_eps = 1e-20`, keys its disk KV cache and agent
 checkpoints separately from 0731, and refuses to pair a Vision-Exp base with

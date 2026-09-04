@@ -228,15 +228,20 @@ static int ds4_vit_matmul_bf16(
     ds4_vit_f32_to_bf16_kernel<<<(unsigned)((input_elements + 255u) / 256u), 256, 0, stream>>>(
             xb, (const float *)x->ptr, input_elements);
     if (!cuda_ok(cudaGetLastError(), "vision BF16 activation conversion launch")) return 0;
-    cuda_cublas_ws_prep(stream);
+    /* Track B inc 9: inside the vision lane the GEMM runs on the lane's own
+     * handle (already bound to the lane stream, own workspace); the shared
+     * inference handle is only used by the legacy in-lock path. */
+    const int lane = ds4_gpu_vision_lane_active() && g_vision_lane_ready;
+    cublasHandle_t handle = lane ? g_cublas_vision : g_cublas;
+    if (lane) cuda_cublas_vision_ws_prep(stream); else cuda_cublas_ws_prep(stream);
     cudaStream_t prev_stream = NULL;
-    if (cublasGetStream(g_cublas, &prev_stream) != CUBLAS_STATUS_SUCCESS) return 0;
+    if (cublasGetStream(handle, &prev_stream) != CUBLAS_STATUS_SUCCESS) return 0;
     if (prev_stream != stream &&
-        cublasSetStream(g_cublas, stream) != CUBLAS_STATUS_SUCCESS) return 0;
+        cublasSetStream(handle, stream) != CUBLAS_STATUS_SUCCESS) return 0;
     const float alpha = 1.0f;
     const float beta = 0.0f;
     const cublasStatus_t status = cublasGemmEx(
-            g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            handle, CUBLAS_OP_T, CUBLAS_OP_N,
             (int)out_dim, (int)n_rows, (int)in_dim,
             &alpha,
             weights, CUDA_R_16BF, (int)in_dim,
@@ -244,7 +249,7 @@ static int ds4_vit_matmul_bf16(
             &beta,
             out->ptr, CUDA_R_32F, (int)out_dim,
             CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
-    if (prev_stream != stream) (void)cublasSetStream(g_cublas, prev_stream);
+    if (prev_stream != stream) (void)cublasSetStream(handle, prev_stream);
     if (status != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "ds4: vision BF16 GEMM failed (cublas status %d)\n", (int)status);
         return 0;

@@ -37,6 +37,10 @@ typedef enum {
                                    (serial spends its own reserve, batch
                                    must not) falls out of ownership       */
     DS4_GOVC_STATIC_BATCH,      /* per-call /v1/batch fallback graph      */
+    DS4_GOVC_VISION_ENCODER,    /* Track B inc 9: the Vision-Exp encoder's
+                                   per-encode device scratch (transient,
+                                   published as the lease's intent for the
+                                   duration of one encode)                */
     DS4_GOVC__COUNT
 } ds4_gov_consumer;
 

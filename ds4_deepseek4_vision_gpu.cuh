@@ -251,9 +251,15 @@ extern "C" int ds4_gpu_deepseek4_vision_encode(
     xb_t = ds4_gpu_tensor_alloc(xb_elements * sizeof(__nv_bfloat16));
     if (!xb_t) goto cleanup;
     xb = (__nv_bfloat16 *)xb_t->ptr;
-    if (!ds4_gpu_tensor_write(
-            patch, 0, patches,
-            (uint64_t)rows * 588u * sizeof(float)) ||
+    /* Track B inc 9: the upload and the readback are ordered on the CURRENT
+     * stream (the vision lane's when the caller entered it, the legacy stream
+     * otherwise), so a non-blocking lane never reads the patches before they
+     * land nor hands back rows before the last kernel ran.  Pageable host
+     * memory makes the H2D copy synchronous for the host, which is what the
+     * caller-owned `patches` needs. */
+    if (!cuda_ok(cudaMemcpyAsync(patch->ptr, patches, (size_t)rows * 588u * sizeof(float),
+                                 cudaMemcpyHostToDevice, ds4_current_stream()),
+                 "vision patch upload") ||
         !ds4_gpu_begin_commands()) goto cleanup;
     ok = ds4_vit_matmul_bf16(
             a, model_map, model_size, weights->patch_weight,
@@ -439,9 +445,12 @@ extern "C" int ds4_gpu_deepseek4_vision_encode(
     }
     if (ok) ok = deepseek4_vision_round_tensor(
             align_a, aligned4096, "DeepSeek vision aligner output round");
-    if (ds4_gpu_end_commands() == 0) ok = 0;
-    if (ok) ok = ds4_gpu_tensor_read(
-            align_a, 0, out, aligned4096 * sizeof(float));
+    /* inc 9: a stream sync, never the device-wide end_commands -- an encode on
+     * the vision lane must not drain the inference thread's streams. */
+    if (ok) ok = cuda_ok(cudaMemcpyAsync(out, align_a->ptr, aligned4096 * sizeof(float),
+                                         cudaMemcpyDeviceToHost, ds4_current_stream()),
+                         "vision output readback");
+    if (!cuda_ok(cudaStreamSynchronize(ds4_current_stream()), "vision encode sync")) ok = 0;
 
 cleanup:
     ds4_gpu_tensor_free(xb_t);

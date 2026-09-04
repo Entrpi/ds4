@@ -7,6 +7,48 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased
 
+- **Track B inc 6+9: the batched bank path serves image prompts, with memory
+  governance.**  `ds4_cont_request` carries the prompt's image blocks
+  (`images`/`image_count`, spans in prompt coordinates; the caller keeps the
+  embeddings valid until `on_done`), and the continuous engine prefills them
+  through the visual path chunk by chunk, interleaved with the other banks'
+  decode: the admission chunk never splits an image block (a block wider
+  than the live width takes the boot width; wider than the ring, the
+  admission fails by name), the image rows are scattered over the gather
+  exactly as on the serial lane, the visual router and the mixed attention
+  run on the admission bank's own cache views (a visual chunk is admitted
+  only as one bank's consecutive run; ragged multi-bank visual batches refuse
+  by name), and the mixed kernel never runs under graph capture.  Every bank
+  now records its ordered image lineage at the same points its committed
+  history advances (cold reset, chunk commit, fork copy, partial cut,
+  trim/quarantine, payload restore), readable through
+  `ds4_batch_ctx_bank_lineage`.  Reuse is engine-validated like the frontier
+  memcmp: a warm, fork or partial admit whose reference spans do not match
+  the source bank's recorded blocks, or whose reuse point would split a
+  block, degrades to cold (counted in `warm_rejects`/`fork_rejects`); a
+  partial cut is first moved below any source block it would cut; a
+  data-less span the engine would have to prefill rejects the admission;
+  image admissions need the chunked admission path and a bound encoder.
+  Bank payloads carry the bank lineage (the inc 8 refusals are lifted; an
+  image payload needs `--vision` to restore) and the bank record's key must
+  reproduce it.  The server plumbing for inc 7 lands with it: requests carry
+  an image list (empty until the parsers fill it), every admission passes it
+  to the engine, an image-bearing request takes a directed cold placement
+  (warm reuse of image prompts needs the multimodal render seam), and an
+  aborted-admission record over a bank with images renders the identity
+  markers.  Memory governance (inc 9): the Vision-Exp encoder runs on its own
+  lane, a dedicated stream and cuBLAS handle with its own workspace and a
+  stream sync at the end instead of a device-wide one, so an encode can run
+  outside the inference lock beside the worker's decode; its transient scratch
+  is a new census class (`vision_encoder`) and a new governor family
+  (`DS4_MEMGOV_VISION`, default enforce) whose per-encode intent
+  (`ds4_vision_encoder_scratch_bytes`) is checked before any device work and
+  published for the duration of the encode; the census scope stack is
+  thread-local.  `DS4_CONT_DUMP_SEED_LOGITS=path` is a batched-lane
+  diagnostic that appends every completed admission's final-chunk logits
+  (bank, prompt length, vocab floats), the tap the gate used to compare the
+  batched prefill state against the serial lane's.  Receipts:
+  `local/docs/vision-exp/v070/inc6-20260904/`.
 - **Track B inc 5: image input on the CLI and the agent.**  `ds4 --vision
   FILE` now makes `/read FILE` accept a PNG or JPEG in the interactive
   prompt (sniffed by magic): the image is encoded, laid out as one DeepSeek

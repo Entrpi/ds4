@@ -1175,6 +1175,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         const char *cache_text_key,
                                         const ds4_kvstore_trailer_hooks *hooks,
                                         const ds4_session_payload_file *staged_in,
+                                        const ds4_vision_identity *bank_ids,
+                                        size_t bank_ids_n,
                                         char *err,
                                         size_t err_len) {
     if (!kc->enabled) return false;
@@ -1220,11 +1222,12 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     const bool text_override = cache_text_override && cache_text_override[0];
     /* inc 8: the record's key carries the checkpoint's image lineage (one
      * marker per block, minted from the identity).  A bank payload (staged_in)
-     * has no lineage yet -- its tokens must be text-only or the render
-     * refuses by name.  A caller-supplied visible-text key must reproduce the
-     * same marker sequence, or the record would be served under a text key. */
-    const ds4_vision_identity *ids = NULL;
-    const size_t n_ids = staged_in ? 0 : ds4_session_vision_identities(session, &ids);
+     * brings the bank's own lineage (inc 6); a serial record takes the
+     * session's.  A caller-supplied visible-text key must reproduce the same
+     * marker sequence, or the record would be served under a text key. */
+    const ds4_vision_identity *ids = staged_in ? bank_ids : NULL;
+    const size_t n_ids = staged_in ? (bank_ids ? bank_ids_n : 0)
+                                   : ds4_session_vision_identities(session, &ids);
     if (text_override) {
         text = kv_xstrdup(cache_text_override);
         text_len = strlen(text);
@@ -1451,7 +1454,7 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
     return ds4_kvstore_store_live_prefix_text(kc, engine, session,
                                               ds4_session_ctx(session), tokens,
                                               store_len, reason, NULL, 0, NULL,
-                                              hooks, NULL, err, err_len);
+                                              hooks, NULL, NULL, 0, err, err_len);
 }
 
 bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,

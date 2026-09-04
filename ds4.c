@@ -16620,19 +16620,63 @@ static bool metal_graph_visual_attention(ds4_gpu_graph *g, const ds4_model *mode
         fprintf(stderr, "ds4: visual attention has no F16 compressed-KV read; layer %u refused\n", il);
         return false;
     }
+    /* Track B inc 6: on the batched admission shape (one bank's consecutive
+     * run, bg_prefill_rows) the caches are the MS-bank slab views and pos0 is
+     * the frontier by convention; the mixed kernel reads ONE bank, so hand it
+     * bank-offset views (raw ring, F32 comp, FP8 mirror + scale; the same
+     * strides the per-seq kernels use) and the first row's own position. */
+    uint32_t bank = UINT32_MAX;
+    if (g->batch_admit_fast && g->batch_multiseq_emit && n_tokens != 0u) {
+        bank = (uint32_t)g->ms_seq_id[0];
+        pos0 = (uint32_t)g->ms_positions[0];
+    }
+    ds4_gpu_tensor *fp8 = n_comp ? g->layer_comp_cache_fp8[il] : NULL;
+    ds4_gpu_tensor *fp8_scale = n_comp ? g->layer_comp_scale[il] : NULL;
+    ds4_gpu_tensor *comp = n_comp ? comp_kv : NULL;
+    ds4_gpu_tensor *raw_v = NULL, *comp_v = NULL, *fp8_v = NULL, *sc_v = NULL;
+    bool ok = true;
+    if (bank != UINT32_MAX) {
+        const uint64_t raw_bytes = (uint64_t)raw_cap * DS4_N_HEAD_DIM * sizeof(float);
+        raw_v = ds4_gpu_tensor_view(raw_kv, (uint64_t)bank * raw_bytes, raw_bytes);
+        ok = raw_v != NULL;
+        if (ok && n_comp) {
+            const uint64_t cap = g->layer_comp_cap[il];
+            if (comp) {
+                const uint64_t cb = cap * DS4_N_HEAD_DIM * sizeof(float);
+                comp_v = ds4_gpu_tensor_view(comp, (uint64_t)bank * cb, cb);
+                ok = comp_v != NULL;
+            }
+            if (ok && fp8 && fp8_scale) {
+                const uint64_t f8b = cap * DS4_OPP_C_FP8_ROW_BYTES;
+                const uint64_t scb = cap * DS4_OPP_C_FP8_SCALE_BYTES;
+                fp8_v = ds4_gpu_tensor_view(fp8, (uint64_t)bank * f8b, f8b);
+                sc_v  = ds4_gpu_tensor_view(fp8_scale, (uint64_t)bank * scb, scb);
+                ok = fp8_v != NULL && sc_v != NULL;
+            }
+        }
+        if (!ok) fprintf(stderr, "ds4: visual attention: bank %u view failed (il=%u)\n", bank, il);
+        raw_kv = raw_v;
+        if (comp_v) comp = comp_v;
+        if (fp8_v) { fp8 = fp8_v; fp8_scale = sc_v; }
+    }
     /* inc 3c: the packed FP8 compressed-KV mirror (the v0.2.4 default) is read
      * by the pack kernel; the F32 primary is used when the mirror is absent
      * (DS4_CUDA_FP8_KV=0), so the identity leg and the shipping config share
      * one code path. */
-    return ds4_gpu_attention_visual_mixed_batch_heads_tensor(g->batch_heads, model->map, model->size,
-                                                             layer->attn_sinks->abs_offset, g->batch_q,
-                                                             raw_kv, n_comp ? comp_kv : NULL, 0u,
-                                                             comp_mask, comp_mask != NULL ? 1u : 0u,
-                                                             (const int32_t *)visual_tokens, (uint32_t)DS4_N_VOCAB,
-                                                             n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
-                                                             g->raw_window, ratio, DS4_N_HEAD, DS4_N_HEAD_DIM,
-                                                             n_comp ? g->layer_comp_cache_fp8[il] : NULL,
-                                                             n_comp ? g->layer_comp_scale[il] : NULL) != 0;
+    if (ok)
+        ok = ds4_gpu_attention_visual_mixed_batch_heads_tensor(g->batch_heads, model->map, model->size,
+                                                               layer->attn_sinks->abs_offset, g->batch_q,
+                                                               raw_kv, comp, 0u,
+                                                               comp_mask, comp_mask != NULL ? 1u : 0u,
+                                                               (const int32_t *)visual_tokens, (uint32_t)DS4_N_VOCAB,
+                                                               n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp,
+                                                               g->raw_window, ratio, DS4_N_HEAD, DS4_N_HEAD_DIM,
+                                                               fp8, fp8_scale) != 0;
+    if (raw_v)  ds4_gpu_tensor_free(raw_v);
+    if (comp_v) ds4_gpu_tensor_free(comp_v);
+    if (fp8_v)  ds4_gpu_tensor_free(fp8_v);
+    if (sc_v)   ds4_gpu_tensor_free(sc_v);
+    return ok;
 }
 
 static bool metal_graph_encode_layer_attention_batch(
@@ -16691,10 +16735,6 @@ static bool metal_graph_encode_layer_attention_batch(
      * kernel at every shape below; a shape without a visual branch fails by
      * name instead of falling through to a causal/windowed kernel. */
     const int *visual_tokens = metal_graph_visual_tokens_for_batch(g, pos0, n_tokens);
-    if (visual_tokens && seq_positions != NULL) {
-        fprintf(stderr, "ds4: visual attention is serial-lane only in this build (multi-seq chunk refused, il=%u)\n", il);
-        return false;
-    }
     /* B0 (ragged prefill): the batched attention ring-fit guard is per-seq in
      * multi-seq mode -- each seq lands in its own bank (offset seq_id*raw_cap),
      * so the packed n_tokens (Σ seq lens) may exceed raw_cap as long as the
@@ -16728,6 +16768,15 @@ static bool metal_graph_encode_layer_attention_batch(
             if (g->ms_seq_id[t] != ar_s0 ||
                 g->ms_positions[t] != ar_p0 + (int32_t)t) { admit_single_run = false; break; }
         }
+    }
+    /* Track B inc 6: a multi-seq chunk with image rows is served only as ONE
+     * bank's consecutive run (the bg_prefill_rows admission shape, verified
+     * above against the host mirrors); metal_graph_visual_attention then reads
+     * that bank's views.  Ragged multi-bank visual batches refuse by name
+     * (charter F: measure the single-run restriction before widening it). */
+    if (visual_tokens && seq_positions != NULL && !admit_single_run) {
+        fprintf(stderr, "ds4: visual attention: multi-seq chunk is not a single-bank run (il=%u) -- refused\n", il);
+        return false;
     }
     bool tt_single_run = admit_single_run;
     if (!tt_single_run && g->batch_admit_fast && use_multiseq &&
@@ -21578,7 +21627,13 @@ static void metal_graph_report_prefill_display_progress(
  * The chunk's host token window, published so the attention/router dispatch can
  * see synthetic ids without a device readback. */
 static const int *metal_graph_visual_tokens_for_batch(const ds4_gpu_graph *g, uint32_t pos0, uint32_t n_tokens) {
-    if (!g || !g->prefill_has_visual || !g->prefill_host_tokens || pos0 < g->prefill_host_pos0) return NULL;
+    if (!g || !g->prefill_has_visual || !g->prefill_host_tokens) return NULL;
+    /* Track B inc 6: the batched admission chunk (bg_prefill_rows) passes the
+     * FRONTIER as pos0 by convention; its rows' positions live in the host
+     * mirrors, so the window starts at the first row's own position. */
+    if (g->batch_admit_fast && g->batch_multiseq_emit && n_tokens != 0u)
+        pos0 = (uint32_t)g->ms_positions[0];
+    if (pos0 < g->prefill_host_pos0) return NULL;
     const uint32_t off = pos0 - g->prefill_host_pos0;
     if (off > g->prefill_host_count || n_tokens > g->prefill_host_count - off) return NULL;
     const int *tokens = g->prefill_host_tokens + off;
@@ -21591,12 +21646,14 @@ static const int *metal_graph_visual_tokens_for_batch(const ds4_gpu_graph *g, ui
  * every image row of the chunk with its span row, replicated across the
  * DS4_N_HC lanes exactly as the host HC layout.  Every synthetic id in the
  * window must be covered by a published span, or the chunk is refused. */
-static bool metal_graph_scatter_visual_rows(ds4_gpu_graph *g, const token_vec *prompt,
+static bool metal_graph_scatter_visual_rows(ds4_gpu_graph *g, const int *win,
                                             uint32_t pos0, uint32_t n_tokens) {
+    /* win[t] is the token at absolute position pos0 + t (the serial chunk passes
+     * prompt->v + start, the batched admission chunk its suffix window). */
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     uint32_t synthetic = 0, covered = 0;
     for (uint32_t t = 0; t < n_tokens; t++)
-        if (prompt->v[pos0 + t] >= (int)DS4_N_VOCAB) synthetic++;
+        if (win[t] >= (int)DS4_N_VOCAB) synthetic++;
     if (synthetic == 0) return true;
     float *stage = NULL;
     uint32_t stage_rows = 0;
@@ -21713,7 +21770,7 @@ static bool metal_graph_prefill_layer_major(
                                                      prompt,
                                                      start,
                                                      n_tokens);
-        if (ok && visual_chunk) ok = metal_graph_scatter_visual_rows(g, prompt, start, n_tokens);   /* Track B inc 3 (A6) */
+        if (ok && visual_chunk) ok = metal_graph_scatter_visual_rows(g, prompt->v + start, start, n_tokens);   /* Track B inc 3 (A6) */
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
             ok = metal_graph_encode_layer_batch(g,
@@ -21791,7 +21848,7 @@ static bool metal_graph_prefill_layer_major(
                                                  prompt,
                                                  start,
                                                  n_tokens);
-        if (ok && visual_chunk) ok = metal_graph_scatter_visual_rows(g, prompt, start, n_tokens);   /* Track B inc 3 (A6) */
+        if (ok && visual_chunk) ok = metal_graph_scatter_visual_rows(g, prompt->v + start, start, n_tokens);   /* Track B inc 3 (A6) */
     const double t_embed_encoded = (profile || throttle) ? now_sec() : 0.0;
     const double t_embed_done = (profile || throttle) ? now_sec() : 0.0;
     if (profile) {
@@ -24196,6 +24253,122 @@ int ds4_vision_lineage_prefix_cap_matching(const ds4_vision_lineage *l, int len,
         if (!reproduced) return (int)old->token_start;
     }
     return len;
+}
+
+/* Track B inc 6: batched-admission helpers (pure; unit battery --vision-cont). */
+int ds4_vision_spans_admit_check(const ds4_vision_span *images, size_t n, uint32_t P,
+                                 const ds4_vision_identity *lineage, size_t lineage_n,
+                                 char *err, size_t errlen) {
+    size_t below = 0;
+    for (size_t i = 0; images && i < n; i++) {
+        const ds4_vision_span *sp = &images[i];
+        const uint64_t s = sp->token_start, e = s + sp->embedding.token_count;
+        if (s < P) {
+            if (e > P) {
+                if (err && errlen)
+                    snprintf(err, errlen, "image block %zu @%u (%u rows) straddles the reuse point %u",
+                             i, sp->token_start, sp->embedding.token_count, P);
+                return DS4_VISION_ADMIT_COLD;
+            }
+            if (!lineage || below >= lineage_n ||
+                lineage[below].token_start != sp->token_start ||
+                lineage[below].token_count != sp->embedding.token_count ||
+                memcmp(lineage[below].identity, sp->embedding.identity, sizeof(lineage[below].identity)) != 0) {
+                if (err && errlen)
+                    snprintf(err, errlen, "image block %zu @%u is not the bank's recorded block", i, sp->token_start);
+                return DS4_VISION_ADMIT_COLD;
+            }
+            below++;
+        } else if (!sp->embedding.data) {
+            if (err && errlen)
+                snprintf(err, errlen, "image block %zu @%u (%u rows) has no embedding and lies past the reuse point %u",
+                         i, sp->token_start, sp->embedding.token_count, P);
+            return DS4_VISION_ADMIT_REJECT;
+        }
+    }
+    for (size_t k = below; P != 0 && lineage && k < lineage_n; k++) {
+        if (lineage[k].token_start < P) {
+            if (err && errlen)
+                snprintf(err, errlen, "bank records image block @%u below the reuse point %u that the request does not carry",
+                         lineage[k].token_start, P);
+            return DS4_VISION_ADMIT_COLD;
+        }
+    }
+    return DS4_VISION_ADMIT_OK;
+}
+
+uint32_t ds4_vision_lineage_cut_cap(const ds4_vision_identity *lineage, size_t lineage_n,
+                                    uint32_t R, uint32_t align) {
+    for (;;) {
+        uint32_t next = R;
+        for (size_t i = 0; lineage && i < lineage_n; i++) {
+            const uint64_t s = lineage[i].token_start, e = s + lineage[i].token_count;
+            if ((uint64_t)next > s && (uint64_t)next < e) next = (uint32_t)s;
+        }
+        if (align > 1u) next = (next / align) * align;
+        if (next == R) return R;
+        R = next;
+    }
+}
+
+bool ds4_vision_identities_cover_rows(const ds4_vision_identity *v, size_t n,
+                                      const int *tokens, uint32_t n_tokens, uint32_t n_vocab) {
+    if (!tokens && n_tokens != 0) return false;
+    uint64_t pos = 0;
+    for (size_t k = 0; k < n; k++) {
+        if (!v) return false;
+        const uint64_t s = v[k].token_start, e = s + v[k].token_count;
+        if (v[k].token_count == 0 || s < pos || e > n_tokens) return false;
+        for (uint64_t i = pos; i < s; i++)
+            if (tokens[i] < 0 || (uint32_t)tokens[i] >= n_vocab) return false;   /* image row outside an entry */
+        for (uint64_t i = s; i < e; i++)
+            if (tokens[i] >= 0 && (uint32_t)tokens[i] < n_vocab) return false;   /* text row inside an entry */
+        pos = e;
+    }
+    for (uint64_t i = pos; i < n_tokens; i++)
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= n_vocab) return false;
+    return true;
+}
+
+int ds4_vision_lineage_append_in_range(ds4_vision_lineage *l, const ds4_vision_span *images,
+                                       size_t n, uint32_t lo, uint32_t hi) {
+    if (!l) return 0;
+    size_t add = 0;
+    for (size_t i = 0; images && i < n; i++) {
+        const uint64_t s = images[i].token_start, e = s + images[i].embedding.token_count;
+        if (s >= lo && e <= hi) add++;
+    }
+    if (add == 0) return 1;
+    if (l->n > SIZE_MAX / sizeof(l->v[0]) - add) return 0;
+    ds4_vision_identity *grown = realloc(l->v, (l->n + add) * sizeof(l->v[0]));
+    if (!grown) return 0;
+    l->v = grown;
+    for (size_t i = 0; i < n; i++) {
+        const uint64_t s = images[i].token_start, e = s + images[i].embedding.token_count;
+        if (s < lo || e > hi) continue;
+        l->v[l->n].token_start = images[i].token_start;
+        l->v[l->n].token_count = images[i].embedding.token_count;
+        memcpy(l->v[l->n].identity, images[i].embedding.identity, sizeof(l->v[l->n].identity));
+        l->n++;
+    }
+    return 1;
+}
+
+uint64_t ds4_vision_encoder_scratch_bytes(uint32_t grid_h, uint32_t grid_w) {
+    /* Mirrors the allocation list of ds4_gpu_deepseek4_vision_encode
+     * (ds4_deepseek4_vision_gpu.cuh): per natural row patch 588 + a/b 2x1024 +
+     * qkv 3072 + q/k/v 3x1024 + attn 1024 + mlp_w1 5632 + mlp_mid 2816 F32;
+     * per 3x3-aligned row align_in 9216 + align_a/b 2x4096 F32; plus the BF16
+     * staging sized by the widest GEMM input. */
+    if (grid_h == 0u || grid_w == 0u || grid_h > UINT32_MAX / grid_w) return 0u;
+    const uint64_t rows = (uint64_t)grid_h * grid_w;
+    const uint64_t aligned = (uint64_t)((grid_h + 2u) / 3u) * ((grid_w + 2u) / 3u);
+    const uint64_t per_row = 588u + 2u * 1024u + 3072u + 3u * 1024u + 1024u + 5632u + 2816u;
+    const uint64_t per_aligned = 9216u + 2u * 4096u;
+    uint64_t xb = rows * 2816u;
+    if (rows * 1024u > xb) xb = rows * 1024u;
+    if (aligned * 9216u > xb) xb = aligned * 9216u;
+    return (rows * per_row + aligned * per_aligned) * sizeof(float) + xb * 2u;
 }
 
 int ds4_vision_spans_require_data(const ds4_vision_span *images, size_t image_count,
@@ -32209,6 +32382,24 @@ static bool metal_graph_batch_eval_logits(
     ds4_gpu_stage_prof_end(sp_emb);
     token_vec_free(&tv);
     if (!ok) return false;
+    {   /* Track B inc 6: an admission chunk with image rows overwrites them
+         * with the published span rows (A6) exactly like the serial chunk
+         * path; image rows with no published window are refused instead of
+         * being served from the clamped gather (the inc 5 lesson). */
+        const int *vwin = metal_graph_visual_tokens_for_batch(g, pos0, n);
+        if (vwin) {
+            const uint32_t vpos0 = (g->batch_admit_fast && g->batch_multiseq_emit)
+                                       ? (uint32_t)g->ms_positions[0] : pos0;
+            if (!metal_graph_scatter_visual_rows(g, vwin, vpos0, n)) return false;
+        } else {
+            for (uint32_t i = 0; i < n; i++) {
+                if (tokens[i] >= (int)DS4_N_VOCAB) {
+                    fprintf(stderr, "ds4: image prefill: batched chunk (frontier %u) carries image rows but no image spans were published\n", pos0);
+                    return false;
+                }
+            }
+        }
+    }
     const double be_t_emb = g_cont_prof ? now_sec() : 0.0;
     if (g_cont_prof) g_cont_be_emb_s += be_t_emb - be_t0;
     const double be_c_emb = g_cont_prof ? now_thread_cpu_sec() : 0.0;
@@ -34089,6 +34280,10 @@ struct ds4_batch_ctx {
      * term: among idle valid banks, oldest activity trims first. */
     uint64_t       *bank_last_use;
     uint64_t        use_clock;
+    /* Track B inc 6: per-bank ORDERED image lineage (bank coordinates),
+     * maintained at exactly the points bank_hist commits; readable through
+     * ds4_batch_ctx_bank_lineage only while the history is trustworthy. */
+    ds4_vision_lineage *bank_lineage;
     /* memgov D4-2: a batched pass is driving this context (set/cleared by
      * the two pass entry points).  Reclaim prepare/commit answer BUSY
      * instead of racing a pass -- structural today (server and pass
@@ -34262,13 +34457,14 @@ int ds4_cont_bank_save_payload(ds4_batch_ctx *ctx, uint32_t bank,
     ds4_gpu_graph *g = &ctx->g;
     const int *tokens = ctx->bank_hist + (uint64_t)bank * ctx->seq_cap;
     const uint32_t n_tokens = ctx->bank_hist_len[bank];
-    /* inc 8: banks carry no image lineage yet (inc 6); a bank that somehow
-     * holds image rows must not be persisted under a text key. */
-    for (uint32_t i = 0; i < n_tokens; i++) {
-        if (tokens[i] < 0 || (uint32_t)tokens[i] >= (uint32_t)DS4_N_VOCAB) {
-            payload_set_err(err, errlen, "bank holds image rows without lineage; the batched lane does not persist image state yet");
-            return 1;
-        }
+    /* inc 6: the bank's image lineage must describe exactly its image rows
+     * (inc 8's rule for sessions), or the record could be served under a key
+     * that does not name every image that conditioned it. */
+    const ds4_vision_lineage *blin = ctx->bank_lineage ? &ctx->bank_lineage[bank] : NULL;
+    if (!ds4_vision_identities_cover_rows(blin ? blin->v : NULL, blin ? blin->n : 0,
+                                          tokens, n_tokens, (uint32_t)DS4_N_VOCAB)) {
+        payload_set_err(err, errlen, "bank image lineage does not describe the bank's image rows; refusing to persist");
+        return 1;
     }
     if (ds4_gpu_synchronize() == 0) {
         payload_set_err(err, errlen, "failed to synchronize accelerator before bank snapshot");
@@ -34296,7 +34492,8 @@ int ds4_cont_bank_save_payload(ds4_batch_ctx *ctx, uint32_t bank,
     for (uint32_t i = 0; i < n_tokens; i++) {
         if (payload_write_u32(fp, (uint32_t)tokens[i], err, errlen) != 0) return 1;
     }
-    if (ds4_session_payload_write_lineage(fp, NULL, 0, err, errlen) != 0) return 1;   /* v4: empty list */
+    if (ds4_session_payload_write_lineage(fp, blin ? blin->v : NULL, blin ? blin->n : 0,
+                                          err, errlen) != 0) return 1;   /* v4: the bank lineage (inc 6) */
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
     /* Logits block: zeros (see the section comment). */
     memset(buf, 0, DS4_SESSION_IO_CHUNK);
@@ -34401,16 +34598,25 @@ int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
         if (payload_read_u32(fp, &tok, &remaining, err, errlen) != 0) return 1;
         hist[i] = (int)tok;
     }
-    {   /* v4 image lineage: read + validate, then refuse anything non-empty by
-         * name -- the batched lane has no per-bank lineage yet (inc 6). */
+    {   /* v4 image lineage: read + validate, then install it on the bank now
+         * (inc 6).  The bank is marked untrustworthy above until the restore
+         * completes, so a failure below leaves the list unreadable and the next
+         * reset clears it.  An image payload needs the encoder bound, like the
+         * session restore: without it the state could never be extended or
+         * re-validated. */
         ds4_vision_lineage lin = {0};
         if (ds4_session_payload_read_lineage(fp, payload_version, &remaining, hist, saved_tokens,
                                              (uint32_t)DS4_N_VOCAB, &lin, err, errlen) != 0) return 1;
-        const size_t n_images = lin.n;
-        ds4_vision_lineage_clear(&lin);
-        if (n_images != 0) {
-            payload_set_err(err, errlen, "bank payload carries image lineage; the batched lane does not serve image state yet");
+        if (lin.n != 0 && !(ctx->e && ctx->e->vision_ready)) {
+            ds4_vision_lineage_clear(&lin);
+            payload_set_err(err, errlen, "bank payload is image-conditioned but no vision encoder is loaded (--vision)");
             return 1;
+        }
+        if (ctx->bank_lineage) {
+            ds4_vision_lineage_clear(&ctx->bank_lineage[bank]);
+            ctx->bank_lineage[bank] = lin;
+        } else {
+            ds4_vision_lineage_clear(&lin);
         }
     }
     uint32_t n_comp[DS4_MAX_LAYER];
@@ -34912,6 +35118,7 @@ void ds4_gov_modes_init(void) {
         "DS4_MEMGOV_BANK",      /* DS4_GOVC_BATCH_BANK_PLAN */
         "DS4_MEMGOV_SERIAL",    /* DS4_GOVC_SERIAL_SESSION  */
         "DS4_MEMGOV_STATIC",    /* DS4_GOVC_STATIC_BATCH    */
+        "DS4_MEMGOV_VISION",    /* DS4_GOVC_VISION_ENCODER  (Track B inc 9) */
     };
     /* D2-2b ratchet (the box gates the ratchet, not the machinery):
      * BOOT and BANK default ENFORCE -- their quotes ran AGREE across
@@ -34932,6 +35139,11 @@ void ds4_gov_modes_init(void) {
         DS4_GOV_MODE_ENFORCE,   /* BATCH_BANK_PLAN  (D2-2b) */
         DS4_GOV_MODE_ENFORCE,   /* SERIAL_SESSION   (D2-4)  */
         DS4_GOV_MODE_ENFORCE,   /* STATIC_BATCH     (D2-5)  */
+        DS4_GOV_MODE_ENFORCE,   /* VISION_ENCODER   (Track B inc 9: the
+                                 * encoder's transient scratch is the one
+                                 * new memory term of the image lanes;
+                                 * a refusal names itself and the request
+                                 * fails before any prefill is spent) */
     };
     int gdef = -1;
     const char *g = getenv("DS4_MEMGOV");
@@ -35435,6 +35647,7 @@ static void ds4_batch_bank_mark_trimmed(ds4_batch_ctx *ctx, ds4_gpu_graph *g,
     ctx->bank_gen[v]++;                    /* Inc 5a: trim destroys content */
     ctx->bank_hist_valid[v] = 0u;
     ctx->bank_hist_len[v]   = 0u;
+    if (ctx->bank_lineage) ds4_vision_lineage_clear(&ctx->bank_lineage[v]);   /* inc 6 */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         g->ms_n_comp[v][il] = 0u;
         g->ms_n_index_comp[v][il] = 0u;
@@ -36507,6 +36720,7 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     for (uint32_t bg = 0; bg < ctx->max_seq; bg++) ctx->bank_gen[bg] = 1u;
     /* v0.6.2 Inc 3: recency starts at 0 = never used. */
     ctx->bank_last_use   = xcalloc(ctx->max_seq, sizeof(uint64_t));
+    ctx->bank_lineage    = xcalloc(ctx->max_seq, sizeof(ds4_vision_lineage));   /* inc 6 */
     /* P1: one stashed compressed row per (bank, layer) for the partial-fork
      * boundary-row restore (see ms_emit_keep).  Tiny vs the slabs
      * (max_seq x n_layer x head_dim floats); allocated unconditionally so the
@@ -36591,6 +36805,9 @@ void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
     free(ctx->bank_hist_valid);
     free(ctx->bank_gen);
     free(ctx->bank_last_use);
+    if (ctx->bank_lineage)
+        for (uint32_t b = 0; b < ctx->max_seq; b++) ds4_vision_lineage_clear(&ctx->bank_lineage[b]);
+    free(ctx->bank_lineage);
     free(ctx);
 }
 
@@ -36603,10 +36820,32 @@ static void bank_hist_reset(ds4_batch_ctx *ctx, uint32_t b) {
     ctx->bank_hist_len[b] = 0u;
     ctx->bank_hist_valid[b] = 1u;
     ctx->bank_last_use[b] = ++ctx->use_clock;   /* v0.6.2 Inc 3: recency */
+    if (ctx->bank_lineage) ds4_vision_lineage_clear(&ctx->bank_lineage[b]);   /* inc 6 */
 }
 static void bank_hist_invalidate_all(ds4_batch_ctx *ctx) {
-    for (uint32_t b = 0; b < ctx->max_seq; b++) ctx->bank_gen[b]++;   /* Inc 5a */
+    for (uint32_t b = 0; b < ctx->max_seq; b++) {
+        ctx->bank_gen[b]++;   /* Inc 5a */
+        if (ctx->bank_lineage) ds4_vision_lineage_clear(&ctx->bank_lineage[b]);   /* inc 6 */
+    }
     memset(ctx->bank_hist_valid, 0, (size_t)ctx->max_seq);
+}
+/* inc 6: dst's image lineage becomes a copy of src's (fork-by-copy); the
+ * partial cut rewinds it afterwards.  Allocation failure quarantines dst
+ * (history invalid), never leaves a lineage that disagrees with the rows. */
+static void bank_lineage_copy(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst) {
+    if (!ctx->bank_lineage || src == dst) return;
+    ds4_vision_lineage *d = &ctx->bank_lineage[dst];
+    const ds4_vision_lineage *s = &ctx->bank_lineage[src];
+    ds4_vision_lineage_clear(d);
+    if (s->n == 0) return;
+    d->v = malloc(s->n * sizeof(d->v[0]));
+    if (!d->v) {
+        ctx->bank_gen[dst]++;
+        ctx->bank_hist_valid[dst] = 0u;
+        return;
+    }
+    memcpy(d->v, s->v, s->n * sizeof(d->v[0]));
+    d->n = s->n;
 }
 static void bank_hist_append(ds4_batch_ctx *ctx, uint32_t b, int tok) {
     if (!ctx->bank_hist_valid[b]) return;
@@ -36731,6 +36970,7 @@ static bool bank_fork_copy(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst) {
     ctx->bank_gen[dst]++;   /* Inc 5a: fork-by-copy replaces dst's lineage */
     ctx->bank_hist_len[dst]   = (uint32_t)P;
     ctx->bank_hist_valid[dst] = 1u;
+    bank_lineage_copy(ctx, src, dst);   /* inc 6: the image lineage travels with the rows */
     /* v0.6.2 Inc 3: both sides are hot -- the copy touched src's content. */
     ctx->bank_last_use[dst] = ++ctx->use_clock;
     ctx->bank_last_use[src] = ++ctx->use_clock;
@@ -36997,6 +37237,16 @@ static bool bank_fork_copy_cut(ds4_batch_ctx *ctx, uint32_t src, uint32_t dst, u
     ctx->bank_gen[dst]++;
     ctx->bank_hist_len[dst]   = R;
     ctx->bank_hist_valid[dst] = 1u;
+    /* inc 6: the lineage below the cut travels with the rows; admission capped
+     * R below any block it would cut (ds4_vision_lineage_cut_cap), so a
+     * rewind that still lands inside a block is a contract violation --
+     * quarantine rather than serve a half block under its identity. */
+    bank_lineage_copy(ctx, src, dst);
+    if (ctx->bank_lineage && !ds4_vision_lineage_rewind(&ctx->bank_lineage[dst], (int)R)) {
+        ctx->bank_gen[dst]++;
+        ctx->bank_hist_valid[dst] = 0u;
+        ds4_vision_lineage_clear(&ctx->bank_lineage[dst]);
+    }
     /* v0.6.2 Inc 3: the source trunk was read too (src==dst harmless). */
     ctx->bank_last_use[dst] = ++ctx->use_clock;
     ctx->bank_last_use[src] = ++ctx->use_clock;
@@ -37016,6 +37266,16 @@ uint64_t ds4_batch_ctx_bank_generation(const ds4_batch_ctx *ctx, int bank) {
     if (!ctx || bank < 0 || (uint32_t)bank >= ctx->max_seq || !ctx->bank_gen)
         return 0u;
     return ctx->bank_gen[bank];
+}
+
+size_t ds4_batch_ctx_bank_lineage(const ds4_batch_ctx *ctx, int bank,
+                                  const ds4_vision_identity **out) {
+    if (out) *out = NULL;
+    if (!ctx || bank < 0 || (uint32_t)bank >= ctx->max_seq || !ctx->bank_lineage) return 0;
+    if (!ctx->bank_hist_valid[bank] || ctx->bank_hist_len[bank] == 0u) return 0;
+    const ds4_vision_lineage *l = &ctx->bank_lineage[bank];
+    if (out) *out = l->n ? l->v : NULL;
+    return l->n;
 }
 
 int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) {
@@ -37964,6 +38224,11 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
     uint32_t *pflen  = xcalloc(MS, sizeof(uint32_t));   /* suffix length to prefill */
     uint32_t *pfoff  = xcalloc(MS, sizeof(uint32_t));   /* tokens already committed */
     uint32_t *pfbase = xcalloc(MS, sizeof(uint32_t));   /* suffix start position    */
+    /* Track B inc 6: the pending admission's image spans (a copy of the span
+     * structs in request == bank coordinates; the embedding rows stay
+     * caller-owned until on_done), published to the graph chunk by chunk. */
+    ds4_vision_span **pfimg   = xcalloc(MS, sizeof(ds4_vision_span *));
+    uint32_t         *pfimg_n = xcalloc(MS, sizeof(uint32_t));
     /* Inc 0b: lifetime admission credit -- the row's full normalized target
      * min(prompt + decode budget, seq_cap), held from install until the row
      * ends (retire, abort, eviction, interrupted prefill).  The page-union
@@ -38423,6 +38688,66 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                               (size_t)req.n_cached * sizeof(int)) == 0;
                 if (warm) ctx->warm_admits++; else ctx->warm_rejects++;
             }
+            /* Track B inc 6: image admissions.  The span list is validated
+             * against the request, then against the reuse point the placement
+             * above chose: a block that straddles it, or a prefix block that
+             * is not the source bank's recorded block, DEGRADES TO COLD (the
+             * frontier-memcmp discipline: never reuse state under the wrong
+             * identity); a data-less block the engine would have to prefill
+             * rejects; a partial cut is first moved below any source block it
+             * would split.  Text requests skip all of this. */
+            const uint32_t vis_n = req.images ? (uint32_t)req.image_count : 0u;
+            if (vis_n != 0u) {
+                char verr[192] = {0};
+                const ds4_tokens pview = { (int *)req.tokens, (int)L, (int)L };
+                const char *reject = NULL;
+                if (!ctx->e || !ctx->e->vision_ready)
+                    reject = "image request but no vision encoder is loaded (--vision)";
+                else if (bg_prefill_chunk_tokens() == 0u)
+                    reject = "image admissions need chunked admission (DS4_CONT_PREFILL_CHUNK=0 is the legacy one-shot path)";
+                else if (!ds4_vision_spans_validate(&pview, req.images, req.image_count, verr, sizeof(verr)))
+                    reject = verr;
+                if (!reject) {
+                    uint32_t P0 = partial ? cutC : (fork || warm) ? (uint32_t)req.n_cached : 0u;
+                    const uint32_t lsrc = (fork || partial) ? fsrc : b;
+                    const ds4_vision_identity *lin = NULL;
+                    size_t lin_n = 0;
+                    if (P0 != 0u) lin_n = ds4_batch_ctx_bank_lineage(ctx, (int)lsrc, &lin);
+                    if (partial) {
+                        const uint32_t align = ds4_partial_fork_base_align();
+                        const uint32_t R2 = ds4_vision_lineage_cut_cap(lin, lin_n, cutC, align);
+                        if (R2 != cutC) {
+                            if (R2 < align || L <= R2 + 4u) {
+                                fprintf(stderr, "ds4: cont admit: partial cut %u would split a source image block and no reuse remains below it -- degrading to cold\n", cutC);
+                                partial = false; cutC = 0u; P0 = 0u;
+                                ctx->fork_admits--; ctx->fork_partial--; ctx->fork_rejects++;
+                            } else {
+                                fprintf(stderr, "ds4: cont admit: partial cut %u moved below a source image block to %u\n", cutC, R2);
+                                cutC = R2; P0 = R2;
+                            }
+                        }
+                    }
+                    int verdict = ds4_vision_spans_admit_check(req.images, req.image_count, P0,
+                                                               lin, lin_n, verr, sizeof(verr));
+                    if (verdict == DS4_VISION_ADMIT_COLD && P0 != 0u) {
+                        fprintf(stderr, "ds4: cont admit: image lineage mismatch (%s) -- degrading to cold\n", verr);
+                        if (warm) { warm = false; ctx->warm_admits--; ctx->warm_rejects++; }
+                        if (fork || partial) {
+                            ctx->fork_admits--; if (partial) ctx->fork_partial--; ctx->fork_rejects++;
+                            fork = false; partial = false;
+                        }
+                        cutC = 0u;
+                        verdict = ds4_vision_spans_admit_check(req.images, req.image_count, 0u,
+                                                               NULL, 0, verr, sizeof(verr));
+                    }
+                    if (verdict != DS4_VISION_ADMIT_OK) reject = verr;
+                }
+                if (reject) {
+                    fprintf(stderr, "ds4: cont admit rejected: %s\n", reject);
+                    on_done(ud, req.user, NULL, 0, 0);   /* reject: bank stays free */
+                    continue;
+                }
+            }
             uint32_t mn = req.max_new > 0 ? (uint32_t)req.max_new : 1u;
             const uint32_t cap = seq_cap > L ? seq_cap - L : 1u;   /* frontier bound (R2: ring wraps; comp caches bound the seq) */
             if (mn > cap) mn = cap;
@@ -38551,6 +38876,16 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                 pfbase[b] = P;
                 pflen[b]  = S;
                 pfoff[b]  = 0u;
+                free(pfimg[b]); pfimg[b] = NULL; pfimg_n[b] = 0u;
+                if (vis_n != 0u) {
+                    pfimg[b] = xmalloc((size_t)vis_n * sizeof(ds4_vision_span));
+                    if (!pfimg[b]) { ok = false; break; }
+                    memcpy(pfimg[b], req.images, (size_t)vis_n * sizeof(ds4_vision_span));
+                    pfimg_n[b] = vis_n;
+                    fprintf(stderr, "ds4: cont visual admission bank=%u prompt=%u images=%u reuse=%u%s\n",
+                            b, L, vis_n, P,
+                            warm ? " (warm)" : fork ? " (fork)" : partial ? " (partial)" : "");
+                }
                 credit[b] = flen;   /* Inc 0b: the funded promise, released at row end */
                 btgt[b]   = (uint64_t)L + mn > seq_cap ? seq_cap
                                                        : (uint64_t)L + mn;   /* MT-1b: true target */
@@ -38688,6 +39023,7 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                             pfoff[b], pflen[b], ctx->bank_hist_valid[b] ? wm : 0u);
                     bcancel[b] = 0u;
                     free(pftok[b]); pftok[b] = NULL;
+                    free(pfimg[b]); pfimg[b] = NULL; pfimg_n[b] = 0u;
                     pflen[b] = pfoff[b] = 0u;
                     pfq_h = (pfq_h + 1u) % MS;
                     pfq_n--;
@@ -38738,13 +39074,72 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                     uint32_t W_eff = (interleave && n_live_now > 0u) ? W_live : W_boot;
                     W_eff = bg_prefill_width_clamp(g, W_eff);
                     if (n > W_eff) n = W_eff;
-                    final = pfoff[b] + n == pflen[b];
-                    ok = bg_prefill_rows(g, model, weights, b, pftok[b] + pfoff[b], n,
-                                         pfbase[b] + pfoff[b], final,
-                                         final ? seedlog : NULL);
+                    if (pfimg_n[b] != 0u) {
+                        /* Track B inc 6: an image block never splits across an
+                         * admission chunk (the serial chunk rule).  A block wider
+                         * than the live width takes the boot width; wider than
+                         * the ring-clamped boot width the admission fails by
+                         * name (n = 0 below). */
+                        uint32_t vchunk = 0;
+                        if (!ds4_deepseek4_prefill_chunk(pftok[b], pflen[b], DS4_N_VOCAB,
+                                                         pfoff[b], n, &vchunk) || vchunk == 0u) {
+                            const uint32_t W_max = bg_prefill_width_clamp(g, W_boot);
+                            uint32_t n2 = pflen[b] - pfoff[b];
+                            if (n2 > W_max) n2 = W_max;
+                            vchunk = 0;
+                            if (n2 <= n ||
+                                !ds4_deepseek4_prefill_chunk(pftok[b], pflen[b], DS4_N_VOCAB,
+                                                             pfoff[b], n2, &vchunk) || vchunk == 0u) {
+                                fprintf(stderr, "ds4: cont admission: image block at %u does not fit the admission ring (max chunk %u rows)\n",
+                                        pfbase[b] + pfoff[b], W_max);
+                                vchunk = 0;
+                            }
+                        }
+                        if (vchunk != 0u && vchunk != n)
+                            fprintf(stderr, "ds4: cont admission: image block kept whole: chunk @%u %u -> %u rows (bank %u)\n",
+                                    pfbase[b] + pfoff[b], n, vchunk, b);
+                        n = vchunk;
+                    }
+                    final = n != 0u && pfoff[b] + n == pflen[b];
+                    if (n == 0u) {
+                        ok = false;
+                    } else {
+                        if (pfimg_n[b] != 0u) {
+                            g->prefill_vision_spans = pfimg[b];
+                            g->prefill_vision_span_count = pfimg_n[b];
+                            g->prefill_has_visual = true;
+                            g->prefill_host_tokens = pftok[b];
+                            g->prefill_host_pos0 = pfbase[b];
+                            g->prefill_host_count = pflen[b];
+                            g->vision_map = ctx->e->vision_model.map;
+                            g->vision_size = ctx->e->vision_model.size;
+                            g->vision_weights = &ctx->e->vision_weights;
+                        }
+                        ok = bg_prefill_rows(g, model, weights, b, pftok[b] + pfoff[b], n,
+                                             pfbase[b] + pfoff[b], final,
+                                             final ? seedlog : NULL);
+                        if (pfimg_n[b] != 0u) {
+                            g->prefill_vision_spans = NULL;
+                            g->prefill_vision_span_count = 0;
+                            g->prefill_has_visual = false;
+                            g->prefill_host_tokens = NULL;
+                            g->prefill_host_pos0 = 0;
+                            g->prefill_host_count = 0;
+                            g->vision_map = NULL;
+                            g->vision_size = 0;
+                            g->vision_weights = NULL;
+                        }
+                    }
                 }
                 g->dspark_capture = false;
-                if (ok && final && pfbase[b] == 0u && pfoff[b] == 0u &&
+                if (ok && final && pfbase[b] == 0u && pfoff[b] == 0u && pfimg_n[b] != 0u &&
+                    logits_have_nonfinite(seedlog, DS4_N_VOCAB)) {
+                    /* inc 6: the one-shot retry below cannot scatter image rows;
+                     * a poisoned visual seed fails the admission by name. */
+                    fprintf(stderr, "ds4: cont prefill: nonfinite seed logits on an image admission (bank %u) -- admission fails\n", b);
+                    ok = false;
+                }
+                if (ok && final && pfbase[b] == 0u && pfoff[b] == 0u && pfimg_n[b] == 0u &&
                     logits_have_nonfinite(seedlog, DS4_N_VOCAB)) {
                     /* Validate before DSpark prefix injection.  If the cold
                      * target prefill poisoned the seed row, discard the bank
@@ -38818,6 +39213,7 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                             b, pfoff[b], pflen[b],
                             ctx->bank_hist_valid[b] ? pfbase[b] + pfoff[b] : 0u);
                     free(pftok[b]); pftok[b] = NULL;
+                    free(pfimg[b]); pfimg[b] = NULL; pfimg_n[b] = 0u;
                     pflen[b] = pfoff[b] = 0u;
                     pfq_h = (pfq_h + 1u) % MS;
                     pfq_n--;
@@ -38834,15 +39230,43 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
                     continue;
                 }
                 bank_hist_append_n(ctx, b, pftok[b] + pfoff[b], n);
+                if (pfimg_n[b] != 0u && ctx->bank_lineage &&
+                    !ds4_vision_lineage_append_in_range(&ctx->bank_lineage[b], pfimg[b], pfimg_n[b],
+                                                        pfbase[b] + pfoff[b], pfbase[b] + pfoff[b] + n)) {
+                    /* host OOM: quarantine the history rather than serve image
+                     * rows the lineage does not name (inc 8's rule). */
+                    ctx->bank_gen[b]++;
+                    ctx->bank_hist_valid[b] = 0u;
+                }
                 pfoff[b] += n;
                 ds4_metric_add(&ds4_metrics_get()->tokens_prefilled_computed, n);
                 ds4_metrics_window_add(0, 0, n);
                 if (final) {
+                    /* Track B inc 6 diagnostic: DS4_CONT_DUMP_SEED_LOGITS=path appends
+                     * one record per completed admission -- u32 bank, u32 prompt
+                     * length, float[DS4_N_VOCAB] final-chunk logits -- so a gate can
+                     * compare the batched PREFILL state against the serial lane's
+                     * logits at the same position, independently of decode drift. */
+                    {
+                        static const char *dump_path = NULL;
+                        static int dump_checked = 0;
+                        if (!dump_checked) { dump_checked = 1; dump_path = getenv("DS4_CONT_DUMP_SEED_LOGITS"); }
+                        if (dump_path && dump_path[0]) {
+                            FILE *df = fopen(dump_path, "ab");
+                            if (df) {
+                                const uint32_t hdr[2] = { b, pfbase[b] + pflen[b] };
+                                fwrite(hdr, sizeof(uint32_t), 2, df);
+                                fwrite(seedlog, sizeof(float), DS4_N_VOCAB, df);
+                                fclose(df);
+                            }
+                        }
+                    }
                     /* prefill complete: release the pending state, sample the seed
                      * token, stream it, and make the bank live (or finish at seed). */
                     const uint32_t Ltot = pfbase[b] + pflen[b];
                     const double   tadm = pft0[b];
                     free(pftok[b]); pftok[b] = NULL;
+                    free(pfimg[b]); pfimg[b] = NULL; pfimg_n[b] = 0u;
                     pflen[b] = pfoff[b] = 0u;
                     pfq_h = (pfq_h + 1u) % MS;
                     pfq_n--;
@@ -39989,6 +40413,8 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
 
     if (gbuf) for (uint32_t b = 0; b < MS; b++) free(gbuf[b]);
     if (pftok) for (uint32_t b = 0; b < MS; b++) free(pftok[b]);
+    if (pfimg) for (uint32_t b = 0; b < MS; b++) free(pfimg[b]);
+    free(pfimg); free(pfimg_n);
     free(live); free(usr); free(posv); free(cur); free(beos); free(bmax); free(glen); free(gbuf);
     free(btemp); free(btopk); free(btopp); free(bminp); free(brng); free(bsoc);
     free(balive);
@@ -41047,6 +41473,9 @@ int ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_t
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) { (void)ctx; }
 int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
 uint64_t ds4_batch_ctx_bank_generation(const ds4_batch_ctx *ctx, int bank) { (void)ctx; (void)bank; return 0u; }
+size_t ds4_batch_ctx_bank_lineage(const ds4_batch_ctx *ctx, int bank, const ds4_vision_identity **out) {
+    (void)ctx; (void)bank; if (out) *out = NULL; return 0;
+}
 int ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
 int ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
 int ds4_batch_ctx_commit_rate(const ds4_batch_ctx *ctx,
@@ -42265,13 +42694,51 @@ static int ds4_engine_vision_encode_image(ds4_engine *e, const ds4_image *image,
             return 0;
         }
     }
+    /* Track B inc 9: the encoder's transient device scratch is the one new
+     * memory term of the image lanes.  Publish it as the VISION_ENCODER lease
+     * for the duration of the encode, refuse by name when the governor says
+     * so (before any device work), and attribute every allocation inside to
+     * its own census class.  The encode runs on the vision lane (own stream +
+     * cuBLAS handle, stream sync at the end), so it may run on the request
+     * thread while the worker decodes. */
+    const uint64_t need = ds4_vision_encoder_scratch_bytes(patches.grid_height, patches.grid_width);
+    {
+        ds4_gov_claim cl = {0};
+        cl.requester = DS4_GOVC_VISION_ENCODER;
+        cl.memc = DS4_MEMC_VISION_ENCODER;
+        cl.domain = DS4_MEMD_UNIFIED_DEVICE;
+        cl.proposed_outstanding = need;
+        cl.operation_transient = need;
+        const int gv = ds4_gov_governed_check("vision_encode", &cl, DS4_GOV_ADMIT);
+        if (gv != DS4_GOV_ADMIT) {
+            if (error && error_cap)
+                snprintf(error, error_cap,
+                         "vision encoder refused by the memory governor (%.1f MiB of encoder scratch, status %d)",
+                         (double)need / 1048576.0, gv);
+            ds4_deepseek4_image_patches_free(&patches);
+            return 0;
+        }
+    }
     float *embedding = malloc((size_t)token_count * 4096u * sizeof(float));
     int ok = 0;
     if (embedding) {
+        ds4_gov_publish_use(DS4_GOVC_VISION_ENCODER, need, 0);
+        ds4_gpu_mem_scope_begin(DS4_MEMC_VISION_ENCODER);
+        const int lane = ds4_gpu_vision_lane_begin();
         ok = ds4_gpu_deepseek4_vision_encode(embedding, patches.patches,
                                              patches.grid_height, patches.grid_width,
                                              e->vision_model.map, e->vision_model.size,
                                              &e->vision_weights);
+        if (lane && !ds4_gpu_vision_lane_end()) ok = 0;
+        ds4_gpu_mem_scope_end();
+        ds4_gov_publish_use(DS4_GOVC_VISION_ENCODER, 0, 0);
+        static bool lane_announced = false;
+        if (ok && !lane_announced) {
+            lane_announced = true;
+            fprintf(stderr, "ds4: vision encoder lane %s (scratch %.1f MiB for %ux%u rows)\n",
+                    lane ? "engaged: own stream + cuBLAS handle" : "unavailable: legacy stream",
+                    (double)need / 1048576.0, patches.grid_height, patches.grid_width);
+        }
     }
     out->content_width = patches.content_width;
     out->content_height = patches.content_height;

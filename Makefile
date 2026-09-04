@@ -266,6 +266,16 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ tests/vision_serial_probe.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
+tests/vision_cont_probe.o: tests/vision_cont_probe.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ tests/vision_cont_probe.c
+
+tests/vision_cont_probe: tests/vision_cont_probe.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(CFLAGS) -o $@ tests/vision_cont_probe.o $(CORE_OBJS) $(METAL_LDLIBS)
+else
+	$(NVCC) $(NVCCFLAGS) -o $@ tests/vision_cont_probe.o $(CORE_OBJS) $(CUDA_LDLIBS)
+endif
+
 tests/vision_cache_probe.o: tests/vision_cache_probe.c ds4.h ds4_kvstore.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/vision_cache_probe.c
 

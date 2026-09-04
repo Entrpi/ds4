@@ -320,6 +320,45 @@ int      ds4_vision_prompt_first_image_row(const ds4_tokens *prompt, int from);
 size_t   ds4_vision_spans_retain(const ds4_vision_span *images, size_t n,
                                  uint32_t tail_start, uint32_t bottom, uint32_t dst_start,
                                  ds4_vision_span *out, bool *kept);
+/* Track B inc 6 (batched admission; pure, unit-pinned).
+ * ds4_vision_spans_admit_check classifies a request's spans against a reuse
+ * point P (0 = cold) and the bank lineage the prefix would be reused from:
+ *   DS4_VISION_ADMIT_OK      every span below P is a recorded block (start,
+ *                            count, identity) and every span at/after P
+ *                            carries data;
+ *   DS4_VISION_ADMIT_COLD    a span straddles P, or a prefix span is not the
+ *                            recorded block, or the lineage records a block
+ *                            below P the request does not reproduce: the
+ *                            caller degrades the admission to cold;
+ *   DS4_VISION_ADMIT_REJECT  a span at/after P has no data (nothing can
+ *                            prefill it): the admission is refused.
+ * err names the block.  With P = 0 the lineage is ignored. */
+#define DS4_VISION_ADMIT_OK     0
+#define DS4_VISION_ADMIT_COLD   1
+#define DS4_VISION_ADMIT_REJECT 2
+int      ds4_vision_spans_admit_check(const ds4_vision_span *images, size_t n, uint32_t P,
+                                      const ds4_vision_identity *lineage, size_t lineage_n,
+                                      char *err, size_t errlen);
+/* Cap a partial-fork replay base R so it never lands inside a recorded block:
+ * R moves down to the start of the block it would cut, then down to a
+ * multiple of align.  Returns the capped R (0 = no reuse worth having). */
+uint32_t ds4_vision_lineage_cut_cap(const ds4_vision_identity *lineage, size_t lineage_n,
+                                    uint32_t R, uint32_t align);
+/* True when the identity list covers EXACTLY the synthetic rows (id >= n_vocab)
+ * of tokens[0..n_tokens): entries in order, non-overlapping, each over image
+ * rows only, and no image row outside an entry.  The consistency check a bank
+ * payload writer and the admission commit both apply. */
+bool     ds4_vision_identities_cover_rows(const ds4_vision_identity *v, size_t n,
+                                          const int *tokens, uint32_t n_tokens, uint32_t n_vocab);
+/* The blocks of `images` that lie wholly inside [lo, hi) appended to the
+ * lineage (the chunk-commit step; chunks never split a block).  Returns 0 on
+ * allocation failure (the lineage is left as it was). */
+int      ds4_vision_lineage_append_in_range(ds4_vision_lineage *l, const ds4_vision_span *images,
+                                            size_t n, uint32_t lo, uint32_t hi);
+/* Inc 9: the encoder's per-encode device scratch for an image whose LLM grid is
+ * grid_h x grid_w rows (the 14 transient allocations + the BF16 staging), the
+ * intent published to the memory governor before the allocations run. */
+uint64_t ds4_vision_encoder_scratch_bytes(uint32_t grid_h, uint32_t grid_w);
 int ds4_engine_layer_count(ds4_engine *e);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
@@ -775,6 +814,19 @@ typedef struct {
      * source ring that no longer covers the replay's attention window)
      * degrade to cold like any other validation failure. */
     int        fork_bank;   /* source bank id + 1; 0 = no fork                */
+    /* Track B inc 6: the prompt's image blocks, in tokens[] coordinates
+     * (ds4_vision_spans_validate shape: one span per complete DeepSeek image
+     * block, in order).  A span at or past the prefill point carries its
+     * embedding, which the CALLER keeps valid until on_done -- the chunks run
+     * interleaved with decode and the engine borrows the rows, it never copies
+     * them.  A span inside a reused prefix (warm/fork/partial) may be a
+     * REFERENCE span (data NULL): the engine validates (start, count,
+     * identity) against the bank's recorded lineage and DEGRADES TO COLD on
+     * any mismatch or a block that straddles the reuse point, exactly like
+     * the frontier memcmp.  A data-less span the engine would have to
+     * prefill rejects the admission.  NULL/0 = a text request (unchanged). */
+    const ds4_vision_span *images;
+    size_t     image_count;
 } ds4_cont_request;
 /* A2a: a bank's committed token history (engine-authoritative bookkeeping for
  * warm start).  *toks points at ctx-owned storage, valid until the next admit
@@ -793,6 +845,13 @@ int  ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank,
  * exact content with equality checks alone -- no memcmp, no ABA.  Returns 0
  * for NULL ctx or out-of-range bank (0 is never a live generation). */
 uint64_t ds4_batch_ctx_bank_generation(const ds4_batch_ctx *ctx, int bank);
+/* Track B inc 6: the bank's ORDERED image lineage (identities in token order,
+ * bank coordinates), maintained at exactly the points bank_hist commits.  The
+ * pointer is ctx-owned and valid until the next event that touches the bank.
+ * Returns the block count; 0 (and *out = NULL) when the bank is out of range
+ * or its history is not reuse-trustworthy. */
+size_t   ds4_batch_ctx_bank_lineage(const ds4_batch_ctx *ctx, int bank,
+                                    const ds4_vision_identity **out);
 /* admit: fill *req for the next waiting request and return 1; return 0 when none is
  *   available right now (the loop keeps decoding the active set and ends once the
  *   active set is empty AND admit returns 0).
