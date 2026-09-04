@@ -424,8 +424,21 @@ static bool content_block_type_is_media(const char *t) {
 
 static void content_reject_media(const char *t) {
     snprintf(g_content_reject, sizeof g_content_reject,
-             "content block type \"%s\" is not supported: image and file input is not "
-             "implemented in this build (text only)", t ? t : "?");
+             "content block type \"%s\" is not supported: this build accepts text and "
+             "base64 JPEG/PNG images (image_url, image, input_image); audio, video and "
+             "file input are not implemented", t ? t : "?");
+}
+
+static void content_reject_set(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_content_reject, sizeof g_content_reject, fmt, ap);
+    va_end(ap);
+}
+
+static void content_reject_image_position(void) {
+    content_reject_set("image content is accepted only inside user messages "
+                       "(not in system prompts, assistant turns, or tool results)");
 }
 
 /* Hand the recorded reason to a request parser's error buffer (once). */
@@ -443,7 +456,376 @@ static void content_reject_take(char *err, size_t errlen) {
     }
 }
 
+/* ---- Track B inc 7: image content blocks --------------------------------
+ * A parser decodes each accepted image block (base64 JPEG/PNG) into the
+ * request thread's image pool and leaves a PLACEHOLDER marker in the message
+ * text where the image sits: the kvstore marker shape
+ * (\036DS4_IMAGE_<64 hex>\037) whose hex is a per-process random nonce
+ * followed by the pool index, so the seam that finishes the request can
+ * recognize it and client text cannot forge it (a request that carries
+ * images escapes client 0x1E/0x1F at render time).  The seam
+ * (request_tokenize_prompt) encodes each pooled image on the request thread,
+ * lays the block into the token stream at the marker, and rewrites the
+ * placeholder to the block's identity marker, so prompt_text ends up exactly
+ * the key the kvstore renders for the same tokens (inc 8).  Text-only
+ * requests never touch any of this: their render and tokenization are byte
+ * for byte what they were before inc 7. */
+typedef struct { uint8_t *bytes; size_t len; } image_blob;
+static __thread struct { image_blob *v; size_t len, cap; } t_image_pool;
+static uint8_t g_image_nonce[24];
+static char g_image_nonce_hex[48];
+static pthread_once_t g_image_nonce_once = PTHREAD_ONCE_INIT;
+static void image_nonce_init(void) {
+    if (!random_bytes(g_image_nonce, sizeof g_image_nonce)) {
+        const uint64_t t = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32);
+        for (size_t i = 0; i < sizeof g_image_nonce; i++)
+            g_image_nonce[i] = (uint8_t)((t >> ((i % 8) * 8)) ^ (i * 0x9du));
+    }
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof g_image_nonce; i++) {
+        g_image_nonce_hex[2 * i] = hex[g_image_nonce[i] >> 4];
+        g_image_nonce_hex[2 * i + 1] = hex[g_image_nonce[i] & 15];
+    }
+}
+static size_t image_pool_count(void) { return t_image_pool.len; }
+static void image_pool_clear(void) {
+    for (size_t i = 0; i < t_image_pool.len; i++) free(t_image_pool.v[i].bytes);
+    free(t_image_pool.v);
+    memset(&t_image_pool, 0, sizeof t_image_pool);
+}
+static const image_blob *image_pool_get(size_t i) {
+    return i < t_image_pool.len ? &t_image_pool.v[i] : NULL;
+}
+/* Takes ownership of bytes; returns the pool index. */
+static size_t image_pool_push(uint8_t *bytes, size_t len) {
+    if (t_image_pool.len == t_image_pool.cap) {
+        t_image_pool.cap = t_image_pool.cap ? t_image_pool.cap * 2 : 4;
+        t_image_pool.v = xrealloc(t_image_pool.v, t_image_pool.cap * sizeof *t_image_pool.v);
+    }
+    t_image_pool.v[t_image_pool.len].bytes = bytes;
+    t_image_pool.v[t_image_pool.len].len = len;
+    return t_image_pool.len++;
+}
+static void image_placeholder_marker(size_t index, char out[DS4_KVSTORE_IMAGE_MARKER_LEN + 1]) {
+    pthread_once(&g_image_nonce_once, image_nonce_init);
+    uint8_t id[32];
+    memcpy(id, g_image_nonce, sizeof g_image_nonce);
+    for (int i = 0; i < 8; i++) id[24 + i] = (uint8_t)((uint64_t)index >> (8 * (7 - i)));
+    ds4_kvstore_image_marker(id, out);
+}
+/* True when identity is one of this process's placeholders (*index = slot). */
+static bool image_placeholder_index(const uint8_t identity[32], size_t *index) {
+    pthread_once(&g_image_nonce_once, image_nonce_init);
+    if (memcmp(identity, g_image_nonce, sizeof g_image_nonce) != 0) return false;
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 8) | identity[24 + i];
+    *index = (size_t)v;
+    return true;
+}
+/* A well-formed placeholder marker starts at p (n bytes available)? */
+static bool image_placeholder_at(const char *p, size_t n) {
+    pthread_once(&g_image_nonce_once, image_nonce_init);
+    if (n < DS4_KVSTORE_IMAGE_MARKER_LEN) return false;
+    if (memcmp(p, DS4_KVSTORE_IMAGE_MARKER_PREFIX, DS4_KVSTORE_IMAGE_MARKER_PREFIX_LEN) != 0) return false;
+    const char *h = p + DS4_KVSTORE_IMAGE_MARKER_PREFIX_LEN;
+    if (memcmp(h, g_image_nonce_hex, sizeof g_image_nonce_hex) != 0) return false;
+    for (size_t i = sizeof g_image_nonce_hex; i < DS4_KVSTORE_IMAGE_MARKER_HEX_LEN; i++)
+        if (!((h[i] >= '0' && h[i] <= '9') || (h[i] >= 'a' && h[i] <= 'f'))) return false;
+    return h[DS4_KVSTORE_IMAGE_MARKER_HEX_LEN] == '\037';
+}
+/* Client text into a rendered prompt.  When the request carries images every
+ * 0x1E/0x1F of client text is escaped exactly as the kvstore renderer escapes
+ * token pieces (a marker cannot be forged and the rendered text stays the
+ * byte key of its tokens); the parser's own placeholders pass through.  A
+ * text-only request is appended byte for byte. */
+static void buf_append_text(buf *b, const char *p, size_t n, bool esc) {
+    if (!esc) {
+        buf_append(b, p, n);
+        return;
+    }
+    for (size_t i = 0; i < n;) {
+        if (p[i] == '\036' && image_placeholder_at(p + i, n - i)) {
+            buf_append(b, p + i, DS4_KVSTORE_IMAGE_MARKER_LEN);
+            i += DS4_KVSTORE_IMAGE_MARKER_LEN;
+            continue;
+        }
+        if (p[i] == '\036' || p[i] == '\037') buf_putc(b, '\036');
+        buf_putc(b, p[i++]);
+    }
+}
+static void buf_puts_text(buf *b, const char *s, bool esc) {
+    if (!s) s = "";
+    buf_append_text(b, s, strlen(s), esc);
+}
+
+/* base64 (standard or URL-safe alphabet, padding optional, whitespace
+ * skipped).  NULL on a byte outside the alphabet, junk after the padding, or
+ * a dangling sextet that encodes no byte. */
+static uint8_t *base64_decode(const char *s, size_t n, size_t *out_len) {
+    uint8_t *out = xmalloc(n / 4 * 3 + 3);
+    size_t o = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    bool pad = false;
+    for (size_t i = 0; i < n; i++) {
+        const char c = s[i];
+        int v;
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+        if (c == '=') { pad = true; continue; }
+        if (pad) { free(out); return NULL; }
+        if (c >= 'A' && c <= 'Z') v = c - 'A';
+        else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
+        else if (c >= '0' && c <= '9') v = c - '0' + 52;
+        else if (c == '+' || c == '-') v = 62;
+        else if (c == '/' || c == '_') v = 63;
+        else { free(out); return NULL; }
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[o++] = (uint8_t)(acc >> bits);
+            acc &= (1u << bits) - 1u;
+        }
+    }
+    if (bits >= 6) { free(out); return NULL; }
+    *out_len = o;
+    return out;
+}
+
+/* "data:image/<fmt>;base64,<bytes>" -> decoded bytes (the image codec sniffs
+ * the real format).  Anything else is refused BY NAME into the content
+ * rejection slot: remote URLs and file paths are never fetched. */
+static bool image_data_uri_decode(const char *uri, const char *field, uint8_t **bytes, size_t *len) {
+    if (!uri || strncmp(uri, "data:", 5) != 0) {
+        content_reject_set("%s must be a data: URI carrying base64 JPEG or PNG bytes "
+                           "(\"data:image/png;base64,...\"); remote URLs and file paths are not fetched",
+                           field);
+        return false;
+    }
+    const char *hdr = uri + 5;
+    const char *comma = strchr(hdr, ',');
+    if (!comma) {
+        content_reject_set("%s: data URI has no payload", field);
+        return false;
+    }
+    bool b64 = false;
+    for (const char *q = hdr; q < comma;) {
+        const char *e = memchr(q, ';', (size_t)(comma - q));
+        if (!e) e = comma;
+        if (e - q == 6 && !strncmp(q, "base64", 6)) b64 = true;
+        q = e + 1;
+    }
+    if (!b64) {
+        content_reject_set("%s: data URI must be base64 (\"data:image/png;base64,...\")", field);
+        return false;
+    }
+    if (comma - hdr < 6 || strncmp(hdr, "image/", 6) != 0) {
+        content_reject_set("%s: data URI media type must be image/* (JPEG or PNG)", field);
+        return false;
+    }
+    size_t n = 0;
+    uint8_t *b = base64_decode(comma + 1, strlen(comma + 1), &n);
+    if (!b) {
+        content_reject_set("%s: image payload is not valid base64", field);
+        return false;
+    }
+    if (n == 0) {
+        free(b);
+        content_reject_set("%s: image payload is empty", field);
+        return false;
+    }
+    *bytes = b;
+    *len = n;
+    return true;
+}
+static bool image_base64_field_decode(const char *data, const char *field, uint8_t **bytes, size_t *len) {
+    size_t n = 0;
+    uint8_t *b = data ? base64_decode(data, strlen(data), &n) : NULL;
+    if (!b) {
+        content_reject_set("%s is not valid base64", field);
+        return false;
+    }
+    if (n == 0) {
+        free(b);
+        content_reject_set("%s is empty", field);
+        return false;
+    }
+    *bytes = b;
+    *len = n;
+    return true;
+}
+/* Pool the decoded image and put its placeholder where the block sits. */
+static void image_block_accept(buf *b, uint8_t *bytes, size_t len) {
+    const size_t idx = image_pool_push(bytes, len);
+    char marker[DS4_KVSTORE_IMAGE_MARKER_LEN + 1];
+    image_placeholder_marker(idx, marker);
+    buf_puts(b, marker);
+}
+/* The value of an image_url member: a bare string, or {"url": ..., "detail": ...}. */
+static bool json_image_url_value(const char **p, char **out) {
+    json_ws(p);
+    if (**p == '"') return json_string(p, out);
+    if (**p != '{') return json_skip_value(p);
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "url")) {
+            free(*out);
+            *out = NULL;
+            if (!json_string(p, out)) {
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+/* One typed object of a chat-completions content array into b.  Text blocks
+ * append their text (several text members concatenate, type before or after
+ * text); image_url blocks pool the image and append its placeholder when the
+ * caller allows images here; every other media type refuses by name. */
+static bool json_content_part(const char **p, buf *b, bool allow_images) {
+    bool ok = false;
+    char *type = NULL, *image_url = NULL;
+    buf text = {0};
+    bool has_text = false;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto done;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto done;
+        }
+        (*p)++;
+        if (!strcmp(key, "text")) {
+            char *t = NULL;
+            if (!json_string(p, &t)) {
+                free(key);
+                goto done;
+            }
+            buf_puts(&text, t);
+            has_text = true;
+            free(t);
+        } else if (!strcmp(key, "type")) {
+            json_ws(p);
+            if (**p == '"') {
+                free(type);
+                type = NULL;
+                if (!json_string(p, &type)) {
+                    free(key);
+                    goto done;
+                }
+            } else if (!json_skip_value(p)) {
+                free(key);
+                goto done;
+            }
+        } else if (!strcmp(key, "image_url")) {
+            free(image_url);
+            image_url = NULL;
+            if (!json_image_url_value(p, &image_url)) {
+                free(key);
+                goto done;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            goto done;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') goto done;
+    (*p)++;
+    if (type && !strcmp(type, "image_url")) {
+        uint8_t *bytes = NULL;
+        size_t len = 0;
+        if (!allow_images) {
+            content_reject_image_position();
+            goto done;
+        }
+        if (!image_url) {
+            content_reject_set("image_url block has no url");
+            goto done;
+        }
+        if (!image_data_uri_decode(image_url, "image_url", &bytes, &len)) goto done;
+        image_block_accept(b, bytes, len);
+    } else if (content_block_type_is_media(type)) {
+        content_reject_media(type);
+        goto done;
+    } else if (has_text) {
+        buf_append(b, text.ptr, text.len);
+    }
+    ok = true;
+done:
+    free(type);
+    free(image_url);
+    buf_free(&text);
+    return ok;
+}
+/* Anthropic image block "source": {"type": "base64"|"url", "media_type", "data", "url"}. */
+static bool json_anthropic_source(const char **p, char **type, char **media, char **data) {
+    json_ws(p);
+    if (**p != '{') return json_skip_value(p);
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        char **dst = !strcmp(key, "type") ? type :
+                     !strcmp(key, "media_type") ? media :
+                     !strcmp(key, "data") ? data : NULL;
+        if (dst) {
+            free(*dst);
+            *dst = NULL;
+            if (!json_string(p, dst)) {
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+static bool json_content_ex(const char **p, char **out, bool allow_images);
 static bool json_content(const char **p, char **out) {
+    return json_content_ex(p, out, false);
+}
+static bool json_content_ex(const char **p, char **out, bool allow_images) {
     json_ws(p);
     if (**p == '"') return json_string(p, out);
     if (json_lit(p, "null")) {
@@ -467,54 +849,7 @@ static bool json_content(const char **p, char **out) {
             free(s);
         } else if (**p == '{') {
             (*p)++;
-            json_ws(p);
-            while (**p && **p != '}') {
-                char *key = NULL;
-                if (!json_string(p, &key)) goto fail;
-                json_ws(p);
-                if (**p != ':') {
-                    free(key);
-                    goto fail;
-                }
-                (*p)++;
-                if (!strcmp(key, "text")) {
-                    char *s = NULL;
-                    if (!json_string(p, &s)) {
-                        free(key);
-                        goto fail;
-                    }
-                    buf_puts(&b, s);
-                    free(s);
-                } else if (!strcmp(key, "type")) {
-                    json_ws(p);
-                    if (**p == '"') {
-                        char *t = NULL;
-                        if (!json_string(p, &t)) {
-                            free(key);
-                            goto fail;
-                        }
-                        if (content_block_type_is_media(t)) {
-                            content_reject_media(t);
-                            free(t);
-                            free(key);
-                            goto fail;
-                        }
-                        free(t);
-                    } else if (!json_skip_value(p)) {
-                        free(key);
-                        goto fail;
-                    }
-                } else if (!json_skip_value(p)) {
-                    free(key);
-                    goto fail;
-                }
-                free(key);
-                json_ws(p);
-                if (**p == ',') (*p)++;
-                json_ws(p);
-            }
-            if (**p != '}') goto fail;
-            (*p)++;
+            if (!json_content_part(p, &b, allow_images)) goto fail;
         } else if (!json_skip_value(p)) {
             goto fail;
         }
@@ -888,6 +1223,7 @@ static float server_default_temperature(void) {
 }
 
 static void request_init(request *r, req_kind kind, int max_tokens) {
+    image_pool_clear();   /* inc 7: a parse starts with an empty image pool */
     memset(r, 0, sizeof(*r));
     r->kind = kind;
     r->api = API_OPENAI;
@@ -921,6 +1257,96 @@ static void request_free(request *r) {
     free(r->anthropic_live_suffix_text);
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
+}
+
+static void server_log(ds4_log_type type, const char *fmt, ...);
+
+/* inc 7: finish a parsed request's prompt.  A text-only request tokenizes its
+ * rendered text exactly as before.  A request that pooled images walks the
+ * rendered text marker by marker: each text run is unescaped and tokenized,
+ * each placeholder encodes its pooled image (the inc 9 lane, on this thread),
+ * lays the block into the token stream (ds4_prompt_append_vision: the span
+ * records its token start, the embedding moves into it) and is rewritten to
+ * the block's identity marker, so prompt_text becomes the byte key the
+ * kvstore renders for these tokens (inc 8).  Refuses by name without an
+ * encoder; on failure the request is left without a prompt (caller frees). */
+static bool request_tokenize_prompt(ds4_engine *e, request *r, char *err, size_t errlen) {
+    const size_t n_pool = image_pool_count();
+    if (n_pool == 0) {
+        ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+        return true;
+    }
+    if (!e || !ds4_engine_has_vision(e)) {
+        snprintf(err, errlen, "image input needs the Vision-Exp encoder sidecar "
+                              "(start ds4-server with --vision FILE); this server serves text only");
+        image_pool_clear();
+        return false;
+    }
+    char *text = r->prompt_text;
+    const size_t len = strlen(text);
+    uint8_t id[32];
+    size_t pos = 0, n_markers = 0;
+    int rc;
+    while ((rc = ds4_kvstore_text_next_marker(text, len, &pos, id)) == 1) {
+        n_markers++;
+        pos += DS4_KVSTORE_IMAGE_MARKER_LEN;
+    }
+    if (rc < 0 || n_markers == 0) {
+        snprintf(err, errlen, "image request: the rendered prompt carries %s image marker",
+                 rc < 0 ? "a malformed" : "no");
+        image_pool_clear();
+        return false;
+    }
+    r->images = xmalloc(n_markers * sizeof *r->images);
+    memset(r->images, 0, n_markers * sizeof *r->images);
+    r->image_count = 0;
+    size_t run = 0;
+    pos = 0;
+    while ((rc = ds4_kvstore_text_next_marker(text, len, &pos, id)) == 1) {
+        if (pos > run) {
+            size_t ulen = 0;
+            char *u = ds4_kvstore_unescape_text(text + run, pos - run, &ulen);
+            ds4_tokenize_rendered_chat(e, u, &r->prompt);
+            free(u);
+        }
+        size_t index = 0;
+        const image_blob *blob = image_placeholder_index(id, &index) ? image_pool_get(index) : NULL;
+        if (!blob) {
+            snprintf(err, errlen, "image request: a marker in the rendered prompt names no image of this request");
+            goto fail;
+        }
+        ds4_vision_embedding emb = {0};
+        if (!ds4_engine_vision_encode_memory(e, blob->bytes, blob->len, &emb, err, errlen)) goto fail;
+        ds4_vision_span *span = &r->images[r->image_count];
+        if (!ds4_prompt_append_vision(e, &r->prompt, span, &emb, err, errlen)) {
+            ds4_vision_embedding_free(&emb);
+            goto fail;
+        }
+        r->image_count++;
+        char marker[DS4_KVSTORE_IMAGE_MARKER_LEN + 1];
+        ds4_kvstore_image_marker(span->embedding.identity, marker);
+        memcpy(text + pos, marker, DS4_KVSTORE_IMAGE_MARKER_LEN);
+        pos += DS4_KVSTORE_IMAGE_MARKER_LEN;
+        run = pos;
+    }
+    if (len > run) {
+        size_t ulen = 0;
+        char *u = ds4_kvstore_unescape_text(text + run, len - run, &ulen);
+        ds4_tokenize_rendered_chat(e, u, &r->prompt);
+        free(u);
+    }
+    image_pool_clear();
+    server_log(DS4_LOG_PREFILL, "ds4-server: image request images=%zu prompt=%d",
+               r->image_count, r->prompt.len);
+    return true;
+fail:
+    for (size_t i = 0; i < r->image_count; i++) ds4_vision_embedding_free(&r->images[i].embedding);
+    free(r->images);
+    r->images = NULL;
+    r->image_count = 0;
+    ds4_tokens_free(&r->prompt);
+    image_pool_clear();
+    return false;
 }
 
 /* Inc 0b: route-invariant decode budget -- three states, one meaning on
@@ -1980,6 +2406,7 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         if (**p != '{') return false;
         (*p)++;
         chat_msg msg = {0};
+        const size_t pool_before = image_pool_count();   /* inc 7 */
         json_ws(p);
         while (**p && **p != '}') {
             char *key = NULL;
@@ -1998,7 +2425,7 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                 }
             } else if (!strcmp(key, "content")) {
                 free(msg.content);
-                if (!json_content(p, &msg.content)) {
+                if (!json_content_ex(p, &msg.content, true)) {   /* inc 7: images ride user content */
                     free(key);
                     goto fail;
                 }
@@ -2035,6 +2462,10 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
+        if (image_pool_count() > pool_before && strcmp(msg.role, "user") != 0) {
+            content_reject_image_position();   /* inc 7: role may follow content */
+            goto fail;
+        }
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -2073,6 +2504,7 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     char *name = NULL;
     char *input = NULL;
     char *tool_result = NULL;
+    char *src_type = NULL, *src_media = NULL, *src_data = NULL;   /* inc 7: image source */
 
     json_ws(p);
     while (**p && **p != '}') {
@@ -2126,6 +2558,11 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "source")) {
+            if (!json_anthropic_source(p, &src_type, &src_media, &src_data)) {
+                free(key);
+                goto bad;
+            }
         } else if (!json_skip_value(p)) {
             free(key);
             goto bad;
@@ -2158,8 +2595,30 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         buf_puts(&b, "</tool_result>");
         free(msg->content);
         msg->content = buf_take(&b);
+    } else if (type && !strcmp(type, "image")) {
+        /* inc 7: a base64 JPEG/PNG source is pooled and placed; a url source
+         * is refused by name (never fetched). */
+        uint8_t *bytes = NULL;
+        size_t len = 0;
+        if (!src_type || strcmp(src_type, "base64") != 0) {
+            content_reject_set("image source type \"%s\" is not supported: send "
+                               "{\"type\":\"base64\",\"media_type\":\"image/png\" or "
+                               "\"image/jpeg\",\"data\":...} (remote URLs and files are not fetched)",
+                               src_type ? src_type : "?");
+            goto bad;
+        }
+        if (src_media && strncmp(src_media, "image/", 6) != 0) {
+            content_reject_set("image media_type must be image/* (JPEG or PNG), not \"%s\"", src_media);
+            goto bad;
+        }
+        if (!image_base64_field_decode(src_data, "image source data", &bytes, &len)) goto bad;
+        buf b = {0};
+        buf_puts(&b, msg->content ? msg->content : "");
+        image_block_accept(&b, bytes, len);
+        free(msg->content);
+        msg->content = buf_take(&b);
     } else if (content_block_type_is_media(type)) {
-        /* Anthropic image/document blocks: refuse, never flatten. */
+        /* Anthropic document/file blocks: refuse, never flatten. */
         content_reject_media(type);
         goto bad;
     } else {
@@ -2186,6 +2645,9 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     free(name);
     free(input);
     free(tool_result);
+    free(src_type);
+    free(src_media);
+    free(src_data);
     return true;
 bad:
     free(type);
@@ -2195,6 +2657,9 @@ bad:
     free(name);
     free(input);
     free(tool_result);
+    free(src_type);
+    free(src_media);
+    free(src_data);
     return false;
 }
 
@@ -2243,6 +2708,7 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
         if (**p != '{') return false;
         (*p)++;
         chat_msg msg = {0};
+        const size_t pool_before = image_pool_count();   /* inc 7 */
         json_ws(p);
         while (**p && **p != '}') {
             char *key = NULL;
@@ -2279,6 +2745,10 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
+        if (image_pool_count() > pool_before && strcmp(msg.role, "user") != 0) {
+            content_reject_image_position();   /* inc 7: role may follow content */
+            goto fail;
+        }
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -2672,6 +3142,40 @@ static bool live_tail_has_reminder(const char *tail) {
     return tail && strstr(tail, DS4_TOOL_CALL_REMINDER_TEXT) != NULL;
 }
 
+
+/* inc 7: the escape-aware twins of the render helpers.  With esc, the
+ * helper's whole output (its client text plus its own template bytes, which
+ * carry no 0x1E/0x1F) is escaped as one segment. */
+static void append_tools_prompt_text_esc(buf *b, const char *tool_schemas, bool esc) {
+    if (!esc) {
+        append_tools_prompt_text(b, tool_schemas);
+        return;
+    }
+    buf t = {0};
+    append_tools_prompt_text(&t, tool_schemas);
+    buf_append_text(b, t.ptr ? t.ptr : "", t.len, true);
+    buf_free(&t);
+}
+static void append_tool_result_text_esc(buf *b, const char *text, bool esc) {
+    if (!esc) {
+        append_tool_result_text(b, text);
+        return;
+    }
+    buf t = {0};
+    append_tool_result_text(&t, text);
+    buf_append_text(b, t.ptr ? t.ptr : "", t.len, true);
+    buf_free(&t);
+}
+static void append_dsml_tool_calls_text_esc(buf *b, const tool_calls *calls, bool esc) {
+    if (!esc) {
+        append_dsml_tool_calls_text(b, calls);
+        return;
+    }
+    buf t = {0};
+    append_dsml_tool_calls_text(&t, calls);
+    buf_append_text(b, t.ptr ? t.ptr : "", t.len, true);
+    buf_free(&t);
+}
 /* Core renderer.  mark_idx/mark_out are the live-tail extraction hook: when
  * mark_idx names a message index, *mark_out reports the byte offset of out at
  * the top of that message's loop iteration -- i.e. where that message's bytes
@@ -2682,6 +3186,7 @@ static char *render_chat_prompt_text_mark(const chat_msgs *msgs, const char *too
                                           ds4_think_mode think_mode,
                                           int mark_idx, size_t *mark_out) {
     (void)tool_orders;
+    const bool esc = image_pool_count() > 0;   /* inc 7: an image request escapes client text */
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     int last_user_idx = -1;
@@ -2690,13 +3195,13 @@ static char *render_chat_prompt_text_mark(const chat_msgs *msgs, const char *too
      * --kv-cache-boundary-trim-tokens chops a dynamic tail from the client
      * message instead of the much larger tool-schema region. */
     if (tool_schemas && tool_schemas[0]) {
-        append_tools_prompt_text(&system, tool_schemas);
+        append_tools_prompt_text_esc(&system, tool_schemas, esc);
     }
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (!role_is_system(m->role)) continue;
         if (system.len) buf_puts(&system, "\n\n");
-        buf_puts(&system, m->content ? m->content : "");
+        buf_puts_text(&system, m->content, esc);
     }
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
@@ -2739,19 +3244,19 @@ static char *render_chat_prompt_text_mark(const chat_msgs *msgs, const char *too
                 }
             }
             if (inject_at) {
-                buf_append(&out, c, (size_t)(inject_at - c));
+                buf_append_text(&out, c, (size_t)(inject_at - c), esc);
                 if (tool_call_reminder_due(tool_schemas, out.len))
                     buf_puts(&out, DS4_TOOL_CALL_REMINDER_TEXT);
-                buf_puts(&out, inject_at);
+                buf_puts_text(&out, inject_at, esc);
             } else {
-                buf_puts(&out, c);
+                buf_puts_text(&out, c, esc);
             }
             pending_assistant = true;
             pending_tool_result = false;
         } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
             if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
             buf_puts(&out, "<tool_result>");
-            append_tool_result_text(&out, m->content);
+            append_tool_result_text_esc(&out, m->content, esc);
             /* issue #18 option E: past the depth gate, every tool result in
              * a tools-armed conversation carries the protocol reminder.
              * Per-result (not last-result-only) so the rendered history is
@@ -2775,7 +3280,7 @@ static char *render_chat_prompt_text_mark(const chat_msgs *msgs, const char *too
                     if ((tool_context && !g_reasoning_replay_drop) ||
                         i > last_user_idx) {
                         buf_puts(&out, "<think>");
-                        buf_puts(&out, m->reasoning ? m->reasoning : "");
+                        buf_puts_text(&out, m->reasoning, esc);
                         buf_puts(&out, "</think>");
                     } else {
                         buf_puts(&out, "</think>");
@@ -2784,8 +3289,8 @@ static char *render_chat_prompt_text_mark(const chat_msgs *msgs, const char *too
                     buf_puts(&out, "</think>");
                 }
             }
-            buf_puts(&out, m->content ? m->content : "");
-            append_dsml_tool_calls_text(&out, &m->calls);
+            buf_puts_text(&out, m->content, esc);
+            append_dsml_tool_calls_text_esc(&out, &m->calls, esc);
             buf_puts(&out, "<｜end▁of▁sentence｜>");
             pending_assistant = false;
             pending_tool_result = false;
@@ -2844,6 +3349,7 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
                                    const char *tool_schemas,
                                    size_t frontier_bytes,
                                    ds4_think_mode think_mode) {
+    const bool esc = image_pool_count() > 0;   /* inc 7 */
     const bool think = ds4_think_mode_enabled(think_mode);
     const bool base_known = frontier_bytes >= DS4_EOS_TEXT_LEN;
     const size_t base = base_known ? frontier_bytes - DS4_EOS_TEXT_LEN : 0;
@@ -2872,19 +3378,19 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
                 }
             }
             if (inject_at) {
-                buf_append(&out, c, (size_t)(inject_at - c));
+                buf_append_text(&out, c, (size_t)(inject_at - c), esc);
                 if (tool_call_reminder_due(tool_schemas, base + out.len))
                     buf_puts(&out, DS4_TOOL_CALL_REMINDER_TEXT);
-                buf_puts(&out, inject_at);
+                buf_puts_text(&out, inject_at, esc);
             } else {
-                buf_puts(&out, c);
+                buf_puts_text(&out, c, esc);
             }
             pending_assistant = true;
             pending_tool_result = false;
         } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
             if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
             buf_puts(&out, "<tool_result>");
-            append_tool_result_text(&out, m->content);
+            append_tool_result_text_esc(&out, m->content, esc);
             if (base_known &&
                 tool_call_reminder_due(tool_schemas, base + out.len))
                 buf_puts(&out, DS4_TOOL_CALL_REMINDER_TEXT);
@@ -2896,14 +3402,14 @@ static char *render_live_tool_tail(const chat_msgs *msgs, int start,
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
                     buf_puts(&out, "<think>");
-                    buf_puts(&out, m->reasoning ? m->reasoning : "");
+                    buf_puts_text(&out, m->reasoning, esc);
                     buf_puts(&out, "</think>");
                 } else {
                     buf_puts(&out, "</think>");
                 }
             }
-            buf_puts(&out, m->content ? m->content : "");
-            append_dsml_tool_calls_text(&out, &m->calls);
+            buf_puts_text(&out, m->content, esc);
+            append_dsml_tool_calls_text_esc(&out, &m->calls, esc);
             buf_puts(&out, "<｜end▁of▁sentence｜>");
             pending_assistant = false;
             pending_tool_result = false;
@@ -3380,13 +3886,17 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(tool_schemas);
+    if (!request_tokenize_prompt(e, r, err, errlen)) {   /* inc 7: image blocks */
+        request_free(r);
+        return false;
+    }
     return true;
 bad:
     chat_msgs_free(&msgs);
     free(tool_schemas);
+    image_pool_clear();
     content_reject_take(err, errlen);   /* a refused media block names itself */
     if (!err[0]) snprintf(err, errlen, "invalid JSON request");   /* Inc 2b: keep a specific validation message */
     request_free(r);
@@ -3612,15 +4122,19 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
+    if (!request_tokenize_prompt(e, r, err, errlen)) {   /* inc 7: image blocks */
+        request_free(r);
+        return false;
+    }
     return true;
 bad:
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
+    image_pool_clear();
     content_reject_take(err, errlen);   /* a refused media block names itself */
     if (!err[0]) snprintf(err, errlen, "invalid JSON request");   /* Inc 2b: keep a specific validation message */
     request_free(r);
@@ -3632,7 +4146,7 @@ bad:
  * recognized text blocks. Numbers / objects / arrays-of-primitives at the top
  * level all reject so the client sees a 400 instead of an answer built on
  * silently dropped context. */
-static bool parse_responses_content_array(const char **p, char **out) {
+static bool parse_responses_content_array(const char **p, char **out, bool allow_images) {
     json_ws(p);
     if (**p == '"') return json_string(p, out);
     if (json_lit(p, "null")) {
@@ -3655,12 +4169,14 @@ static bool parse_responses_content_array(const char **p, char **out) {
             (*p)++;
             char *type = NULL;
             char *text = NULL;
+            char *image_url = NULL;   /* inc 7 */
             json_ws(p);
             while (**p && **p != '}') {
                 char *key = NULL;
                 if (!json_string(p, &key)) {
                     free(type);
                     free(text);
+                    free(image_url);
                     goto fail;
                 }
                 json_ws(p);
@@ -3668,6 +4184,7 @@ static bool parse_responses_content_array(const char **p, char **out) {
                     free(key);
                     free(type);
                     free(text);
+                    free(image_url);
                     goto fail;
                 }
                 (*p)++;
@@ -3691,10 +4208,21 @@ static bool parse_responses_content_array(const char **p, char **out) {
                         free(type);
                         goto fail;
                     }
+                } else if (!strcmp(key, "image_url")) {
+                    free(image_url);
+                    image_url = NULL;
+                    if (!json_image_url_value(p, &image_url)) {
+                        free(key);
+                        free(type);
+                        free(text);
+                        free(image_url);
+                        goto fail;
+                    }
                 } else if (!json_skip_value(p)) {
                     free(key);
                     free(type);
                     free(text);
+                    free(image_url);
                     goto fail;
                 }
                 free(key);
@@ -3705,6 +4233,7 @@ static bool parse_responses_content_array(const char **p, char **out) {
             if (**p != '}') {
                 free(type);
                 free(text);
+                free(image_url);
                 goto fail;
             }
             (*p)++;
@@ -3713,6 +4242,30 @@ static bool parse_responses_content_array(const char **p, char **out) {
              * image/file/audio types, future schema-drift — is rejected so the
              * client gets a 400 instead of an answer built on context the
              * server discarded silently. */
+            if (type && !strcmp(type, "input_image")) {
+                /* inc 7: a data-URI input_image is pooled and placed (user
+                 * messages only); anything else refuses by name. */
+                uint8_t *bytes = NULL;
+                size_t len = 0;
+                bool ok = false;
+                if (!allow_images) content_reject_image_position();
+                else if (!image_url) content_reject_set("input_image block has no image_url");
+                else ok = image_data_uri_decode(image_url, "input_image.image_url", &bytes, &len);
+                if (!ok) {
+                    free(type);
+                    free(text);
+                    free(image_url);
+                    goto fail;
+                }
+                image_block_accept(&b, bytes, len);
+                free(type);
+                free(text);
+                free(image_url);
+                json_ws(p);
+                if (**p == ',') (*p)++;
+                json_ws(p);
+                continue;
+            }
             bool is_text_block = type && (
                 !strcmp(type, "input_text") ||
                 !strcmp(type, "output_text") ||
@@ -3723,11 +4276,13 @@ static bool parse_responses_content_array(const char **p, char **out) {
                 if (content_block_type_is_media(type)) content_reject_media(type);
                 free(type);
                 free(text);
+                free(image_url);
                 goto fail;
             }
             buf_puts(&b, text);
             free(type);
             free(text);
+            free(image_url);
         } else {
             /* Reject primitives, arrays-of-arrays, nulls: a content array
              * element must be either a string or a typed text object. */
@@ -3791,6 +4346,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
         char *result = NULL;
         char *tools_json = NULL;
         char *status_str = NULL;
+        const size_t pool_before = image_pool_count();   /* inc 7 */
         json_ws(p);
         while (**p && **p != '}') {
             char *key = NULL;
@@ -3815,7 +4371,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                 }
             } else if (!strcmp(key, "content")) {
                 free(content);
-                if (!parse_responses_content_array(p, &content)) {
+                if (!parse_responses_content_array(p, &content, true)) {   /* inc 7 */
                     free(key);
                     goto item_fail;
                 }
@@ -3859,7 +4415,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                 free(output);
                 json_ws(p);
                 if (**p == '[') {
-                    if (!parse_responses_content_array(p, &output)) {
+                    if (!parse_responses_content_array(p, &output, false)) {
                         free(key);
                         goto item_fail;
                     }
@@ -3886,7 +4442,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                 }
             } else if (!strcmp(key, "summary")) {
                 free(summary);
-                if (!parse_responses_content_array(p, &summary)) {
+                if (!parse_responses_content_array(p, &summary, false)) {
                     free(key);
                     goto item_fail;
                 }
@@ -4006,6 +4562,13 @@ item_fail:
          *   3. everything else (user message, tool output): forces pending
          *      reasoning to flush in-position as an empty assistant message so it
          *      stays before this item in the rendered history. */
+        /* inc 7: images ride user message items only (the role member may
+         * follow the content member, so the verdict is taken here). */
+        if (image_pool_count() > pool_before &&
+            (strcmp(t, "message") != 0 || (role && strcmp(role, "user") != 0))) {
+            content_reject_image_position();
+            goto item_fail;
+        }
         bool consumes_reasoning =
             (!strcmp(t, "message") && role && !strcmp(role, "assistant")) ||
             !strcmp(t, "function_call") || !strcmp(t, "custom_tool_call") ||
@@ -4575,18 +5138,22 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     request_acquire_cont_pin(s, r);   /* Inc 5b: pin the LIVE record */
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
     buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
+    if (!request_tokenize_prompt(e, r, err, errlen)) {   /* inc 7: image blocks */
+        request_free(r);
+        return false;
+    }
     return true;
 bad:
     chat_msgs_free(&msgs);
     buf_free(&loaded_tool_schemas);
     free(instructions);
     free(tool_schemas);
+    image_pool_clear();
     content_reject_take(err, errlen);   /* a refused media block names itself */
     if (!err[0]) snprintf(err, errlen, "invalid JSON request");   /* Inc 2b: keep a specific validation message */
     request_free(r);
@@ -4780,11 +5347,15 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     buf_puts(&rendered, "<｜Assistant｜>");
     buf_puts(&rendered, ds4_think_mode_enabled(r->think_mode) ? "<think>" : "</think>");
     r->prompt_text = buf_take(&rendered);
-    ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     free(prompt);
+    if (!request_tokenize_prompt(e, r, err, errlen)) {   /* inc 7 (never images here) */
+        request_free(r);
+        return false;
+    }
     return true;
 bad:
     free(prompt);
+    image_pool_clear();
     content_reject_take(err, errlen);   /* a refused media block names itself */
     if (!err[0]) snprintf(err, errlen, "invalid JSON request");   /* Inc 2b: keep a specific validation message */
     request_free(r);
@@ -11245,6 +11816,7 @@ static int kv_cache_try_load(server *s, const request *req,
                              ds4_tokens *effective_prompt,
                              char **loaded_path_out,
                              uint8_t *loaded_ext_flags_out) {
+    if (req && req->image_count) return 0;   /* inc 7: cold path (v0.7.0) */
     return kv_cache_try_load_text(s, req ? req->prompt_text : NULL,
                                   effective_prompt,
                                   loaded_path_out,
@@ -11255,6 +11827,7 @@ static int kv_cache_try_load(server *s, const request *req,
 static int live_text_prefix_prompt(server *s, const request *req,
                                    ds4_tokens *effective_prompt) {
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
+    if (req->image_count) return 0;   /* inc 7: no text splice can carry a block */
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
     if (!live_tokens || live_tokens->len <= 0) return 0;
 
@@ -11294,6 +11867,7 @@ static int responses_live_continuation_prompt(server *s, const request *req,
                                               int *matched_ids) {
     if (!s || !req || !effective_prompt) return 0;
     if (req->api != API_RESPONSES || !req->responses_live_suffix_text) return 0;
+    if (req->image_count) return 0;   /* inc 7 */
     if (req->responses_live_call_ids.len == 0) return 0;
     if (!cont_registry_resolve_serial(s, API_RESPONSES,
                                       &req->responses_live_call_ids,
@@ -11324,6 +11898,7 @@ static int anthropic_live_continuation_prompt(server *s, const request *req,
                                               int *matched_ids) {
     if (!s || !req || !effective_prompt) return 0;
     if (req->api != API_ANTHROPIC || !req->anthropic_live_suffix_text) return 0;
+    if (req->image_count) return 0;   /* inc 7 */
     if (req->anthropic_live_call_ids.len == 0) return 0;
     if (!cont_registry_resolve_serial(s, API_ANTHROPIC,
                                       &req->anthropic_live_call_ids,
@@ -11359,6 +11934,7 @@ static int responses_live_visible_prefix_prompt(server *s, const request *req,
                                                 ds4_tokens *effective_prompt) {
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
     if (req->api != API_RESPONSES) return 0;
+    if (req->image_count) return 0;   /* inc 7: image requests take the multimodal cold path */
 
     const size_t prompt_len = strlen(req->prompt_text);
     size_t visible_len = 0;
@@ -11401,6 +11977,7 @@ static int thinking_live_visible_prefix_prompt(server *s, const request *req,
                                                ds4_tokens *effective_prompt) {
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
     if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
+    if (req->image_count) return 0;   /* inc 7 */
 
     const size_t prompt_len = strlen(req->prompt_text);
     size_t visible_len = 0;
@@ -12546,6 +13123,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
                                          uint64_t trace_id, const char *content,
                                          const char *reasoning, const tool_calls *calls) {
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
+    if (j->req.image_count) return;   /* inc 7: a marker-keyed prompt is not re-tokenizable from text */
 
     char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
 
@@ -12725,11 +13303,24 @@ static uint64_t resolve_job_seed(const server *s, const job *j) {
         (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
 }
 
+/* inc 7: an image request syncs through the multimodal entry (the engine
+ * refuses an image row synced without its spans, so a miss is loud). */
+static int session_sync_request(server *s, const ds4_tokens *prompt, const request *req,
+                                char *err, size_t errlen) {
+    if (req && req->image_count)
+        return ds4_session_sync_multimodal(s->session, prompt, req->images, req->image_count,
+                                           err, errlen);
+    return ds4_session_sync(s->session, prompt, err, errlen);
+}
+
 static void generate_job(server *s, job *j) {
     char err[160];
     err[0] = '\0';
     const int old_pos = ds4_session_pos(s->session);
-    const int common = ds4_session_common_prefix(s->session, &j->req.prompt);
+    const int common = j->req.image_count
+        ? ds4_session_common_prefix_multimodal(s->session, &j->req.prompt,
+                                               j->req.images, j->req.image_count)
+        : ds4_session_common_prefix(s->session, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(s->session),
                         &j->req.prompt, old_pos, common);
@@ -12958,6 +13549,7 @@ static void generate_job(server *s, job *j) {
 
     int cold_store_len = 0;
     if (cached == 0 &&
+        j->req.image_count == 0 &&   /* inc 7: no prefix cut through a block */
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0 &&
@@ -13012,7 +13604,7 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&prefix);
     }
 
-    if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
+    if (session_sync_request(s, prompt_for_sync, &j->req, err, sizeof(err)) != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
         ds4_session_set_display_progress(s->session, NULL, NULL);
@@ -29260,33 +29852,218 @@ static void test_responses_durable_references_rejected_at_parse(void) {
     TEST_ASSERT(strstr(err, "conversation") != NULL);
 }
 
-/* Vision-Exp text-only serving: media content blocks are refused with a
- * named reason on the chat and Anthropic content parsers (the Responses
- * converter already failed closed), never flattened to their text parts.
- * Text-only content arrays still parse. */
-static void test_media_content_blocks_rejected(void) {
+/* Track B inc 7: image content blocks.  Base64 JPEG/PNG bytes are accepted
+ * on the three chat surfaces inside user messages: the bytes land in the
+ * request thread's image pool and a placeholder marker takes the image's
+ * place in the message text.  Everything else keeps a named 400: remote
+ * URLs and file paths, images outside user messages, audio/video/file
+ * blocks.  A request that carries images escapes client 0x1E/0x1F in the
+ * render and keeps the placeholder verbatim; the seam refuses by name on a
+ * server without the encoder sidecar and leaves nothing behind. */
+static void test_image_content_blocks(void) {
     chat_msgs msgs = {0};
     char err[200] = {0};
     const char *p;
+    char marker[DS4_KVSTORE_IMAGE_MARKER_LEN + 1];
 
-    p = "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"},"
-        "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AA==\"}}]}]";
+    /* base64 */
+    {
+        size_t n = 0;
+        uint8_t *b = base64_decode("QUJD", 4, &n);
+        TEST_ASSERT(b && n == 3 && !memcmp(b, "ABC", 3));
+        free(b);
+        b = base64_decode("QUJ D\n", 6, &n);
+        TEST_ASSERT(b && n == 3 && !memcmp(b, "ABC", 3));
+        free(b);
+        b = base64_decode("QUI=", 4, &n);
+        TEST_ASSERT(b && n == 2 && !memcmp(b, "AB", 2));
+        free(b);
+        b = base64_decode("QUI", 3, &n);
+        TEST_ASSERT(b && n == 2 && !memcmp(b, "AB", 2));
+        free(b);
+        b = base64_decode("-_8=", 4, &n);
+        TEST_ASSERT(b && n == 2 && b[0] == 0xfb && b[1] == 0xff);
+        free(b);
+        TEST_ASSERT(base64_decode("QU*D", 4, &n) == NULL);
+        TEST_ASSERT(base64_decode("Q", 1, &n) == NULL);
+        TEST_ASSERT(base64_decode("QUI=x", 5, &n) == NULL);
+    }
+
+    /* chat completions: text + image_url data URI + text in a user message */
+    image_pool_clear();
     g_content_reject[0] = 0;
+    p = "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi \"},"
+        "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,QUJD\",\"detail\":\"auto\"}},"
+        "{\"text\":\" there\",\"type\":\"text\"}]}]";
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(image_pool_count() == 1);
+    TEST_ASSERT(image_pool_get(0)->len == 3 && !memcmp(image_pool_get(0)->bytes, "ABC", 3));
+    image_placeholder_marker(0, marker);
+    TEST_ASSERT(msgs.len == 1 && msgs.v[0].content);
+    TEST_ASSERT(strlen(msgs.v[0].content) == 3 + DS4_KVSTORE_IMAGE_MARKER_LEN + 6);
+    TEST_ASSERT(!strncmp(msgs.v[0].content, "hi ", 3));
+    TEST_ASSERT(!strncmp(msgs.v[0].content + 3, marker, DS4_KVSTORE_IMAGE_MARKER_LEN));
+    TEST_ASSERT(!strcmp(msgs.v[0].content + 3 + DS4_KVSTORE_IMAGE_MARKER_LEN, " there"));
+    {
+        uint8_t id[32];
+        size_t pos = 0, idx = 99;
+        TEST_ASSERT(ds4_kvstore_text_next_marker(msgs.v[0].content, strlen(msgs.v[0].content), &pos, id) == 1);
+        TEST_ASSERT(pos == 3);
+        TEST_ASSERT(image_placeholder_index(id, &idx) && idx == 0);
+        uint8_t other[32];
+        memcpy(other, id, 32);
+        other[0] ^= 1;
+        TEST_ASSERT(!image_placeholder_index(other, &idx));
+    }
+    /* the render of an image request escapes client text and keeps the placeholder */
+    {
+        chat_msg *m = &msgs.v[0];
+        buf b = {0};
+        buf_puts(&b, m->content);
+        buf_puts(&b, "\036x\037");
+        free(m->content);
+        m->content = buf_take(&b);
+        char *text = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
+        TEST_ASSERT(text && strstr(text, marker) != NULL);
+        TEST_ASSERT(strstr(text, "\036\036x\036\037") != NULL);
+        uint8_t id[32];
+        size_t pos = 0;
+        int n = 0, rc;
+        while ((rc = ds4_kvstore_text_next_marker(text, strlen(text), &pos, id)) == 1) {
+            n++;
+            pos += DS4_KVSTORE_IMAGE_MARKER_LEN;
+        }
+        TEST_ASSERT(rc == 0 && n == 1);
+        size_t ulen = 0;
+        char *u = ds4_kvstore_unescape_text(text, strlen(text), &ulen);
+        TEST_ASSERT(u && strstr(u, "\036x\037") != NULL && strstr(u, marker) != NULL);
+        free(u);
+        /* text-only render of the same messages: byte for byte, no escaping */
+        image_pool_clear();
+        char *plain = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
+        TEST_ASSERT(plain && strstr(plain, "\036x\037") != NULL && strstr(plain, "\036\036") == NULL);
+        free(plain);
+        free(text);
+    }
+    chat_msgs_free(&msgs);
+    /* no encoder: the seam refuses by name and leaves the request empty */
+    {
+        request r;
+        request_init(&r, REQ_CHAT, 16);
+        uint8_t *bytes = xmalloc(3);
+        memcpy(bytes, "ABC", 3);
+        image_pool_push(bytes, 3);
+        buf b = {0};
+        image_placeholder_marker(0, marker);
+        buf_puts(&b, "<｜User｜>look ");
+        buf_puts(&b, marker);
+        r.prompt_text = buf_take(&b);
+        err[0] = '\0';
+        TEST_ASSERT(!request_tokenize_prompt(NULL, &r, err, sizeof(err)));
+        TEST_ASSERT(strstr(err, "Vision-Exp encoder") != NULL);
+        TEST_ASSERT(image_pool_count() == 0 && r.image_count == 0 && r.prompt.len == 0);
+        request_free(&r);
+    }
+
+    /* refusals keep their names */
+    image_pool_clear();
+    g_content_reject[0] = 0;
+    err[0] = '\0';
+    p = "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.com/a.png\"}}]}]";
     TEST_ASSERT(!parse_messages(&p, &msgs));
     content_reject_take(err, sizeof(err));
-    TEST_ASSERT(strstr(err, "image_url") != NULL);
-    TEST_ASSERT(strstr(err, "not implemented") != NULL);
+    TEST_ASSERT(strstr(err, "data:") != NULL && strstr(err, "not fetched") != NULL);
+    TEST_ASSERT(image_pool_count() == 0);
+    chat_msgs_free(&msgs);
+    err[0] = '\0';
+    p = "[{\"content\":[{\"type\":\"image_url\",\"image_url\":\"data:image/png;base64,QUJD\"}],\"role\":\"assistant\"}]";
+    TEST_ASSERT(!parse_messages(&p, &msgs));
+    content_reject_take(err, sizeof(err));
+    TEST_ASSERT(strstr(err, "user messages") != NULL);
+    chat_msgs_free(&msgs);
+    image_pool_clear();
+    err[0] = '\0';
+    p = "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png,abc\"}}]}]";
+    TEST_ASSERT(!parse_messages(&p, &msgs));
+    content_reject_take(err, sizeof(err));
+    TEST_ASSERT(strstr(err, "base64") != NULL);
+    chat_msgs_free(&msgs);
+    err[0] = '\0';
+    p = "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,QU*D\"}}]}]";
+    TEST_ASSERT(!parse_messages(&p, &msgs));
+    content_reject_take(err, sizeof(err));
+    TEST_ASSERT(strstr(err, "not valid base64") != NULL);
+    chat_msgs_free(&msgs);
+    err[0] = '\0';
+    p = "[{\"role\":\"user\",\"content\":[{\"type\":\"input_audio\",\"input_audio\":{\"data\":\"AA==\",\"format\":\"wav\"}}]}]";
+    TEST_ASSERT(!parse_messages(&p, &msgs));
+    content_reject_take(err, sizeof(err));
+    TEST_ASSERT(strstr(err, "input_audio") != NULL && strstr(err, "not supported") != NULL);
     TEST_ASSERT(g_content_reject[0] == 0);          /* consumed once */
     chat_msgs_free(&msgs);
 
-    /* Anthropic image block inside a user message. */
-    err[0] = '\0';
+    /* Anthropic: base64 source accepted; url source and tool_result images refused */
+    image_pool_clear();
     p = "[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"},"
-        "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"AA==\"}}]}]";
+        "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"QUJD\"}}]}]";
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(image_pool_count() == 1 && msgs.len == 1);
+    image_placeholder_marker(0, marker);
+    TEST_ASSERT(!strncmp(msgs.v[0].content, "hi", 2) && !strcmp(msgs.v[0].content + 2, marker));
+    chat_msgs_free(&msgs);
+    image_pool_clear();
+    err[0] = '\0';
+    p = "[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":\"https://example.com/a.png\"}}]}]";
     TEST_ASSERT(!parse_anthropic_messages(&p, &msgs));
     content_reject_take(err, sizeof(err));
-    TEST_ASSERT(strstr(err, "\"image\"") != NULL);
+    TEST_ASSERT(strstr(err, "\"url\"") != NULL && strstr(err, "base64") != NULL);
     chat_msgs_free(&msgs);
+    err[0] = '\0';
+    p = "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\","
+        "\"content\":[{\"type\":\"image_url\",\"image_url\":\"data:image/png;base64,QUJD\"}]}]}]";
+    TEST_ASSERT(!parse_anthropic_messages(&p, &msgs));
+    content_reject_take(err, sizeof(err));
+    TEST_ASSERT(strstr(err, "user messages") != NULL);
+    TEST_ASSERT(image_pool_count() == 0);
+    chat_msgs_free(&msgs);
+    err[0] = '\0';
+    p = "[{\"role\":\"user\",\"content\":[{\"type\":\"document\",\"source\":{\"type\":\"base64\",\"media_type\":\"application/pdf\",\"data\":\"QUJD\"}}]}]";
+    TEST_ASSERT(!parse_anthropic_messages(&p, &msgs));
+    content_reject_take(err, sizeof(err));
+    TEST_ASSERT(strstr(err, "\"document\"") != NULL);
+    chat_msgs_free(&msgs);
+
+    /* Responses: input_image data URI in a user message; refused in a tool output */
+    {
+        chat_msgs rm = {0};
+        buf schemas = {0};
+        tool_schema_orders orders = {0};
+        image_pool_clear();
+        p = "[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"},"
+            "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,QUJD\",\"detail\":\"auto\"}]}]";
+        TEST_ASSERT(parse_responses_input(&p, &rm, &schemas, &orders));
+        TEST_ASSERT(image_pool_count() == 1 && rm.len == 1);
+        image_placeholder_marker(0, marker);
+        TEST_ASSERT(!strncmp(rm.v[0].content, "hi", 2) && !strcmp(rm.v[0].content + 2, marker));
+        chat_msgs_free(&rm);
+        image_pool_clear();
+        err[0] = '\0';
+        p = "[{\"type\":\"function_call_output\",\"call_id\":\"c1\","
+            "\"output\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,QUJD\"}]}]";
+        TEST_ASSERT(!parse_responses_input(&p, &rm, &schemas, &orders));
+        content_reject_take(err, sizeof(err));
+        TEST_ASSERT(strstr(err, "user messages") != NULL);
+        chat_msgs_free(&rm);
+        err[0] = '\0';
+        p = "[{\"type\":\"message\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,QUJD\"}],\"role\":\"assistant\"}]";
+        TEST_ASSERT(!parse_responses_input(&p, &rm, &schemas, &orders));
+        content_reject_take(err, sizeof(err));
+        TEST_ASSERT(strstr(err, "user messages") != NULL);
+        chat_msgs_free(&rm);
+        buf_free(&schemas);
+        tool_schema_orders_free(&orders);
+        image_pool_clear();
+    }
 
     /* Positive control: typed text blocks (type before text, and after). */
     err[0] = '\0';
@@ -29296,6 +30073,7 @@ static void test_media_content_blocks_rejected(void) {
     TEST_ASSERT(msgs.len == 1 && msgs.v[0].content && !strcmp(msgs.v[0].content, "ab"));
     content_reject_take(err, sizeof(err));
     TEST_ASSERT(err[0] == '\0');
+    TEST_ASSERT(image_pool_count() == 0);
     chat_msgs_free(&msgs);
 }
 
@@ -31516,7 +32294,7 @@ static void test_launch_spec_decision_matrix(void) {
 static void ds4_server_unit_tests_run(void) {
     test_launch_generation_names();
     test_launch_spec_decision_matrix();
-    test_media_content_blocks_rejected();
+    test_image_content_blocks();
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();

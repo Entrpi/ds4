@@ -975,6 +975,8 @@ int  ds4_gpu_model_units_bind(const void *map_base, const ds4_phys_unit *units,
  * LOG-AND-COUNT ONLY: nothing here influences any live decision (D2). */
 void ds4_gov_publish_use(int consumer, uint64_t intent, uint64_t resident);
 void ds4_gov_publish_reservation(int consumer, uint64_t reservation);
+/* inc 7: a consumer's current boot reservation (0 when none/unknown). */
+uint64_t ds4_gov_reservation_of(int consumer);
 void ds4_gov_snapshot(ds4_gov_ledger *out);
 void ds4_gov_shadow_check(const char *site, const ds4_gov_claim *cl,
                           int live_status);

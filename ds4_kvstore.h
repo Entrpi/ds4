@@ -164,6 +164,12 @@ char *ds4_kvstore_render_tokens_text(ds4_engine *engine,
                                      size_t *out_len);
 void ds4_kvstore_image_marker(const uint8_t identity[32], char out[DS4_KVSTORE_IMAGE_MARKER_LEN + 1]);
 char *ds4_kvstore_escape_text(const char *in, size_t len, size_t *out_len);
+/* Inverse of ds4_kvstore_escape_text (an unpaired trailing 0x1E is kept). */
+char *ds4_kvstore_unescape_text(const char *in, size_t len, size_t *out_len);
+/* Walk the markers of an escaped text.  From *pos: 1 = the next marker is
+ * at *pos (identity parsed), 0 = none left (*pos = len), -1 = a marker
+ * prefix at *pos is truncated or malformed. */
+int ds4_kvstore_text_next_marker(const char *text, size_t len, size_t *pos, uint8_t identity[32]);
 bool ds4_kvstore_text_has_image_marker(const char *text, size_t len);
 /* True when the markers in text are exactly ids[0..n) in order (a text with
  * no marker matches an empty list). */

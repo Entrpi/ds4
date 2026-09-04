@@ -34967,11 +34967,11 @@ static uint64_t ds4_batch_fit_headroom_bytes(int ctx_size) {
     (void)ctx_size;
     if (he && he[0]) {
         const long hv = atol(he);
-        if (hv >= 0) return (uint64_t)hv << 20;
+        if (hv >= 0) return ((uint64_t)hv << 20) + ds4_gov_reservation_of(DS4_GOVC_VISION_ENCODER);
     }
     { const char *de = getenv("DS4_BATCH_FIT_HEADROOM_DERIVED");
       if (de && de[0] == '0' && de[1] == '\0')
-          return 6144ull << 20; }      /* kill switch: the V7 static */
+          return (6144ull << 20) + ds4_gov_reservation_of(DS4_GOVC_VISION_ENCODER); }      /* kill switch: the V7 static */
     uint64_t burst = 2048ull << 20;
     { const char *be = getenv("DS4_BATCH_FIT_BURST_MB");
       if (be && be[0]) {
@@ -34979,15 +34979,19 @@ static uint64_t ds4_batch_fit_headroom_bytes(int ctx_size) {
           if (bv >= 0) burst = (uint64_t)bv << 20;
       } }
     const uint64_t floor = ds4_mem_floor_bytes();
-    const uint64_t headroom = floor + burst;
+    /* inc 7: a bound vision encoder's reservation is held out of the fit
+     * (its scratch must fit above the floor at request time). */
+    const uint64_t vision = ds4_gov_reservation_of(DS4_GOVC_VISION_ENCODER);
+    const uint64_t headroom = floor + burst + vision;
     static int disclosed;              /* boot-path call sites only */
     if (!disclosed) {
         disclosed = 1;
         fprintf(stderr,
                 "ds4: batch fit headroom: floor %.2f GiB + boot-burst %.2f "
-                "GiB = %.2f GiB (derived; DS4_BATCH_FIT_HEADROOM_MB pins, "
+                "GiB%s = %.2f GiB (derived; DS4_BATCH_FIT_HEADROOM_MB pins, "
                 "DS4_BATCH_FIT_HEADROOM_DERIVED=0 restores static 6144)\n",
                 (double)floor / 1073741824.0, (double)burst / 1073741824.0,
+                vision ? " + vision reserve" : "",
                 (double)headroom / 1073741824.0);
     }
     return headroom;
@@ -35176,23 +35180,42 @@ void ds4_gov_fault_tick(void) {
     ds4_metric_add(&ds4_metrics_get()->memgov_faults, 1);
 }
 
+/* Track B inc 7: the ledger seqlock is single-writer by contract; the vision
+ * encoder publishes its lease from a request thread while the worker
+ * publishes its own, so the writer side is serialized here (readers stay
+ * lock-free). */
+static pthread_mutex_t g_gov_write_mu = PTHREAD_MUTEX_INITIALIZER;
+static void gov_ledger_write_begin(uint64_t *faults) {
+    pthread_mutex_lock(&g_gov_write_mu);
+    ds4_gov_epoch_write_begin(&g_gov_ledger.epoch, faults);
+}
+static void gov_ledger_write_end(uint64_t *faults) {
+    ds4_gov_epoch_write_end(&g_gov_ledger.epoch, faults);
+    pthread_mutex_unlock(&g_gov_write_mu);
+}
+
 void ds4_gov_publish_use(int consumer, uint64_t intent, uint64_t resident) {
     if (ds4_gov_mode(consumer) == DS4_GOV_MODE_OFF) return;   /* D2-1 kill */
     uint64_t *faults = &ds4_metrics_get()->memgov_faults;
-    ds4_gov_epoch_write_begin(&g_gov_ledger.epoch, faults);
+    gov_ledger_write_begin(faults);
     if (consumer >= 0 && consumer < DS4_GOVC__COUNT)
         (void)ds4_gov_lease_publish(&g_gov_ledger, consumer, intent, resident,
                                     g_gov_ledger.lease[consumer].reservation,
                                     faults);
     else
         (*faults)++;
-    ds4_gov_epoch_write_end(&g_gov_ledger.epoch, faults);
+    gov_ledger_write_end(faults);
+}
+
+uint64_t ds4_gov_reservation_of(int consumer) {
+    if (consumer < 0 || consumer >= DS4_GOVC__COUNT) return 0;
+    return g_gov_ledger.lease[consumer].reservation;
 }
 
 void ds4_gov_publish_reservation(int consumer, uint64_t reservation) {
     if (ds4_gov_mode(consumer) == DS4_GOV_MODE_OFF) return;   /* D2-1 kill */
     uint64_t *faults = &ds4_metrics_get()->memgov_faults;
-    ds4_gov_epoch_write_begin(&g_gov_ledger.epoch, faults);
+    gov_ledger_write_begin(faults);
     if (consumer >= 0 && consumer < DS4_GOVC__COUNT)
         (void)ds4_gov_lease_publish(&g_gov_ledger, consumer,
                                     g_gov_ledger.lease[consumer].intent,
@@ -35200,7 +35223,7 @@ void ds4_gov_publish_reservation(int consumer, uint64_t reservation) {
                                     reservation, faults);
     else
         (*faults)++;
-    ds4_gov_epoch_write_end(&g_gov_ledger.epoch, faults);
+    gov_ledger_write_end(faults);
 }
 
 void ds4_gov_snapshot(ds4_gov_ledger *out) {
@@ -42117,8 +42140,21 @@ mtp_done:;
             char hex[65];
             vision_fingerprint_hex(e->vision_fingerprint, hex);
             fprintf(stderr, "ds4: vision sidecar bound: %s (%u tensors, sha256 %.16s...); "
-                    "image input lands with the encoder + prompt increments -- this build still serves text only\n",
+                    "image input on the CLI, the agent and the server surfaces\n",
                     opt->vision_path, DS4_DEEPSEEK4_VISION_TENSORS, hex);
+        }
+        /* Track B inc 7: the encoder's transient scratch is funded at BOOT.
+         * Its maximum (the preprocess caps an image at image.max_tokens =
+         * 384 LLM tokens, i.e. 3456 natural rows: a 48x72 natural grid) is
+         * published as the VISION_ENCODER reservation, which the bank fit
+         * leaves free (ds4_batch_fit_headroom_bytes) and the governor
+         * protects from every other claimant; the encode's own claim may
+         * dip into the operator floor by exactly this amount. */
+        {
+            const uint64_t reserve = ds4_vision_encoder_scratch_bytes(48u, 72u);
+            ds4_gov_publish_reservation(DS4_GOVC_VISION_ENCODER, reserve);
+            fprintf(stderr, "ds4: vision encoder reserve: %.1f MiB (max encoder scratch; held out of the bank fit, spendable by the encoder)\n",
+                    (double)reserve / 1048576.0);
         }
     }
 
@@ -42702,19 +42738,36 @@ static int ds4_engine_vision_encode_image(ds4_engine *e, const ds4_image *image,
      * cuBLAS handle, stream sync at the end), so it may run on the request
      * thread while the worker decodes. */
     const uint64_t need = ds4_vision_encoder_scratch_bytes(patches.grid_height, patches.grid_width);
+    /* inc 7: the server encodes on request threads; the lane (stream, cuBLAS
+     * handle, workspace) is one, so encodes are serialized here and the
+     * governed quote below is atomic with the lease it publishes. */
+    static pthread_mutex_t encode_mu = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&encode_mu);
     {
         ds4_gov_claim cl = {0};
         cl.requester = DS4_GOVC_VISION_ENCODER;
         cl.memc = DS4_MEMC_VISION_ENCODER;
         cl.domain = DS4_MEMD_UNIFIED_DEVICE;
-        cl.proposed_outstanding = need;
-        cl.operation_transient = need;
-        const int gv = ds4_gov_governed_check("vision_encode", &cl, DS4_GOV_ADMIT);
+        cl.proposed_outstanding = need;   /* the scratch IS the lease for the encode's duration */
+        cl.operation_transient = 0;
+        /* inc 7: the scratch is pre-funded by the encoder's boot reservation
+         * (held out of the bank fit; D2-2b pattern: a reservation is
+         * protected for others, spendable by the owner), so a claim inside
+         * it takes the PHYSICAL check only -- room for the scratch beyond
+         * what the other consumers have promised (their unfunded intent and
+         * reservations) -- not the operator floor, which a loaded box sits
+         * under at rest (gate run 2: 2.99 GiB free vs a 4.0 GiB floor) and
+         * which the fit already honoured when it left this room.  A claim
+         * beyond the reservation must clear the floor like anyone else. */
+        const uint64_t reserve = ds4_gov_reservation_of(DS4_GOVC_VISION_ENCODER);
+        const uint64_t margin = need <= reserve ? 0u : ds4_mem_floor_bytes();
+        const int gv = ds4_gov_governed_check_margin("vision_encode", &cl, DS4_GOV_ADMIT, margin);
         if (gv != DS4_GOV_ADMIT) {
             if (error && error_cap)
                 snprintf(error, error_cap,
                          "vision encoder refused by the memory governor (%.1f MiB of encoder scratch, status %d)",
                          (double)need / 1048576.0, gv);
+            pthread_mutex_unlock(&encode_mu);
             ds4_deepseek4_image_patches_free(&patches);
             return 0;
         }
@@ -42740,6 +42793,7 @@ static int ds4_engine_vision_encode_image(ds4_engine *e, const ds4_image *image,
                     (double)need / 1048576.0, patches.grid_height, patches.grid_width);
         }
     }
+    pthread_mutex_unlock(&encode_mu);
     out->content_width = patches.content_width;
     out->content_height = patches.content_height;
     out->grid_width = patches.llm_grid_width;

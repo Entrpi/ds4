@@ -7,6 +7,39 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased
 
+- **Track B inc 7: image input on the three chat surfaces.**  `/v1/chat/completions`
+  (`image_url` with a `data:image/...;base64,` URL, as a string or `{"url":...}`),
+  `/v1/messages` (`image` with a `base64` source) and `/v1/responses`
+  (`input_image` with a data-URI `image_url`) accept JPEG and PNG images inside
+  user messages, on a server started with `--vision FILE`.  The parser decodes
+  each image on the request thread and leaves a placeholder where it sits; the
+  request is finished by one seam that encodes every image through the inc 9
+  lane (one encode at a time, never inside a graph capture), lays each block
+  into the token stream at its place, and rewrites the placeholder to the
+  block's cache-identity marker, so the rendered prompt text is exactly the
+  key the kvstore renders for those tokens (inc 8): records, warm text and the
+  disk tier agree marker for marker.  Escape law: a request that carries images
+  escapes every client 0x1E/0x1F in its render (as the kvstore renderer escapes
+  token pieces), so a marker cannot be forged from text; a text-only request
+  renders and tokenizes byte for byte as before.  Everything else keeps a named
+  400: remote URLs and file paths (never fetched), images in system prompts,
+  assistant turns or tool results, audio/video/file blocks, a payload that is
+  not JPEG or PNG, and any image on a server without the encoder sidecar.
+  `/v1/completions` and `/v1/batch` stay text-only.  On the batched lane an
+  image request takes the inc 6 cold placement; on the serial lane it syncs
+  through the multimodal entry (common prefix walked through recorded blocks,
+  no text splice, no cold-prefix store cut through a block, no tool-checkpoint
+  canonicalization from text).  The encoder now runs on request threads beside
+  the worker: the memory governor's ledger and the device census take a writer
+  mutex (readers stay lock-free), and the two `cudaStreamCaptureModeGlobal`
+  brackets exclude the vision lane's allocations.  The encoder's scratch is
+  funded at boot: a bound sidecar publishes its maximum transient (the
+  384-token image budget, ~285 MiB) as the `vision_encoder` reservation, the
+  bank fit holds that room out of its headroom, and the encode's governed
+  claim takes the physical check (room beyond the other consumers' promises)
+  while it fits that reservation, the operator floor beyond it (the
+  first API gate run found every image request refused by the governor on a
+  server whose fit had priced all headroom into banks).
 - **Track B inc 6+9: the batched bank path serves image prompts, with memory
   governance.**  `ds4_cont_request` carries the prompt's image blocks
   (`images`/`image_count`, spans in prompt coordinates; the caller keeps the

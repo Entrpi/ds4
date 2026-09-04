@@ -864,6 +864,22 @@ bool ds4_kvstore_text_lineage_matches(const char *text, size_t len,
     return k == n_ids;
 }
 
+char *ds4_kvstore_unescape_text(const char *in, size_t len, size_t *out_len) {
+    kv_buf b = {0};
+    for (size_t i = 0; in && i < len; i++) {
+        if (in[i] == '\036' && i + 1 < len && (in[i + 1] == '\036' || in[i + 1] == '\037')) i++;
+        kv_buf_putc(&b, in[i]);
+    }
+    if (out_len) *out_len = b.len;
+    return kv_buf_take(&b);
+}
+
+int ds4_kvstore_text_next_marker(const char *text, size_t len, size_t *pos, uint8_t identity[32]) {
+    if (!text || !pos) return 0;
+    if (!kv_next_marker(text, len, pos)) return 0;
+    return kv_marker_identity(text, len, *pos, identity) ? 1 : -1;
+}
+
 size_t ds4_kvstore_lcp_marker_cap(const char *text, size_t text_len, size_t lcp) {
     if (!text) return 0;
     if (lcp > text_len) lcp = text_len;

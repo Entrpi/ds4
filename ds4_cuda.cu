@@ -1,3 +1,4 @@
+#include <mutex>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -190,6 +191,23 @@ static void cuda_substrate_cover(const void *model_map, uint64_t bytes) {
 static ds4_mem_cell g_mem_census[DS4_MEMC__COUNT][DS4_MEMD__COUNT];
 static uint64_t g_mem_census_faults;
 static uint64_t g_mem_census_epoch;   /* D0b-2 seqlock (ds4_mem_gov.h) */
+/* Track B inc 7: the census seqlock is single-writer by contract.  The
+ * vision encoder now allocates from a request thread while the worker
+ * decodes, so the writer side takes a mutex (readers stay lock-free). */
+static std::mutex g_mem_census_mu;
+static void cuda_census_write_begin(void) {
+    g_mem_census_mu.lock();
+    ds4_gov_epoch_write_begin(&g_mem_census_epoch, &g_mem_census_faults);
+}
+static void cuda_census_write_end(void) {
+    ds4_gov_epoch_write_end(&g_mem_census_epoch, &g_mem_census_faults);
+    g_mem_census_mu.unlock();
+}
+/* Track B inc 7: a cudaStreamCaptureModeGlobal capture forbids unsafe CUDA
+ * calls (cudaMalloc) from EVERY thread; the vision lane holds this mutex
+ * for its whole encode and both Global capture brackets hold it from
+ * Begin to End, so neither can land inside the other. */
+static std::mutex g_global_capture_mu;
 /* Track B inc 9: thread-local -- the Vision-Exp encoder brackets its scratch
  * from the request thread (outside the inference lock), and a shared stack
  * would re-tag whatever the worker allocates meanwhile. */
@@ -204,24 +222,24 @@ extern "C" int ds4_gpu_mem_observe(ds4_mem_observation *out);
 
 static void cuda_mem_note_alloc(int cls, int dom, uint64_t requested,
                                 uint64_t committed) {
-    ds4_gov_epoch_write_begin(&g_mem_census_epoch, &g_mem_census_faults);
+    cuda_census_write_begin();
     if (cls < 0 || cls >= DS4_MEMC__COUNT || dom < 0 || dom >= DS4_MEMD__COUNT)
         g_mem_census_faults++;
     else
         ds4_mem_cell_note_alloc(&g_mem_census[cls][dom], requested, committed,
                                 &g_mem_census_faults);
-    ds4_gov_epoch_write_end(&g_mem_census_epoch, &g_mem_census_faults);
+    cuda_census_write_end();
 }
 
 static void cuda_mem_note_free(int cls, int dom, uint64_t requested,
                                uint64_t committed) {
-    ds4_gov_epoch_write_begin(&g_mem_census_epoch, &g_mem_census_faults);
+    cuda_census_write_begin();
     if (cls < 0 || cls >= DS4_MEMC__COUNT || dom < 0 || dom >= DS4_MEMD__COUNT)
         g_mem_census_faults++;
     else
         ds4_mem_cell_note_free(&g_mem_census[cls][dom], requested, committed,
                                &g_mem_census_faults);
-    ds4_gov_epoch_write_end(&g_mem_census_epoch, &g_mem_census_faults);
+    cuda_census_write_end();
 }
 
 /* ---------------------------------------------------------------------
@@ -247,7 +265,7 @@ static int cuda_mem_src_index(const void *p) {
 
 static void cuda_mem_note_alloc_srcidx(int cls, int dom, uint64_t requested,
                                        uint64_t committed, int src) {
-    ds4_gov_epoch_write_begin(&g_mem_census_epoch, &g_mem_census_faults);
+    cuda_census_write_begin();
     if (cls < 0 || cls >= DS4_MEMC__COUNT || dom < 0 || dom >= DS4_MEMD__COUNT ||
         src < 0 || src > DS4_MSRC_MAX) {
         g_mem_census_faults++;
@@ -257,12 +275,12 @@ static void cuda_mem_note_alloc_srcidx(int cls, int dom, uint64_t requested,
         ds4_mem_cell_note_alloc(&g_mem_src_census[src][cls][dom], requested,
                                 committed, &g_mem_census_faults);
     }
-    ds4_gov_epoch_write_end(&g_mem_census_epoch, &g_mem_census_faults);
+    cuda_census_write_end();
 }
 
 static void cuda_mem_note_free_srcidx(int cls, int dom, uint64_t requested,
                                       uint64_t committed, int src) {
-    ds4_gov_epoch_write_begin(&g_mem_census_epoch, &g_mem_census_faults);
+    cuda_census_write_begin();
     if (cls < 0 || cls >= DS4_MEMC__COUNT || dom < 0 || dom >= DS4_MEMD__COUNT ||
         src < 0 || src > DS4_MSRC_MAX) {
         g_mem_census_faults++;
@@ -272,7 +290,7 @@ static void cuda_mem_note_free_srcidx(int cls, int dom, uint64_t requested,
         ds4_mem_cell_note_free(&g_mem_src_census[src][cls][dom], requested,
                                committed, &g_mem_census_faults);
     }
-    ds4_gov_epoch_write_end(&g_mem_census_epoch, &g_mem_census_faults);
+    cuda_census_write_end();
 }
 
 /* Pointer-attributed variants: src resolves by containment of `p` (the
@@ -716,6 +734,7 @@ static void cuda_cublas_vision_ws_prep(cudaStream_t stream) {
 extern "C" int ds4_gpu_vision_lane_begin(void) {
     if (!cuda_vision_lane_init()) return 0;
     if (t_vision_lane_depth++ == 0) {
+        g_global_capture_mu.lock();   /* inc 7: never inside a Global capture */
         t_vision_lane_saved_stream = t_ds4_capture_stream;
         ds4_capture_set_stream(g_vision_stream);
     }
@@ -726,6 +745,7 @@ extern "C" int ds4_gpu_vision_lane_end(void) {
     if (t_vision_lane_depth > 0 && --t_vision_lane_depth == 0) {
         ok = cuda_ok(cudaStreamSynchronize(g_vision_stream), "vision lane sync");
         ds4_capture_set_stream(t_vision_lane_saved_stream);
+        g_global_capture_mu.unlock();
     }
     return ok;
 }
@@ -1938,7 +1958,7 @@ static void cuda_q8_f16_cache_release_all(void) {
     for (const cuda_q8_f16_range &r : g_q8_f16_ranges)
         by_src[cuda_mem_src_index(r.host_base)] +=
             r.in_dim * r.out_dim * sizeof(__half);
-    ds4_gov_epoch_write_begin(&g_mem_census_epoch, &g_mem_census_faults);
+    cuda_census_write_begin();
     ds4_mem_cell_note_free(
         &g_mem_census[DS4_MEMC_WEIGHT_DERIVED][DS4_MEMD_UNIFIED_DEVICE],
         g_q8_f16_bytes, g_q8_f16_bytes, &g_mem_census_faults);
@@ -1948,7 +1968,7 @@ static void cuda_q8_f16_cache_release_all(void) {
             &g_mem_src_census[s][DS4_MEMC_WEIGHT_DERIVED][DS4_MEMD_UNIFIED_DEVICE],
             by_src[s], by_src[s], &g_mem_census_faults);
     }
-    ds4_gov_epoch_write_end(&g_mem_census_epoch, &g_mem_census_faults);
+    cuda_census_write_end();
     for (const cuda_q8_f16_range &r : g_q8_f16_ranges) {
         (void)cudaFree(r.device_ptr);
     }
@@ -4149,7 +4169,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         for (const cuda_q8_f32_range &r : g_q8_f32_ranges)
             by_src[cuda_mem_src_index(r.host_base)] +=
                 r.in_dim * r.out_dim * sizeof(float);
-        ds4_gov_epoch_write_begin(&g_mem_census_epoch, &g_mem_census_faults);
+        cuda_census_write_begin();
         ds4_mem_cell_note_free(
             &g_mem_census[DS4_MEMC_WEIGHT_DERIVED][DS4_MEMD_UNIFIED_DEVICE],
             g_q8_f32_bytes, g_q8_f32_bytes, &g_mem_census_faults);
@@ -4159,7 +4179,7 @@ extern "C" void ds4_gpu_cleanup(void) {
                 &g_mem_src_census[s][DS4_MEMC_WEIGHT_DERIVED][DS4_MEMD_UNIFIED_DEVICE],
                 by_src[s], by_src[s], &g_mem_census_faults);
         }
-        ds4_gov_epoch_write_end(&g_mem_census_epoch, &g_mem_census_faults);
+        cuda_census_write_end();
     }
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
         (void)cudaFree(r.device_ptr);
@@ -20181,8 +20201,10 @@ extern "C" int ds4_cuda_layer_graph_begin_or_replay(
      * single-threaded, so the strictness costs nothing.  Output is now
      * deterministic; a separate divergence-from-eager-baseline remains
      * the Step 7 open item (per-kernel hash dump bisection next). */
+    g_global_capture_mu.lock();   /* inc 7: excludes the vision lane's allocations */
     cudaError_t ge = cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
     if (ge != cudaSuccess) {
+        g_global_capture_mu.unlock();
         fprintf(stderr, "ds4: cudaStreamBeginCapture (layer %u) failed: %s\n",
                 il, cudaGetErrorString(ge));
         return -1;
@@ -20214,6 +20236,7 @@ extern "C" void ds4_cuda_layer_graph_end_or_commit(uint32_t il) {
     /* Restore default stream BEFORE any error returns so the thread-local
      * doesn't leak the captured stream into post-capture eager launches. */
     ds4_capture_set_stream((cudaStream_t)0);
+    g_global_capture_mu.unlock();
     if (ge != cudaSuccess) {
         fprintf(stderr, "ds4: cudaStreamEndCapture (layer %u) failed: %s\n",
                 il, cudaGetErrorString(ge));
@@ -20431,8 +20454,10 @@ extern "C" int ds4_cuda_cont_graph_begin_or_replay(
     memcpy(&slot->key, key, sizeof(*key));
     /* Global mode: the Step 7 determinism finding (009b1b2) applies here
      * unchanged -- all GPU dispatch is single-threaded. */
+    g_global_capture_mu.lock();   /* inc 7: excludes the vision lane's allocations */
     cudaError_t ge = cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal);
     if (ge != cudaSuccess) {
+        g_global_capture_mu.unlock();
         fprintf(stderr, "ds4: cudaStreamBeginCapture (cont layer %u) failed: %s\n",
                 il, cudaGetErrorString(ge));
         return -1;
@@ -20453,6 +20478,7 @@ extern "C" void ds4_cuda_cont_graph_end_or_commit(uint32_t il) {
     cudaGraph_t graph = NULL;
     cudaError_t ge = cudaStreamEndCapture(s, &graph);
     ds4_capture_set_stream((cudaStream_t)0);
+    g_global_capture_mu.unlock();
     if (ge != cudaSuccess) {
         fprintf(stderr, "ds4: cudaStreamEndCapture (cont layer %u) failed: %s\n",
                 il, cudaGetErrorString(ge));

@@ -128,10 +128,12 @@ adds the `view_image` tool (the image becomes part of the tool
 observation; context compaction and session save/restore keep the image
 blocks). The engine's batched bank path serves image prompts (per-bank
 image lineage, engine-validated reuse, the encoder on its own stream and
-memory-governance family `DS4_MEMGOV_VISION`), but the server surfaces
-still refuse image, file and audio content blocks with a 400 rather than
-silently dropping them (the API parsers land next), and the 0731
-checkpoint stays the auto-picked default. The
+memory-governance family `DS4_MEMGOV_VISION`), and `ds4-server --vision FILE`
+takes JPEG/PNG images inside user messages on `/v1/chat/completions`
+(`image_url` data URI), `/v1/messages` (`image` base64 source) and
+`/v1/responses` (`input_image` data URI); remote URLs are never fetched,
+and file, audio and video blocks keep their 400 rather than being silently
+dropped. The 0731 checkpoint stays the auto-picked default. The
 engine reads the checkpoint variant off the GGUF metadata, takes
 the checkpoint's `rms_eps = 1e-20`, keys its disk KV cache and agent
 checkpoints separately from 0731, and refuses to pair a Vision-Exp base with
@@ -144,7 +146,7 @@ fork's own extraction with the 0731 Q2K recipe.
 ```sh
 ./download_model.sh vision-q2       # Vision-Exp IQ2_XXS/Q2_K language GGUF + encoder (~88 GB)
 ./download_model.sh drafter-vision  # the fork's Vision-Exp DSpark drafter (6.46 GiB)
-./ds4-server -m ./ds4flash.gguf -c 65536
+./ds4-server -m ./ds4flash.gguf -c 65536 --vision ./DeepSeek-V4-Flash-Vision-Encoder.gguf   # image input on the API
 ./ds4 -m ./ds4flash.gguf --vision ./DeepSeek-V4-Flash-Vision-Encoder.gguf   # then: /read photo.png
 ./ds4-agent -m ./ds4flash.gguf --vision ./DeepSeek-V4-Flash-Vision-Encoder.gguf  # view_image tool
 ```
