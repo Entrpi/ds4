@@ -111,11 +111,22 @@ The bandwidth figure is informational; we don't tier on it.
 
 - `DS4_BATCH_FIT_HEADROOM_MB=N`. Bytes the bank-count fit and the VMM
   comp-page budget leave free for runtime growth (tmp pools, capture graphs,
-  logits staging). Ctx-aware default since 2026-07-03: 6144 for boots with
-  `-c` &le; 16384 (GB10: +20% N=8 agg from the extra banks, N=1 neutral),
-  8192 above (at 57k ctx the extra resident slabs steal page cache from the
-  mmap weights and decode regresses ~7%). Setting the env pins one value for
-  both regimes.
+  logits staging). Derived since v0.6.2 as the operator floor
+  (`DS4_MEM_FLOOR_GB`, default 3 since v0.7.0) plus the boot-burst constant
+  (`DS4_BATCH_FIT_BURST_MB`, default 2048); since v0.7.0 boots with `-c` at or
+  below `DS4_BATCH_FIT_SERIAL_CTX_MAX` (default 131072) add a serial hold-out
+  (`DS4_BATCH_FIT_SERIAL_MB`, default 2048, 0 = off) so the serial lane's
+  session graph stays fundable beside a full bank pool at shallow shapes; at
+  deeper boots the term is off (both lanes cannot be funded at depth, banks
+  win). Setting `DS4_BATCH_FIT_HEADROOM_MB` pins one value outright;
+  `DS4_BATCH_FIT_HEADROOM_DERIVED=0` restores the old static 6144. The boot
+  line `batch fit headroom: ...` discloses the derivation.
+- `DS4_SERVER_SERIAL_RIGHTSIZE_QUOTE=0`. Restores the physical-only serial
+  right-size search. Since v0.7.0 the search also asks the memory governor,
+  so a serial request whose full-context graph fits physically but is
+  refused on the governor's margin gets the largest graph the governor
+  admits instead of a 503 (the log line `serial right-size: governor-aware
+  shrink ctx A -> B`).
 
 - Serving-path note (2026-07-03): `DS4_SERVER_CONTINUOUS=0` routes requests
   down the original graph-captured serial session path — on GB10 short-ctx

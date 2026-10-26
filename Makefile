@@ -366,5 +366,14 @@ test: ds4_test ds4-eval tests/test_deepseek4_vision_image
 	./ds4_test
 	./tests/test_deepseek4_vision_image
 
+# The gate battery (gates/README.md): `check` = the unit suite, `check-manifest` verifies that
+# gates/battery.manifest matches the legs' headers, `battery` runs the release battery
+# (needs local/battery.env, see gates/battery.env.example; OUT=/TIERS=/RESUME= pass through).
+check: test
+check-manifest:
+	bash gates/bin/manifest.sh --check
+battery:
+	bash gates/bin/release_battery.sh
+
 clean:
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_deepseek4_vision_image tests/test_deepseek4_vision_image.o tests/dump_vision_embedding tests/dump_vision_embedding.o

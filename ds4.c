@@ -45,10 +45,13 @@
 #endif
 #include "ds4_distributed.h"
 
-#ifndef DS4_NO_GPU
+/* ds4_gpu.h carries the Vision-Exp sidecar weight-table types and ds4_image.h
+ * the image layout/preprocess API; the sidecar catalog (bind, fingerprint,
+ * --vision-info) and the image prefill layout are shape-independent, so both
+ * headers are included on every build shape (the CPU shape links ds4_image.o
+ * too; the GPU-only entry points below stay under !DS4_NO_GPU). */
 #include "ds4_gpu.h"
 #include "ds4_image.h"
-#endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -34964,14 +34967,13 @@ static uint64_t ds4_batch_slabs_bank_bytes(const ds4_gpu_graph *g, bool mtp, boo
 static uint64_t ds4_mem_floor_bytes(void);
 static uint64_t ds4_batch_fit_headroom_bytes(int ctx_size) {
     const char *he = getenv("DS4_BATCH_FIT_HEADROOM_MB");
-    (void)ctx_size;
     if (he && he[0]) {
         const long hv = atol(he);
-        if (hv >= 0) return ((uint64_t)hv << 20) + ds4_gov_reservation_of(DS4_GOVC_VISION_ENCODER);
+        if (hv >= 0) return (uint64_t)hv << 20;
     }
     { const char *de = getenv("DS4_BATCH_FIT_HEADROOM_DERIVED");
       if (de && de[0] == '0' && de[1] == '\0')
-          return (6144ull << 20) + ds4_gov_reservation_of(DS4_GOVC_VISION_ENCODER); }      /* kill switch: the V7 static */
+          return 6144ull << 20; }      /* kill switch: the V7 static */
     uint64_t burst = 2048ull << 20;
     { const char *be = getenv("DS4_BATCH_FIT_BURST_MB");
       if (be && be[0]) {
@@ -34979,20 +34981,60 @@ static uint64_t ds4_batch_fit_headroom_bytes(int ctx_size) {
           if (bv >= 0) burst = (uint64_t)bv << 20;
       } }
     const uint64_t floor = ds4_mem_floor_bytes();
-    /* inc 7: a bound vision encoder's reservation is held out of the fit
-     * (its scratch must fit above the floor at request time). */
-    const uint64_t vision = ds4_gov_reservation_of(DS4_GOVC_VISION_ENCODER);
-    const uint64_t headroom = floor + burst + vision;
+    /* inc 7 / V8 fix: a bound vision encoder's reservation is held out of the
+     * fit as a PROMISE (subtracted from the budget beside the substrate
+     * outstanding, see ds4_batch_ctx_create_fit), never as headroom: the
+     * governor already charges every other consumer's reservation in its own
+     * verdict, so a reserve inside floor_override was counted twice and the
+     * fit's funded count was refused by exactly that amount (24 -> 12 banks
+     * at -c 32768 on the 09-04 soak). */
+    /* v0.7.0 (09-04 re-gate, USER ruling "A bounded"): the serial lane's
+     * session graph is funded lazily on its first request and its verdict
+     * protects a 1 GiB margin, not the floor (D2-4).  With the vision reserve
+     * counted once the fit's grant is honest and leaves exactly floor + burst
+     * beside the pool, inside which a ~5 GiB serial graph cannot be admitted
+     * at shallow shapes (the 09-04 soak at -c 32768: `serial_rightsize ...
+     * deficit 266 MiB`, a 503 on a 2343-token request; the API leg at -c 8192:
+     * every cont admission refused once the graph had landed).  A BOUNDED
+     * hold-out at shallow shapes keeps a graph fundable beside the pool for
+     * about four banks; at deep shapes the 08-05 law rules (both lanes cannot
+     * be funded, banks win, the serial lane degrades) and the term is off.
+     * DS4_BATCH_FIT_SERIAL_MB pins it (0 = off); DS4_BATCH_FIT_SERIAL_CTX_MAX
+     * moves the shallow/deep line (default 131072: the deep-serial guard's
+     * 65536-token prompt ceiling plus the right-size's continuation slack).
+     * Counted ONCE: the term lives in the headroom only; the governor holds
+     * no serial lease before the graph exists, so its boot verdict cannot
+     * charge it again (the inc 7 double-count lesson). */
+    uint64_t serial_hold = 0;
+    long serial_ctx_max = 131072;
+    { const char *ce = getenv("DS4_BATCH_FIT_SERIAL_CTX_MAX");
+      if (ce && ce[0]) { const long cv = atol(ce); if (cv >= 0) serial_ctx_max = cv; } }
+    if (ctx_size > 0 && (long)ctx_size <= serial_ctx_max) {
+        serial_hold = 2048ull << 20;
+        const char *se = getenv("DS4_BATCH_FIT_SERIAL_MB");
+        if (se && se[0]) { const long sv = atol(se); if (sv >= 0 && sv <= (1L << 20)) serial_hold = (uint64_t)sv << 20; }   /* MiB, clamped to 1 TiB */
+    }
+    const uint64_t headroom = floor + burst + serial_hold;
     static int disclosed;              /* boot-path call sites only */
     if (!disclosed) {
         disclosed = 1;
-        fprintf(stderr,
-                "ds4: batch fit headroom: floor %.2f GiB + boot-burst %.2f "
-                "GiB%s = %.2f GiB (derived; DS4_BATCH_FIT_HEADROOM_MB pins, "
-                "DS4_BATCH_FIT_HEADROOM_DERIVED=0 restores static 6144)\n",
-                (double)floor / 1073741824.0, (double)burst / 1073741824.0,
-                vision ? " + vision reserve" : "",
-                (double)headroom / 1073741824.0);
+        if (serial_hold)
+            fprintf(stderr,
+                    "ds4: batch fit headroom: floor %.2f GiB + boot-burst %.2f "
+                    "GiB + serial hold-out %.2f GiB (ctx %d <= %ld) = %.2f GiB "
+                    "(derived; DS4_BATCH_FIT_HEADROOM_MB pins, "
+                    "DS4_BATCH_FIT_SERIAL_MB=0 drops the hold-out, "
+                    "DS4_BATCH_FIT_HEADROOM_DERIVED=0 restores static 6144)\n",
+                    (double)floor / 1073741824.0, (double)burst / 1073741824.0,
+                    (double)serial_hold / 1073741824.0, ctx_size, serial_ctx_max,
+                    (double)headroom / 1073741824.0);
+        else
+            fprintf(stderr,
+                    "ds4: batch fit headroom: floor %.2f GiB + boot-burst %.2f "
+                    "GiB = %.2f GiB (derived; DS4_BATCH_FIT_HEADROOM_MB pins, "
+                    "DS4_BATCH_FIT_HEADROOM_DERIVED=0 restores static 6144)\n",
+                    (double)floor / 1073741824.0, (double)burst / 1073741824.0,
+                    (double)headroom / 1073741824.0);
     }
     return headroom;
 }
@@ -35009,14 +35051,18 @@ static bool ds4_batch_fit_kv_plan_enabled(void) {
 
 /* v0.5.4 governance inc1 (item 16): the OPERATOR memory floor -- system
  * memory every admission spend must leave untouched no matter what any
- * boot-time budget says.  Default 4 GiB; ds4-server --mem-floor-gb is the
+ * boot-time budget says.  Default 3 GiB since v0.7.0 (4 before); ds4-server --mem-floor-gb is the
  * operator surface (it transports here via DS4_MEM_FLOOR_GB, which also
  * serves as the A/B kill switch at 0).  Distinct from the fit headroom
  * above: headroom is a boot PLANNING margin, the floor is a LIVE line. */
 static uint64_t ds4_mem_floor_bytes(void) {
     static uint64_t floor_b = UINT64_MAX;
     if (floor_b == UINT64_MAX) {
-        uint64_t f = 4ull << 30;
+        /* v0.7.0 (09-04 USER ruling): 3 GiB.  The 4 GiB default dated from the
+         * v0.5.4 governance inc1 ceiling probe; every admission verdict since
+         * charges its own future (substrate, reservations, unfunded credits),
+         * so the operator band no longer carries that slack. */
+        uint64_t f = 3ull << 30;
         const char *fe = getenv("DS4_MEM_FLOOR_GB");
         if (fe && fe[0]) {
             const long fv = atol(fe);
@@ -35226,20 +35272,29 @@ void ds4_gov_publish_reservation(int consumer, uint64_t reservation) {
     gov_ledger_write_end(faults);
 }
 
-void ds4_gov_snapshot(ds4_gov_ledger *out) {
-    if (!out) return;
+/* The snapshot protocol body: 1 = a verified copy, 0 = exhausted (a writer
+ * wedged mid-publish -- the tripwire class; *out is the last copy, possibly
+ * torn or the caller's zeroed image).  No counting here: the counting
+ * wrapper below is the decision sites' entry point; the pure quote (the
+ * serial right-size search) needs the answer without the side effect. */
+static int gov_snapshot_try(ds4_gov_ledger *out) {
     for (int attempt = 0; attempt < 8; attempt++) {
         const uint64_t began = ds4_gov_epoch_read_begin(&g_gov_ledger.epoch);
         if (began & 1u) continue;
         *out = g_gov_ledger;
         if (ds4_gov_epoch_read_verify(&g_gov_ledger.epoch, began)) {
             out->epoch = began;
-            return;
+            return 1;
         }
     }
-    /* Exhausted (a writer wedged mid-publish -- the tripwire class): the
-     * last copy stands, counted.  Shadow quotes from it can only feed
-     * counters, never a decision. */
+    return 0;
+}
+
+void ds4_gov_snapshot(ds4_gov_ledger *out) {
+    if (!out) return;
+    if (gov_snapshot_try(out)) return;
+    /* Exhausted: the last copy stands, counted.  Shadow quotes from it can
+     * only feed counters, never a decision. */
     ds4_metric_add(&ds4_metrics_get()->memgov_faults, 1);
 }
 
@@ -35370,6 +35425,35 @@ int ds4_gov_governed_check(const char *site, const ds4_gov_claim *cl,
 int ds4_gov_governed_check_margin(const char *site, const ds4_gov_claim *cl,
                                   int legacy_status, uint64_t margin_bytes) {
     return gov_governed_dispatch(site, cl, legacy_status, &margin_bytes, NULL);
+}
+
+/* v0.7.0: a SIDE-EFFECT-FREE margin quote for the serial right-size search
+ * (ds4_server.c): the governed check's snapshot + observe + evaluate with the
+ * caller's margin as the protected term, but no counter, no deficit gauge, no
+ * disclosure -- the search probes many sizes and only the final decision is
+ * counted, by the governed check that follows it.  Answers ADMIT wherever the
+ * governed dispatch would let the legacy verdict rule (observe/off modes, no
+ * memory answer); a FAULT fails closed like the dispatch. */
+int ds4_gov_quote_status_margin(const ds4_gov_claim *cl, uint64_t margin_bytes) {
+    if (!cl || cl->requester < 0 || cl->requester >= DS4_GOVC__COUNT)
+        return DS4_GOV_REFUSE_LIVE;
+    if (ds4_gov_mode(cl->requester) != DS4_GOV_MODE_ENFORCE) return DS4_GOV_ADMIT;
+    ds4_gov_ledger img;
+    memset(&img, 0, sizeof(img));
+    if (!gov_snapshot_try(&img)) return DS4_GOV_ADMIT;   /* no verified ledger: no answer, so the search does not shrink; the counted governed check that follows decides (review 09-05 F3) */
+    img.floor_bytes = margin_bytes;
+    img.substrate_outstanding = ds4_gpu_substrate_outstanding();
+    ds4_mem_observation o;
+    memset(&o, 0, sizeof(o));
+    (void)ds4_gpu_mem_observe(&o);
+    const ds4_gov_quote q = ds4_gov_evaluate(&img, &o, cl);
+    switch (q.status) {
+    case DS4_GOV_ADMIT:
+    case DS4_GOV_REFUSE_CLASS:
+    case DS4_GOV_REFUSE_LIVE: return q.status;
+    case DS4_GOV_FAULT:       return DS4_GOV_REFUSE_LIVE;
+    default:                  return DS4_GOV_ADMIT;
+    }
 }
 
 /* Absolute session-graph intent at a ctx: the serial-reserve estimator
@@ -36328,8 +36412,17 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
              * (the 08-05 29-vs-13-bank overcommit class, now closed on the
              * lever path too -- boots plan identically in any mode). */
             const uint64_t sub_out = ds4_gpu_substrate_outstanding();
+            /* inc 7 / V8 fix: the bound vision encoder's reservation is a
+             * promise the governor will charge against this plan (its
+             * other_reservations term); take it out of the budget HERE, once,
+             * and never out of the headroom passed as floor_override. */
+            const uint64_t vision_promise = ds4_gov_reservation_of(DS4_GOVC_VISION_ENCODER);
             uint64_t budget = free_b > headroom ? free_b - headroom : 0;
             budget = budget > sub_out ? budget - sub_out : 0;
+            budget = budget > vision_promise ? budget - vision_promise : 0;
+            if (vision_promise)
+                fprintf(stderr, "ds4: batch fit: vision reserve %.1f MiB held out of the budget (promise, counted once)\n",
+                        (double)vision_promise / 1048576.0);
             uint32_t n = (uint32_t)(budget / per_bank);
             /* Governed cont bank plan (v0.6.2): when the comp/index caches
              * are demand-mapped the per_bank above is the eager REMAINDER
@@ -36456,8 +36549,10 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
             uint64_t free2 = 0, total2 = 0;
             if (ds4_gpu_mem_info(&free2, &total2) == 0) {
                 const uint64_t sub2 = ds4_gpu_substrate_outstanding();
+                const uint64_t vp2 = ds4_gov_reservation_of(DS4_GOVC_VISION_ENCODER);
                 uint64_t budget2 = free2 > fit_headroom ? free2 - fit_headroom : 0;
                 budget2 = budget2 > sub2 ? budget2 - sub2 : 0;
+                budget2 = budget2 > vp2 ? budget2 - vp2 : 0;   /* the same promise the boot budget holds out (review 09-05: the descent cap was one reserve loose) */
                 ds4_gov_claim fcl = {0};
                 fcl.requester = DS4_GOVC_BATCH_BANK_PLAN;
                 fcl.memc = DS4_MEMC_BATCH_BANK;
@@ -36678,7 +36773,13 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
                   floor_work = 2u * cache_per_bank +
                                (uint64_t)ctx->max_seq * floor_pb;
               }
-              raw_capacity = res + (vfree > headroom ? vfree - headroom : 0) +
+              /* v0.7.0: the bound vision encoder's reservation left the fit
+               * headroom (counted once, in the fit budget), so this capacity
+               * holds it out explicitly -- demand-mapped comp pages must not
+               * grow into the encoder's reserved band (review 09-05 F2). */
+              const uint64_t vpromise = ds4_gov_reservation_of(DS4_GOVC_VISION_ENCODER);
+              const uint64_t held = headroom + vpromise;
+              raw_capacity = res + (vfree > held ? vfree - held : 0) +
                              (uint64_t)ctx->max_seq * floor_pb;
               capacity_allow = raw_capacity;
               if (capacity_allow < floor_work) {
@@ -41575,8 +41676,19 @@ int ds4_gov_governed_check_margin(const char *site, const ds4_gov_claim *cl,
     (void)site; (void)cl; (void)margin_bytes;
     return legacy_status;
 }
+int ds4_gov_quote_status_margin(const ds4_gov_claim *cl, uint64_t margin_bytes) {
+    (void)cl; (void)margin_bytes;
+    return DS4_GOV_ADMIT;   /* no governor: the physical probe rules */
+}
 void ds4_gov_publish_use(int consumer, uint64_t intent, uint64_t resident) {
     (void)consumer; (void)intent; (void)resident;
+}
+void ds4_gov_publish_reservation(int consumer, uint64_t reservation) {
+    (void)consumer; (void)reservation;   /* inc 7: the vision encoder's boot reserve drops too */
+}
+uint64_t ds4_gov_reservation_of(int consumer) {
+    (void)consumer;
+    return 0;
 }
 void ds4_gov_snapshot(ds4_gov_ledger *out) {
     if (out) memset(out, 0, sizeof(*out));
@@ -42147,7 +42259,8 @@ mtp_done:;
          * Its maximum (the preprocess caps an image at image.max_tokens =
          * 384 LLM tokens, i.e. 3456 natural rows: a 48x72 natural grid) is
          * published as the VISION_ENCODER reservation, which the bank fit
-         * leaves free (ds4_batch_fit_headroom_bytes) and the governor
+         * holds out of its budget once as a promise (ds4_batch_ctx_create_fit;
+         * V8 fix: no longer inside the headroom) and the governor
          * protects from every other claimant; the encode's own claim may
          * dip into the operator floor by exactly this amount. */
         {

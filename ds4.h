@@ -1014,6 +1014,8 @@ int  ds4_gov_governed_check(const char *site, const ds4_gov_claim *cl,
  * inside the operator-floor band by design. */
 int  ds4_gov_governed_check_margin(const char *site, const ds4_gov_claim *cl,
                                    int legacy_status, uint64_t margin_bytes);
+/* v0.7.0: side-effect-free margin quote for the serial right-size search. */
+int  ds4_gov_quote_status_margin(const ds4_gov_claim *cl, uint64_t margin_bytes);
 /* Absolute session-graph intent for a ctx (the serial-reserve estimator,
  * exported): what a committed graph at this ctx costs, for SERIAL_SESSION
  * and STATIC_BATCH shadow claims. */

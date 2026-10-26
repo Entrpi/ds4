@@ -132,7 +132,7 @@ registry and trust domain").
    serial oracle's plain `text_completion` chunks
    (`cont_stream_emit_plain`); the Inc 0a negative fixture is inverted
    (`test_cont_completion_stream_matches_serial_oracle`) and
-   `speed-bench/completion_stream_gate.sh` holds the live schema +
+   `gates/legs/serving/completion_stream.sh` holds the live schema +
    cont-engagement line.
 2. **Engine-failure stranding finalizes live streams as `length`**
    (continuous lane), conflating a failure with a budget stop.
@@ -164,7 +164,7 @@ registry and trust domain").
    per-bank rounded projections would silently shrink live width. The
    verdict total (resident + projected credits) is timing-independent:
    the promise holds no matter how much of a row's growth has faulted
-   in. Gate: `speed-bench/admission_credit_gate.sh` (achieved width at
+   in. Gate: `gates/legs/memory/admission_credit.sh` (achieved width at
    the default budget, pinned-budget hard-promise reject with serial
    fallback, credit release on row death and on mid-prefill abort).
 5. **FIXED (Inc 0b): the v0.5.5 budget-cut honesty fix (#13) was

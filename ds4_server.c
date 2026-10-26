@@ -15361,9 +15361,70 @@ static bool serial_session_ensure_fit(server *s, job *j) {
     scl.domain = DS4_MEMD_UNIFIED_DEVICE;
     scl.proposed_outstanding = ds4_engine_session_graph_bytes_estimate(
         s->engine, (int)(target > 0 ? target : need_min));
-    const int final_v = ds4_gov_governed_check_margin(
+    /* v0.7.0 governor-aware right-size (09-04 soak): the physical search
+     * settled at the boot ctx (a 5.25 GiB graph) for a 2343-token prompt
+     * because that much was FREE, and the margin quote then refused it --
+     * a 503 where a smaller graph would have served.  When the quote
+     * refuses the physical target, search DOWN on side-effect-free quotes
+     * for the largest ctx in [need_min, target] the governor admits (a
+     * smaller ctx always fits physically if a larger one did); the governed
+     * check below then counts ONE decision at that size.  A refusal at
+     * need_min stands.  DS4_SERVER_SERIAL_RIGHTSIZE_QUOTE=0 restores the
+     * physical-only search. */
+    const char *qe = getenv("DS4_SERVER_SERIAL_RIGHTSIZE_QUOTE");
+    const bool quote_on = !(qe && qe[0] == '0' && qe[1] == '\0');
+    if (target > need_min) {
+        const uint64_t margin = ds4_session_graph_headroom_bytes();
+        if (quote_on &&
+            ds4_gov_quote_status_margin(&scl, margin) != DS4_GOV_ADMIT) {   /* live OR class refusal (review 09-05 F5) */
+            ds4_gov_claim probe = scl;
+            probe.proposed_outstanding =
+                ds4_engine_session_graph_bytes_estimate(s->engine, (int)need_min);
+            if (ds4_gov_quote_status_margin(&probe, margin) == DS4_GOV_ADMIT) {
+                long qlo = need_min, qhi = target;   /* invariant: qlo admitted */
+                while (qhi - qlo > 1024) {
+                    const long mid = qlo + (qhi - qlo) / 2;
+                    probe.proposed_outstanding =
+                        ds4_engine_session_graph_bytes_estimate(s->engine, (int)mid);
+                    if (ds4_gov_quote_status_margin(&probe, margin) == DS4_GOV_ADMIT)
+                        qlo = mid;
+                    else
+                        qhi = mid;
+                }
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: serial right-size: governor-aware shrink ctx %ld -> %ld "
+                           "(the physical fit admitted %ld, the governor's margin quote refused "
+                           "that graph; prompt=%d) (DS4_SERVER_SERIAL_RIGHTSIZE_QUOTE=0 restores "
+                           "the physical-only search)",
+                           target, qlo, target, j->req.prompt.len);
+                target = qlo;
+                scl.proposed_outstanding =
+                    ds4_engine_session_graph_bytes_estimate(s->engine, (int)target);
+            }
+        }
+    }
+    int final_v = ds4_gov_governed_check_margin(
         "serial_rightsize", &scl, legacy_v,
         ds4_session_graph_headroom_bytes());
+    /* Memory can move between the last quote and the counted decision (a hog,
+     * kswapd); when the decision refuses a shrunk target that is still above
+     * the minimum window, try the minimum once more as its own counted claim
+     * rather than 503 a request whose smallest graph was quoted ADMIT
+     * (review 09-05, Grok 1).  Two decisions counted = two attempts made. */
+    if (quote_on && final_v != DS4_GOV_ADMIT && legacy_v == DS4_GOV_ADMIT &&
+        target > need_min) {
+        const long shrunk = target;
+        target = need_min;
+        scl.proposed_outstanding =
+            ds4_engine_session_graph_bytes_estimate(s->engine, (int)target);
+        final_v = ds4_gov_governed_check_margin(
+            "serial_rightsize", &scl, legacy_v,
+            ds4_session_graph_headroom_bytes());
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: serial right-size: decision refused ctx %ld, retried at the minimum window %ld -> %s (prompt=%d)",
+                   shrunk, target, final_v == DS4_GOV_ADMIT ? "admit" : "refuse",
+                   j->req.prompt.len);
+    }
     ds4_session *ns = NULL;
     if (final_v == DS4_GOV_ADMIT && target > 0 &&
         ds4_session_create(&ns, s->engine, (int)target) == 0) {
@@ -20097,7 +20158,7 @@ static void usage(FILE *fp) {
         "      client high/max compat-map to low -- the preambles measurably degrade\n"
         "      deep-context tool calling (issue #18). Env twin: DS4_REASONING_EFFORT_NATIVE=1.\n"
         "  --mem-floor-gb N\n"
-        "      System memory admissions must always leave free, in GiB. Default: 4.\n"
+        "      System memory admissions must always leave free, in GiB. Default: 3.\n"
         "      KV-cache growth is trimmed or rejected before free memory drops below\n"
         "      this line, whatever the boot-time budget says. 0 disables the floor.\n"
         "\n"
@@ -20992,7 +21053,7 @@ int main(int argc, char **argv) {
                        ds4_think_mode_name(g_default_reasoning_effort));
     }
     {   /* v0.5.4 governance inc1: announce a non-default memory floor (the
-         * default 4 GiB rides the engine's batch-vmm boot line). */
+         * default, 3 GiB since v0.7.0, rides the engine's batch-vmm boot line). */
         const char *fe = getenv("DS4_MEM_FLOOR_GB");
         if (fe && fe[0])
             server_log(DS4_LOG_DEFAULT,

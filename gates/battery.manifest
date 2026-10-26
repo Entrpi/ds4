@@ -1,0 +1,31 @@
+# gates/battery.manifest — RENDERED by gates/bin/manifest.sh from the legs' '# battery:' headers; do not edit
+# (edit the leg's header, re-render, commit both).  Fields separated by ' @@ ':
+#   tier @@ stop @@ leg @@ server @@ driver @@ trigger @@ est_min @@ verdict_regex @@ command
+# command runs on the DRIVER box in its ds4 tree with RB_LEG RB_OUT RB_SERVER RB_TREE RB_GGUF RB_VBASE RB_ENC RB_RUN RB_NONCE RB_LOCK_DIR set.
+# Triggered legs run only when named in RUN_TRIGGERED (or ALL=1); otherwise index.md records SKIPPED (trigger: ...).
+# Tier 3m rows are attended pointers the orchestrator never launches.
+# ---- tier 0 ----
+0 @@ 1 @@ build_cpu @@ mac @@ mac @@ always @@ 2 @@ ^\[[0-9:]+\] BUILD_CPU_(PASS|FAIL) @@ bash gates/legs/build/cpu.sh
+0 @@ 1 @@ build_metal @@ mac @@ mac @@ always @@ 4 @@ ^\[[0-9:]+\] BUILD_METAL_(PASS|FAIL) @@ bash gates/legs/build/metal.sh
+0 @@ 1 @@ build_cuda @@ 33 @@ 33 @@ always @@ 5 @@ ^\[[0-9:]+\] BUILD_CUDA_(PASS|FAIL) @@ bash gates/legs/build/cuda.sh
+# ---- tier 1 ----
+1 @@ 1 @@ units_goldens @@ 33 @@ 33 @@ always @@ 7 @@ ^\[.*\] 3A_LEG_(PASS|FAIL) @@ RD="$RB_OUT" bash gates/legs/vision/units.sh
+1 @@ 1 @@ vision_members @@ 33 @@ 33 @@ always @@ 25 @@ ^\[.*\] 3V_LEG_(PASS|FAIL) @@ V8="$RB_OUT" bash gates/legs/vision/members.sh
+1 @@ 1 @@ goldens_crossbox @@ 15 @@ 33 @@ always @@ 3 @@ ^\[[0-9:]+\] GOLDENS_XBOX_(PASS|FAIL) @@ bash gates/legs/build/goldens_crossbox.sh
+1 @@ 1 @@ twins_12k @@ 15 @@ 33 @@ always @@ 5 @@ ^\[[0-9:]+\] TWINS12K_(PASS|FAIL) @@ bash gates/legs/vision/twins_12k.sh
+1 @@ 1 @@ deep_240k @@ 15 @@ 33 @@ always @@ 7 @@ DEEP-CTX GATE: (ALL STAGES PASS|FAIL) @@ bash gates/legs/memory/deep_240k.sh
+# ---- tier 2 ----
+2 @@ 0 @@ memtruth_fast @@ 33 @@ 15 @@ admission/census/ledger/serial-lane changed @@ 40 @@ ^\[[0-9:]+\] MT_FAST_(PASS|FAIL) @@ bash gates/legs/memory/memtruth_fast.sh
+2 @@ 0 @@ toolslip @@ 15 @@ 33 @@ always @@ 30 @@ TOOLCALL-DEPTH GATE: (ALL DEPTHS PASS|FAIL) @@ bash gates/legs/serving/toolslip.sh
+2 @@ 0 @@ deep_admit_ab @@ 33 @@ 15 @@ a batch-fit headroom term changed @@ 60 @@ ^\[[0-9:]+\] (ALL LEGS PASS|FAIL:) @@ R=$RB_SERVER BINDIR=$RB_TREE OUT="$RB_OUT/ab" EXTRA_ARGS="-m $RB_VBASE --vision $RB_ENC" bash gates/legs/memory/deep_admit_ab.sh
+2 @@ 0 @@ teb @@ 33 @@ 15 @@ always @@ 40 @@ ^\[.*\] 3D_(PASS|FAIL) @@ RD="$RB_OUT" bash gates/legs/agent/teb_vision.sh
+2 @@ 0 @@ perf_tripwire @@ 33 @@ 15 @@ always @@ 5 @@ ^TRIPWIRE_(PASS|FLAG|FAIL) @@ R=$RB_SERVER BINDIR=$RB_TREE MODEL=$RB_VBASE OUT="$RB_OUT" bash gates/legs/perf/tripwire.sh
+# ---- tier 2b ----
+2b @@ 0 @@ real_budgets @@ 33 @@ mac @@ admission/census/ledger/serial-lane changed @@ 35 @@ V062 GATE: (ALL LEGS PASS|FAILED) @@ ssh $RB_SERVER "rm -rf $RB_LOCK_DIR"; R=$RB_SERVER OUT="$RB_OUT/v062" bash gates/legs/memory/real_budgets.sh; rc=$?; ssh $RB_SERVER "mkdir -p $RB_LOCK_DIR && echo \"$RB_NONCE\" > $RB_LOCK_DIR/nonce"; exit $rc
+# ---- tier 3 ----
+3 @@ 0 @@ soak_lite @@ 33 @@ 15 @@ always @@ 60 @@ MEMGOV SOAK: (ALL ASSERTS PASS|FAILED) @@ bash gates/legs/memory/soak_lite.sh
+3 @@ 0 @@ soak_24h @@ 33 @@ 15 @@ memgov/census/ledger code changed or a major @@ 1440 @@ MEMGOV SOAK: (ALL ASSERTS PASS|FAILED) @@ bash gates/legs/memory/soak_24h.sh
+3 @@ 0 @@ toolslip_remoff @@ 15 @@ 33 @@ reminder or tool-rendering code changed @@ 30 @@ TOOLCALL-DEPTH GATE: (ALL DEPTHS PASS|FAIL) @@ bash gates/legs/serving/toolslip_remoff.sh
+# ---- tier 3m ----
+3m @@ 0 @@ evals @@ 15 @@ 15 @@ checkpoint or quantization changed @@ 420 @@ RUN_DONE_evals errors=0 @@ bash gates/legs/quality/evals.sh
+3m @@ 0 @@ quench_recal @@ 33 @@ 33 @@ model or drafter identity changed @@ 60 @@ QUENCH_RECAL_(PASS|FAIL) @@ bash gates/legs/perf/quench_recal.sh

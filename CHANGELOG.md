@@ -7,6 +7,114 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 
 ## Unreleased
 
+- **The serial lane beside an honest bank grant: a bounded serial hold-out
+  at shallow shapes, a governor-aware serial right-size, and a 3 GiB default
+  floor.**  With the vision reserve counted once the boot fit's grant is
+  honest and leaves exactly floor + boot-burst beside the pool, inside which
+  the serial lane's lazily funded session graph (about 5 GiB at 32k; its
+  verdict protects a 1 GiB margin rather than the floor) could not be
+  admitted at shallow shapes: the 09-04 re-gate saw a 503 on a 2,343-token
+  serial request beside 20 banks at `-c 32768` (`serial_rightsize ...
+  deficit 266 MiB`) and, in the other order, every continuous-lane
+  admission refused at `-c 8192` once a serial graph had landed.  Three
+  changes: (1) boots with `-c` at or below `DS4_BATCH_FIT_SERIAL_CTX_MAX`
+  (default 131072) hold out `DS4_BATCH_FIT_SERIAL_MB` (default 2048, 0 =
+  off) in the fit headroom, about four banks, so a graph stays fundable
+  beside the pool; deeper boots keep the 08-05 rule (both lanes cannot be
+  funded at depth, banks win, the serial lane degrades).  The boot line
+  reads `batch fit headroom: floor F + boot-burst B + serial hold-out S
+  (ctx N <= M) = H GiB`.  (2) The serial right-size search, which bounded
+  itself at the boot context on the physical probe alone and then let the
+  governor refuse the result, now searches down on side-effect-free
+  governor quotes for the largest context the governor admits and serves
+  with that graph (`serial right-size: governor-aware shrink ctx A -> B`;
+  `DS4_SERVER_SERIAL_RIGHTSIZE_QUOTE=0` restores the old search).  (3) The
+  default operator floor (`--mem-floor-gb` / `DS4_MEM_FLOOR_GB`) drops from
+  4 to 3 GiB: every admission verdict now charges its own future
+  (substrate, reservations, unfunded credits), so the operator band no
+  longer carries that slack; the fit headroom at deep shapes is 5 GiB.
+  Panel review (five models, 2026-09-05) tightened the edges: the
+  physical-descent re-quote and the VMM comp-page capacity hold the
+  vision promise out exactly as the boot budget does; the right-size
+  search's governor quotes use a non-counting snapshot and never shrink
+  on a torn ledger; any governor refusal (live or class) opens the
+  search; when a counted decision refuses a shrunk target because memory
+  moved, the minimum window is retried once as its own claim.
+- **Fix: the vision encoder's boot reservation was counted twice at the
+  batch bank fit.**  Inc 7 held the encoder's ~285 MiB scratch reservation
+  out of the fit headroom, and that headroom is the protected margin the
+  governor checks the bank plan against; the governor's live verdict also
+  charges every other consumer's reservation, so the same bytes were
+  required twice, the governor refused the fit's own funded count (short by
+  exactly the reserve) and the boot shell halved the pool (24 requested, 12
+  granted at `-c 32768`).  The reserve is now subtracted once, from the fit
+  budget as a promise beside the substrate outstanding (boot tell: `batch
+  fit: vision reserve ... held out of the budget (promise, counted once)`),
+  and the headroom line no longer carries the reserve (floor + boot-burst,
+  plus the shallow serial hold-out described above).  Found by the memgov
+  soak's saturation pulse against the fit-reduced pool.
+- **Build: the CPU shape links again.**  `make cpu` had not compiled since the
+  Vision-Exp sidecar catalog landed (inc 3b): `ds4.c` took the sidecar
+  weight-table types and the image layout API only under the GPU shapes while
+  the catalog (bind, fingerprint, `--validate-vision`) and the prompt layout
+  are shape-independent.  Both headers are included on every shape and the
+  CPU governor stubs gained the reservation entry points (drop / read 0), so
+  the five CPU binaries link with 0 warnings; the Metal and CUDA shapes are
+  unchanged.
+- **Release battery: the adopted two-box queue, its orchestrator, and the
+  `gates/` tree.**  The gate scripts leave `speed-bench/` (upstream's
+  benchmark directory keeps only the benchmarks, their CSV history and the
+  plots) for `gates/legs/<subsystem>/<behavior>.sh` (build, memory, serving,
+  vision, agent, perf, quality; arc names such as `inc6_tool_gate.sh` and
+  `v062_budgets_gate.sh` become `serving/tool_promotion.sh` and
+  `memory/real_budgets.sh`), with the shared drivers in `gates/lib/` and the
+  battery tooling in `gates/bin/`.  Every rig fact (hosts, box trees, model
+  and oracle paths) moves out of the scripts into `local/battery.env`
+  (gitignored; template `gates/battery.env.example`), loaded by
+  `gates/lib/env.sh`; a gate that needs an unset key fails by name.
+  `gates/bin/release_battery.sh` runs `gates/battery.manifest`, which is
+  RENDERED from the member legs' `# battery:` headers by
+  `gates/bin/manifest.sh` (`make check-manifest` fails when it is stale;
+  `make battery` runs the queue), tier by tier on both GB10s at once (one
+  detached box-side chain per server box, a sentinel per leg, one
+  `VERDICT leg=... PASS|FAIL` line per leg matched from the member driver's
+  own verdict, triggered legs recorded as skipped-with-reason in the run's
+  `index.md`); the Vision-Exp members (identity vs the upstream oracle,
+  needles, CLI, agent, API surfaces, seed-logit twin, units + goldens, teb
+  restamp) live in `gates/legs/vision/` and `gates/legs/agent/` with their
+  helpers.  New legs use `gates/lib/verdict.sh` (the verdict-line contract)
+  and `gates/lib/boot.sh` (boot/wait/kill over ssh) instead of private
+  copies.  The vision API leg is lane-aware: each compared request records
+  whether the continuous lane refused it on the memory floor (the
+  `ds4_cont_admit_rejects_total` delta), twins and surfaces compare within
+  a lane, refusals are disclosed, and a split twin gets a third draw (two
+  of three agreeing is a disclosed first-draw near-tie, not a failure).  The deep-context, deep-admit A/B, teb and memgov-soak drivers take
+  an `EXTRA_ARGS` splice (extra `ds4-server` flags after `-c`, e.g.
+  `--vision FILE`) so any leg can boot the encoder.  Robustness: every leg
+  runs under a time budget through `gates/bin/tmo.sh` (kills the leg's whole
+  process tree on expiry), every chain keeps a heartbeat, the orchestrator
+  reports stalls, dead chains and budget caps as FAIL rows instead of
+  waiting, and `gates/bin/chain_watch.sh` gives per-event notifications for
+  any detached chain (stall budgets per leg, heartbeat-aware death detection,
+  a chain registry with `gates/bin/rearm_watchers.sh` for re-arming after a
+  restart); `gates/legs/perf/tripwire.sh` is the informational prefill
+  tripwire.  The memgov soak now saturates the bank pool the fit actually
+  granted (read from the boot line) instead of the requested count, and its
+  state-bleed replay is lane-aware: tenant 1 is admitted first and alone
+  with its lane read from the continuous-lane reject counter, so a cold
+  replay after a tenant that was itself floor-refused off the continuous
+  lane is recorded as `no-cont-record` instead of being called state bleed.
+  The soak's hog pulse now carries the boot's vision promise in its target
+  (read from the `batch fit: vision reserve` line): the governor's serial
+  verdict counts every reservation, and a hog blind to the encoder's
+  promise left the 28k serial graph 0.64 MiB short after the whole idle
+  bank pool had been reclaimed on a box 15 h past its reboot.  The lite
+  soak now runs four 8-minute cycles (`CYCLES=` pins the count) instead of
+  four 30-minute ones: the longest timer its pulse depends on is the 300 s
+  continuation TTL, so the idle remainder measured nothing at that age;
+  the 24 h soak keeps 30-minute cycles as the drift instrument.
+  Process of record: `local/docs/release-process.md` §3.0; the in-tree
+  contract: `gates/README.md`.
 - **Track B inc 7: image input on the three chat surfaces.**  `/v1/chat/completions`
   (`image_url` with a `data:image/...;base64,` URL, as a string or `{"url":...}`),
   `/v1/messages` (`image` with a `base64` source) and `/v1/responses`
